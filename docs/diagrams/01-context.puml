@@ -1,0 +1,39 @@
+@startuml
+title 视图 1：系统上下文
+left to right direction
+skinparam backgroundColor #F8FAFC
+skinparam defaultFontName Microsoft YaHei
+skinparam shadowing false
+skinparam rectangle {
+  RoundCorner 14
+  BorderColor #334155
+  BackgroundColor #FFFFFF
+}
+skinparam actor {
+  BorderColor #334155
+  BackgroundColor #E2E8F0
+}
+
+actor "硬件事件源" as Hardware
+actor "运维 / TUI" as Operator
+rectangle "PoolService 容器" as Pool {
+  rectangle "EventService\n盘事件归一化" as Event
+  rectangle "RebuildService\n对象策略 + 窗口调度" as Rebuild
+  rectangle "BgService\n单个 BG 三阶段执行" as Bg
+  rectangle "Router\n只暴露通信能力" as Router
+}
+database "MDC 元数据 / 硬件视图" as MDC
+rectangle "业务节点" as Nodes
+
+Hardware --> Router : DiskOffline
+Router --> Event
+Event --> Router : StartRebuild(disk)
+Router --> Rebuild
+Rebuild --> MDC : 查询 Disk -> BG
+Rebuild --> Router : DoBgRebuild(bg)
+Router --> Bg
+Bg --> Nodes : remap / rebuild
+Bg --> MDC : 落地 BG 元数据
+Operator <-- Pool : Service 状态 + Task 事件
+@enduml
+

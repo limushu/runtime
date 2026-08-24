@@ -1,0 +1,37 @@
+@startuml
+title 视图 5：Service 生命周期与 Rebuild 业务状态
+skinparam backgroundColor #F8FAFC
+skinparam defaultFontName Microsoft YaHei
+skinparam shadowing false
+
+state "框架生命周期" as Framework {
+  [*] --> Initializing
+  Initializing --> Running : spawn ready
+  Running --> Paused : pause（立即停止取新业务）
+  Paused --> Running : resume
+  Running --> Draining : drain / graceful shutdown
+  Draining --> Paused : 队列空 && Task 空\n普通 drain
+  Draining --> Stopping : 队列空 && Task 空\ngraceful shutdown
+  Running --> Stopping : immediate shutdown
+  Paused --> Stopping : immediate shutdown
+  Stopping --> Stopped : 强制取消并清空 TaskSet
+  Stopped --> [*]
+}
+
+state "Rebuild 业务状态（位于 RebuildState，不属于框架）" as Business {
+  [*] --> Idle
+  Idle --> Active : Start(disk)\n创建唯一 public campaign
+  Active --> Active : Start(other disk)\n扩充 disk/BG owner 集合
+  Active --> Suspended : Suspend\n在途 BG 收敛，停止补位
+  Suspended --> Active : Resume\n恢复窗口补位
+  Active --> Active : Cancel(disk)\n删除 owner；共享 BG 保留
+  Active --> Idle : 所有 disk 的 BG 完成/取消
+}
+
+note bottom of Framework
+Paused：已有 Future 仍会被 poll，内部完成消息仍会处理
+Draining：拒绝新请求，但做完已接收队列与在途 Future
+Stopping：用于卸载，最终保证 Future 不泄露
+end note
+@enduml
+
