@@ -1,0 +1,13 @@
+digraph decision {
+  graph [rankdir=TB, bgcolor="transparent", pad=0.3, nodesep=0.4, ranksep=0.5];
+  node [shape=box, style="rounded,filled", fontname="Arial", color="#64748b", fillcolor="#f8fafc", fontcolor="#0f172a"];
+  edge [fontname="Arial", color="#475569", fontcolor="#334155"];
+  request [label="Request", shape=oval, fillcolor="#eef2ff"];
+  handle [label="Service::handle(request)", fillcolor="#dbeafe"];
+  choice [label="needs managed workflow?", shape=diamond, fillcolor="#fef3c7"];
+  reply [label="HandleResult::Reply\noneshot response", fillcolor="#dcfce7"];
+  task [label="HandleResult::Task(TaskSpec)\nTaskSet poll + TaskExit", fillcolor="#f3e8ff"];
+  request -> handle -> choice;
+  choice -> reply [label=" no"];
+  choice -> task [label=" yes"];
+}

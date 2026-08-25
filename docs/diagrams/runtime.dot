@@ -1,0 +1,20 @@
+digraph runtime {
+  graph [rankdir=LR, bgcolor="transparent", pad=0.3, nodesep=0.45, ranksep=0.65];
+  node [shape=box, style="rounded,filled", fontname="Arial", color="#64748b", fillcolor="#f8fafc", fontcolor="#0f172a", margin="0.16,0.10"];
+  edge [fontname="Arial", color="#475569", fontcolor="#334155"];
+  caller [label="Caller", shape=oval, fillcolor="#eef2ff"];
+  client [label="ServiceClient\ncall / submit"];
+  executor [label="Service Executor\none Tokio task", fillcolor="#dbeafe", color="#2563eb"];
+  handle [label="Service::handle\nReply or TaskSpec", fillcolor="#dcfce7", color="#16a34a"];
+  metadata [label="Service core metadata", shape=cylinder, fillcolor="#fef3c7", color="#d97706"];
+  tasks [label="TaskSet\nFuturesUnordered", fillcolor="#f3e8ff", color="#9333ea"];
+  child [label="Child ServiceClient"];
+  caller -> client;
+  client -> executor [label=" business mpsc"];
+  executor -> handle [label=" direct call"];
+  handle -> metadata [label=" sync domain method"];
+  handle -> executor [label=" decision"];
+  executor -> tasks [label=" insert / poll"];
+  tasks -> child [label=" TaskContext::call"];
+  executor -> caller [label=" oneshot / ticket"];
+}

@@ -1,0 +1,14 @@
+digraph cancellation {
+  graph [rankdir=TB, bgcolor="transparent", pad=0.3, nodesep=0.35, ranksep=0.45];
+  node [shape=box, style="rounded,filled", fontname="Arial", color="#64748b", fillcolor="#f8fafc", fontcolor="#0f172a"];
+  edge [fontname="Arial", color="#475569", fontcolor="#334155"];
+  root [label="Cancel Disk task", fillcolor="#fee2e2", color="#dc2626"];
+  rebuild [label="Disk requests Rebuild cancel"];
+  bg [label="Rebuild requests BG cancel"];
+  io [label="BG cancels external I/O\nand waits for acknowledgement", fillcolor="#fef3c7"];
+  bg_exit [label="BG TaskExit::Cancelled", fillcolor="#dcfce7"];
+  rebuild_exit [label="Rebuild TaskExit::Cancelled", fillcolor="#dcfce7"];
+  root_exit [label="Disk TaskExit::Cancelled", fillcolor="#dcfce7"];
+  root -> rebuild -> bg -> io;
+  io -> bg_exit -> rebuild_exit -> root_exit [label=" terminal result flows upward"];
+}

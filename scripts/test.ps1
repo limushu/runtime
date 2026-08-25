@@ -32,9 +32,15 @@ try {
     }
 
     cargo fmt --all -- --check
+    if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed" }
     cargo "+$toolchain" check --all-targets
+    if ($LASTEXITCODE -ne 0) { throw "cargo check failed" }
+    cargo "+$toolchain" clippy --all-targets -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed" }
     cargo "+$toolchain" test --all-targets
+    if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
     cargo "+$toolchain" run --example rebuild
+    if ($LASTEXITCODE -ne 0) { throw "cargo run failed" }
 }
 finally {
     $env:RUSTFLAGS = $oldRustFlags

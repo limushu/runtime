@@ -1,7 +1,5 @@
 use std::{fmt, sync::Arc};
 
-use tokio::sync::oneshot;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OperationId(pub u64);
 
@@ -49,32 +47,29 @@ impl TraceContext {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MessageContext {
-    pub operation_id: OperationId,
-    pub trace: TraceContext,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CancelReason {
+    Requested(Arc<str>),
+    Preempted { by: TaskKey },
+    ParentCancelled,
+    ServiceStopping,
 }
 
-impl MessageContext {
-    pub const fn new(operation_id: OperationId, trace: TraceContext) -> Self {
-        Self {
-            operation_id,
-            trace,
-        }
+impl CancelReason {
+    pub fn requested(reason: impl Into<Arc<str>>) -> Self {
+        Self::Requested(reason.into())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     ServiceNotFound(String),
+    WrongServiceType(String),
     ServiceUnavailable(String),
     ChannelClosed(String),
-    HandlerAlreadyInstalled(String),
-    HandlerNotInstalled(String),
-    WrongMessagePayload,
+    ResponseDropped,
     TaskAlreadyRunning(TaskKey),
-    TaskNotFound(TaskKey),
-    TaskFailed(String),
+    TaskNotFound(TaskId),
 }
 
 impl fmt::Display for RuntimeError {
@@ -85,9 +80,26 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-pub type Reply<T> = oneshot::Sender<T>;
-pub type Ticket<T> = oneshot::Receiver<T>;
-
-pub fn request_channel<T>() -> (Reply<T>, Ticket<T>) {
-    oneshot::channel()
+#[derive(Debug)]
+pub enum TaskExit<T, E> {
+    Completed(T),
+    Failed(E),
+    Cancelled(CancelReason),
+    Aborted,
 }
+
+#[derive(Debug)]
+pub enum CallError<E> {
+    Service(E),
+    Cancelled(CancelReason),
+    Aborted,
+    Runtime(RuntimeError),
+}
+
+impl<E: fmt::Debug> fmt::Display for CallError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl<E: fmt::Debug> std::error::Error for CallError<E> {}

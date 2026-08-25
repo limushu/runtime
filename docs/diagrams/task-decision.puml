@@ -1,0 +1,14 @@
+@startuml
+start
+:Service::handle(request);
+if (needs managed workflow?) then (no)
+  :HandleResult::Reply;
+  :send oneshot response;
+else (yes)
+  :HandleResult::Task(TaskSpec);
+  :TaskSet checks TaskKey;
+  :poll workflow Future;
+  :send TaskExit;
+endif
+stop
+@enduml
