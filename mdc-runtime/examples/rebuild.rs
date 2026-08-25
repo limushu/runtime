@@ -1,30 +1,26 @@
-use std::time::Duration;
-
 use mdc_runtime::{
-    ServiceShutdown,
-    demo::{BgBackend, DemoBlueprint, DiskId, default_demo_catalog},
+    Submission, TaskExit,
+    demo::{DemoPool, DiskId, DiskRequest},
 };
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = BgBackend::new(Duration::from_millis(10));
-    let system = DemoBlueprint::install()?
-        .spawn(default_demo_catalog(), backend.clone(), 2)
-        .await?;
+async fn main() {
+    let pool = DemoPool::start([DiskId::new("disk-1")])
+        .await
+        .expect("start demo pool");
 
-    let (disk_1, disk_2) = tokio::join!(
-        system.disk_offline(DiskId::new("disk-1"), 1),
-        system.disk_offline(DiskId::new("disk-2"), 2),
-    );
+    let Submission::Task(ticket) = pool
+        .disk
+        .client
+        .submit(DiskRequest::Offline(DiskId::new("disk-1")))
+        .await
+        .expect("submit disk offline")
+    else {
+        panic!("offline is expected to create a task");
+    };
 
-    println!("disk-1: {:?}", disk_1?);
-    println!("disk-2: {:?}", disk_2?);
-    println!("BG history: {:?}", backend.snapshot());
-    println!("rebuild state: {:?}", system.rebuild_snapshot(3).await?);
-
-    system
-        .services
-        .shutdown_all(ServiceShutdown::Immediate)
-        .await?;
-    Ok(())
+    match ticket.wait().await.expect("wait for disk offline") {
+        TaskExit::Completed(response) => println!("workflow completed: {response:?}"),
+        exit => println!("workflow stopped: {exit:?}"),
+    }
 }

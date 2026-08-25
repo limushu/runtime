@@ -1,66 +1,50 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
-use tokio::sync::RwLock;
+use crate::{RuntimeError, Service, ServiceClient, ServiceKey};
 
-use crate::{CommandHandle, Message, MessageContext, MessagePayload, RuntimeError, ServiceKey};
-
-pub struct Router<K, M>
-where
-    K: ServiceKey,
-    M: Message,
-{
-    routes: Arc<RwLock<HashMap<K, CommandHandle<K, M>>>>,
+pub struct Router<K: ServiceKey> {
+    routes: Arc<RwLock<HashMap<K, Arc<dyn Any + Send + Sync>>>>,
 }
 
-impl<K, M> Router<K, M>
-where
-    K: ServiceKey,
-    M: Message,
-{
+impl<K: ServiceKey> Router<K> {
     pub fn new() -> Self {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub(crate) async fn register(&self, service: K, handle: CommandHandle<K, M>) {
-        self.routes.write().await.insert(service, handle);
-    }
-
-    pub async fn send(
+    pub(crate) fn register<S: Service>(
         &self,
-        target: K,
-        message: M,
-        context: MessageContext,
+        key: K,
+        client: ServiceClient<S>,
     ) -> Result<(), RuntimeError> {
-        let handle = self
-            .routes
-            .read()
-            .await
-            .get(&target)
-            .cloned()
-            .ok_or_else(|| RuntimeError::ServiceNotFound(format!("{target:?}")))?;
-        handle.send(message, context).await
+        let mut routes = self.routes.write().expect("router poisoned");
+        if routes.contains_key(&key) {
+            return Err(RuntimeError::ServiceUnavailable(format!(
+                "{key:?} is already registered"
+            )));
+        }
+        routes.insert(key, Arc::new(client));
+        Ok(())
     }
 
-    pub async fn send_payload<P>(
-        &self,
-        target: K,
-        payload: P,
-        context: MessageContext,
-    ) -> Result<(), RuntimeError>
-    where
-        P: MessagePayload<M>,
-    {
-        self.send(target, payload.into_message(), context).await
+    pub fn client<S: Service>(&self, key: &K) -> Result<ServiceClient<S>, RuntimeError> {
+        let routes = self.routes.read().expect("router poisoned");
+        let route = routes
+            .get(key)
+            .ok_or_else(|| RuntimeError::ServiceNotFound(format!("{key:?}")))?;
+        route
+            .downcast_ref::<ServiceClient<S>>()
+            .cloned()
+            .ok_or_else(|| RuntimeError::WrongServiceType(format!("{key:?}")))
     }
 }
 
-impl<K, M> Clone for Router<K, M>
-where
-    K: ServiceKey,
-    M: Message,
-{
+impl<K: ServiceKey> Clone for Router<K> {
     fn clone(&self) -> Self {
         Self {
             routes: self.routes.clone(),
@@ -68,11 +52,7 @@ where
     }
 }
 
-impl<K, M> Default for Router<K, M>
-where
-    K: ServiceKey,
-    M: Message,
-{
+impl<K: ServiceKey> Default for Router<K> {
     fn default() -> Self {
         Self::new()
     }

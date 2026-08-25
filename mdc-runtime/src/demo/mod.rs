@@ -1,16 +1,17 @@
-//! End-to-end example for the disk -> BG rebuild business.
-//!
-//! The module is intentionally production-shaped: each feature owns its messages,
-//! handlers, workflow functions and one `install.rs` mapping.
+mod backend;
+mod bg_service;
+mod disk_service;
+mod metadata;
+mod model;
+mod pool;
+mod rebuild_service;
 
-mod blueprint;
-mod protocol;
-mod state;
-
-pub mod bg_rebuild;
-pub mod disk_offline;
-pub mod rebuild;
-
-pub use blueprint::{DemoBlueprint, DemoSystem, default_demo_catalog, demo_context};
-pub use protocol::*;
-pub use state::{BgBackend, DemoCatalog};
+pub use backend::{BackendSnapshot, BgBackend};
+pub use bg_service::BgService;
+pub use disk_service::DiskService;
+pub use model::{
+    BgRequest, BgResponse, DemoError, DiskId, DiskRequest, DiskResponse, DiskSnapshot, DiskState,
+    RebuildRequest, RebuildResponse, ServiceKind,
+};
+pub use pool::DemoPool;
+pub use rebuild_service::RebuildService;

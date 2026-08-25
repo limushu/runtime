@@ -8,35 +8,33 @@ use std::{
 };
 
 use mdc_runtime::{
-    HandlerRegistry, MessageContext, OperationId, PoolServices, RuntimeError, ServiceContext,
-    ServiceLifecycle, ServiceShutdown, TaskKey, TaskOutcome, TaskVisibility, TraceContext,
-    define_messages, register_handlers, request_channel,
+    CancelReason, HandleResult, RequestContext, Service, ServiceGroup, ServiceLifecycle,
+    ShutdownMode, Submission, TaskContext, TaskExit, TaskKey, TaskMeta, TaskSpec,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum TestService {
-    Worker,
+enum Kind {
+    Test,
+}
+
+enum Request {
+    Query,
+    Work,
+    Never {
+        marker: DropMarker,
+        started: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Response {
+    Value(u64),
+    Finished,
 }
 
 #[derive(Debug)]
-struct Start {
-    marker: DropMarker,
-    started: mdc_runtime::Reply<()>,
-}
+struct Error;
 
-#[derive(Debug)]
-struct Finished {
-    outcome: TaskOutcome<()>,
-}
-
-define_messages! {
-    enum TestMessage => TestMessageKind {
-        Start(Start),
-        Finished(Finished)
-    }
-}
-
-#[derive(Debug)]
 struct DropMarker(Arc<AtomicBool>);
 
 impl Drop for DropMarker {
@@ -45,106 +43,132 @@ impl Drop for DropMarker {
     }
 }
 
-fn start(
-    service: &mut ServiceContext<TestService, TestMessage, ()>,
-    request: Start,
-) -> Result<(), RuntimeError> {
-    service.run(
-        TaskKey::new("pending"),
-        "pending workflow",
-        TaskVisibility::Internal,
-        move |_| async move {
-            let _marker = request.marker;
-            let _ = request.started.send(());
-            pending::<()>().await;
-            Ok(())
-        },
-        move |outcome| TestMessage::Finished(Finished { outcome }),
-    );
-    Ok(())
+struct TestService;
+
+impl TestService {
+    async fn work(self: Arc<Self>, task: TaskContext) -> Result<Response, Error> {
+        task.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(Response::Finished)
+    }
+
+    async fn never(
+        self: Arc<Self>,
+        marker: DropMarker,
+        started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Response, Error> {
+        let _marker = marker;
+        let _ = started.send(());
+        pending::<()>().await;
+        Ok(Response::Finished)
+    }
 }
 
-fn finished(
-    _service: &mut ServiceContext<TestService, TestMessage, ()>,
-    event: Finished,
-) -> Result<(), RuntimeError> {
-    let _ = event.outcome;
-    Ok(())
-}
+impl Service for TestService {
+    type Request = Request;
+    type Response = Response;
+    type Error = Error;
 
-fn context() -> MessageContext {
-    MessageContext::new(OperationId(1), TraceContext::root(1))
-}
-
-#[tokio::test]
-async fn control_channel_is_prioritized_and_lifecycle_rejects_new_business() {
-    let mut registry = HandlerRegistry::new();
-    register_handlers!(registry, { Start => start, Finished => finished }).unwrap();
-    let mut services = PoolServices::new();
-    let worker = services
-        .spawn(TestService::Worker, (), registry, 8)
-        .await
-        .unwrap();
-
-    worker.control.pause().await.unwrap();
-    assert_eq!(
-        worker.observer.snapshot().lifecycle,
-        ServiceLifecycle::Paused
-    );
-    let (started, _ticket) = request_channel();
-    let error = worker
-        .command
-        .send_payload(
-            Start {
-                marker: DropMarker(Arc::new(AtomicBool::new(false))),
-                started,
-            },
-            context(),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(error, RuntimeError::ServiceUnavailable(_)));
-
-    worker.control.resume().await.unwrap();
-    worker.control.drain().await.unwrap();
-    assert_eq!(
-        worker.observer.snapshot().lifecycle,
-        ServiceLifecycle::Paused
-    );
-    worker
-        .control
-        .shutdown(ServiceShutdown::Immediate)
-        .await
-        .unwrap();
-    assert_eq!(
-        worker.observer.snapshot().lifecycle,
-        ServiceLifecycle::Stopped
-    );
+    fn handle(
+        self: Arc<Self>,
+        request: Request,
+        _context: RequestContext,
+    ) -> HandleResult<Response, Error> {
+        match request {
+            Request::Query => HandleResult::ok(Response::Value(7)),
+            Request::Work => HandleResult::task(TaskSpec::new(
+                TaskMeta::new(TaskKey::new("work"), "test work"),
+                move |task| self.work(task),
+            )),
+            Request::Never { marker, started } => HandleResult::task(TaskSpec::new(
+                TaskMeta::new(TaskKey::new("never"), "never completes"),
+                move |_| self.never(marker, started),
+            )),
+        }
+    }
 }
 
 #[tokio::test]
-async fn dropping_the_service_container_drops_every_managed_future() {
-    let mut registry = HandlerRegistry::new();
-    register_handlers!(registry, { Start => start, Finished => finished }).unwrap();
-    let mut services = PoolServices::new();
-    let worker = services
-        .spawn(TestService::Worker, (), registry, 8)
+async fn handle_decides_between_an_immediate_reply_and_a_managed_task() {
+    let mut services = ServiceGroup::new();
+    let service = services
+        .spawn(Kind::Test, Arc::new(TestService), 8)
+        .await
+        .unwrap();
+    let mut events = service.observer.task_events();
+
+    assert_eq!(
+        service.client.call(Request::Query).await.unwrap(),
+        Response::Value(7)
+    );
+    assert!(events.try_recv().is_err());
+    assert!(service.observer.task_snapshots().is_empty());
+
+    let Submission::Task(ticket) = service.client.submit(Request::Work).await.unwrap() else {
+        panic!("work must create a managed task");
+    };
+    let exit = ticket
+        .cancel_and_wait(CancelReason::requested("test"))
+        .await
+        .unwrap();
+    assert!(matches!(exit, TaskExit::Cancelled(_)));
+    assert!(service.observer.task_snapshots().is_empty());
+
+    services
+        .shutdown_all(ShutdownMode::Immediate)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_control_rejects_new_requests_while_paused() {
+    let mut services = ServiceGroup::new();
+    let service = services
+        .spawn(Kind::Test, Arc::new(TestService), 8)
+        .await
+        .unwrap();
+
+    service.control.pause().await.unwrap();
+    assert_eq!(
+        service.observer.snapshot().lifecycle,
+        ServiceLifecycle::Paused
+    );
+    assert!(service.client.submit(Request::Query).await.is_err());
+
+    service.control.resume().await.unwrap();
+    assert_eq!(
+        service.client.call(Request::Query).await.unwrap(),
+        Response::Value(7)
+    );
+    service.control.drain().await.unwrap();
+    assert_eq!(
+        service.observer.snapshot().lifecycle,
+        ServiceLifecycle::Paused
+    );
+    services
+        .shutdown_all(ShutdownMode::Immediate)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_the_service_group_drops_every_managed_future() {
+    let mut services = ServiceGroup::new();
+    let service = services
+        .spawn(Kind::Test, Arc::new(TestService), 8)
         .await
         .unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
-    let (started, ticket) = request_channel();
-    worker
-        .command
-        .send_payload(
-            Start {
-                marker: DropMarker(dropped.clone()),
-                started,
-            },
-            context(),
-        )
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let _submission = service
+        .client
+        .submit(Request::Never {
+            marker: DropMarker(dropped.clone()),
+            started,
+        })
         .await
         .unwrap();
-    ticket.await.unwrap();
+    ready.await.unwrap();
 
     drop(services);
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -153,5 +177,5 @@ async fn dropping_the_service_container_drops_every_managed_future() {
         }
     })
     .await
-    .expect("managed future leaked after ServiceEntry was dropped");
+    .expect("managed future leaked after ServiceGroup drop");
 }

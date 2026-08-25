@@ -1,0 +1,20 @@
+@startuml
+participant Caller
+participant Disk
+participant Rebuild
+participant BG
+
+Caller -> Disk : cancel task
+activate Disk
+Disk -> Rebuild : cancel child
+activate Rebuild
+Rebuild -> BG : cancel child
+activate BG
+BG -> BG : cancel external I/O\nand await acknowledgement
+BG --> Rebuild : TaskExit::Cancelled
+deactivate BG
+Rebuild --> Disk : TaskExit::Cancelled
+deactivate Rebuild
+Disk --> Caller : TaskExit::Cancelled
+deactivate Disk
+@enduml

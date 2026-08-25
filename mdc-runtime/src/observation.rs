@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use tokio::sync::{broadcast, watch};
 
-use crate::{OperationId, ServiceKey, TaskId, TaskKey, TraceContext};
+use crate::{OperationId, TaskId, TaskKey, TaskVisibility, TraceContext};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceLifecycle {
@@ -19,86 +21,88 @@ pub enum ServiceActivity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServiceSnapshot<K>
-where
-    K: ServiceKey,
-{
+pub struct ServiceSnapshot<K> {
     pub service: K,
     pub lifecycle: ServiceLifecycle,
     pub activity: ServiceActivity,
-    pub queued_messages: usize,
-    pub running_tasks: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskVisibility {
-    Public,
-    Internal,
+    pub queued_requests: usize,
+    pub managed_tasks: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
-    Started,
+    Queued,
+    Running,
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
+    Aborted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskEvent<K>
-where
-    K: ServiceKey,
-{
+pub struct TaskSnapshot<K> {
     pub service: K,
     pub task_id: TaskId,
     pub key: TaskKey,
-    pub label: String,
+    pub label: Arc<str>,
     pub state: TaskState,
     pub visibility: TaskVisibility,
     pub operation_id: OperationId,
     pub trace: TraceContext,
 }
 
-pub struct ServiceObserver<K>
-where
-    K: ServiceKey,
-{
-    status: watch::Receiver<ServiceSnapshot<K>>,
-    tasks: broadcast::Sender<TaskEvent<K>>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskEvent<K> {
+    pub task: TaskSnapshot<K>,
 }
 
-impl<K> ServiceObserver<K>
-where
-    K: ServiceKey,
-{
+pub struct ServiceObserver<K> {
+    status: watch::Receiver<ServiceSnapshot<K>>,
+    tasks: watch::Receiver<Vec<TaskSnapshot<K>>>,
+    events: broadcast::Sender<TaskEvent<K>>,
+}
+
+impl<K: Clone> ServiceObserver<K> {
     pub(crate) fn new(
         status: watch::Receiver<ServiceSnapshot<K>>,
-        tasks: broadcast::Sender<TaskEvent<K>>,
+        tasks: watch::Receiver<Vec<TaskSnapshot<K>>>,
+        events: broadcast::Sender<TaskEvent<K>>,
     ) -> Self {
-        Self { status, tasks }
+        Self {
+            status,
+            tasks,
+            events,
+        }
     }
 
     pub fn snapshot(&self) -> ServiceSnapshot<K> {
         self.status.borrow().clone()
     }
 
+    pub fn task_snapshots(&self) -> Vec<TaskSnapshot<K>> {
+        self.tasks.borrow().clone()
+    }
+
     pub fn watch_status(&self) -> watch::Receiver<ServiceSnapshot<K>> {
         self.status.clone()
     }
 
-    pub fn watch_tasks(&self) -> broadcast::Receiver<TaskEvent<K>> {
-        self.tasks.subscribe()
+    pub fn watch_tasks(&self) -> watch::Receiver<Vec<TaskSnapshot<K>>> {
+        self.tasks.clone()
+    }
+
+    pub fn task_events(&self) -> broadcast::Receiver<TaskEvent<K>> {
+        self.events.subscribe()
     }
 }
 
-impl<K> Clone for ServiceObserver<K>
-where
-    K: ServiceKey,
-{
+impl<K: Clone> Clone for ServiceObserver<K> {
     fn clone(&self) -> Self {
         Self {
             status: self.status.clone(),
             tasks: self.tasks.clone(),
+            events: self.events.clone(),
         }
     }
 }

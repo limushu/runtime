@@ -1,0 +1,21 @@
+@startuml
+left to right direction
+skinparam componentStyle rectangle
+
+actor Caller
+component ServiceClient
+component "Service Executor\n(one Tokio task)" as Executor
+component "Service::handle" as Handle
+database "Service core metadata" as Metadata
+collections "TaskSet\nFuturesUnordered" as Tasks
+component "Child ServiceClient" as Child
+
+Caller --> ServiceClient : call / submit
+ServiceClient --> Executor : business mpsc
+Executor --> Handle : direct call
+Handle --> Metadata : short domain methods
+Handle --> Executor : Reply or TaskSpec
+Executor --> Tasks : insert and poll
+Tasks --> Child : TaskContext::call
+Executor --> Caller : oneshot / TaskTicket
+@enduml
