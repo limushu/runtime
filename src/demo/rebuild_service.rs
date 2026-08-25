@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use crate::{
-    HandleResult, RequestContext, Router, Service, TaskContext, TaskKey, TaskMeta, TaskSpec,
-};
+use crate::{HandleResult, RequestContext, Router, Service, TaskKey, TaskMeta, TaskSpec};
 
 use super::{
     BgRequest, BgService, DemoError, DiskId, RebuildRequest, RebuildResponse, ServiceKind,
@@ -22,19 +20,22 @@ impl RebuildService {
         }
     }
 
-    async fn rebuild_workflow(
-        self: Arc<Self>,
-        disk: DiskId,
-        task: TaskContext,
-    ) -> Result<RebuildResponse, DemoError> {
-        self.metadata.begin(disk.clone());
+    fn rebuild_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<RebuildResponse, DemoError> {
+        let meta = TaskMeta::new(
+            TaskKey::new(format!("rebuild/{disk}")),
+            format!("rebuild disk {disk}"),
+        );
 
-        let bg = self.router.client::<BgService>(&ServiceKind::Bg)?;
-        let result = task.call(&bg, BgRequest::Rebuild(disk.clone())).await;
+        HandleResult::task(TaskSpec::new(meta, move |task| async move {
+            self.metadata.begin(disk.clone());
 
-        self.metadata.finish(&disk);
-        result?;
-        Ok(RebuildResponse::Completed)
+            let bg = self.router.client::<BgService>(&ServiceKind::Bg)?;
+            let result = task.call(&bg, BgRequest::Rebuild(disk.clone())).await;
+
+            self.metadata.finish(&disk);
+            result?;
+            Ok(RebuildResponse::Completed)
+        }))
     }
 }
 
@@ -49,15 +50,7 @@ impl Service for RebuildService {
         _context: RequestContext,
     ) -> HandleResult<RebuildResponse, DemoError> {
         match request {
-            RebuildRequest::Start(disk) => {
-                let meta = TaskMeta::new(
-                    TaskKey::new(format!("rebuild/{disk}")),
-                    format!("rebuild disk {disk}"),
-                );
-                HandleResult::task(TaskSpec::new(meta, move |task| {
-                    self.rebuild_workflow(disk, task)
-                }))
-            }
+            RebuildRequest::Start(disk) => self.rebuild_workflow(disk),
         }
     }
 }

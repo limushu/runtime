@@ -42,6 +42,8 @@ pub trait Service: Send + Sync + 'static {
     type Response: Send + 'static;
     type Error: Send + 'static;
 
+    /// Routes a protocol request to the corresponding service member method.
+    /// The member method owns the Reply/Task decision and task policy.
     fn handle(
         self: Arc<Self>,
         request: Self::Request,

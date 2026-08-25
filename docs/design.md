@@ -3,7 +3,7 @@
 ## 1. 最终抽象
 
 ```text
-Service = 核心元数据 + Client + handle + async workflow
+Service = 核心元数据 + Client + 请求路由 + workflow
 Task    = 身份/控制/观测 + Future 执行体
 Executor = 业务通道 + 控制通道 + TaskSet + 唯一 poll 循环
 Router  = ServiceKind -> 类型化 ServiceClient
@@ -15,7 +15,7 @@ Router  = ServiceKind -> 类型化 ServiceClient
 
 ## 2. 请求边界
 
-`Service::handle` 是短小同步方法。它返回：
+`Service::handle` 是短小同步分发方法，只负责把 Request 路由到对应的 Service 成员方法。成员方法返回：
 
 ```rust
 pub enum HandleResult<T, E> {
@@ -24,7 +24,7 @@ pub enum HandleResult<T, E> {
 }
 ```
 
-因此简单 Query 只有一次 mpsc + oneshot；只有需要长期执行、取消、排重和观测的请求才成为 Task。
+Reply/Task 决策及 TaskKey、可见性、冲突策略属于具体工作流，不属于 `handle`。因此简单 Query 只有一次 mpsc + oneshot；只有需要长期执行、取消、排重和观测的请求才成为 Task。
 
 ## 3. Task 所有权
 
@@ -44,7 +44,7 @@ pub enum HandleResult<T, E> {
 - AbortHandle；
 - pending replacement。
 
-Service 能定义 Task，但不能直接 poll、删除或篡改 TaskSlot。
+工作流成员方法能定义 Task，但不能直接 poll、删除或篡改 TaskSlot。
 
 ## 4. 结构化取消
 
