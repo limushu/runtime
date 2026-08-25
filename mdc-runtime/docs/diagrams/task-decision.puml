@@ -1,11 +1,13 @@
 @startuml
 start
 :Service::handle(request);
-if (needs managed workflow?) then (no)
+:route to Service member method;
+if (workflow needs managed task?) then (no)
   :HandleResult::Reply;
   :send oneshot response;
 else (yes)
-  :HandleResult::Task(TaskSpec);
+  :workflow builds TaskSpec;
+  :HandleResult::Task;
   :TaskSet checks TaskKey;
   :poll workflow Future;
   :send TaskExit;

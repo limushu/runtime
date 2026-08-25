@@ -9,7 +9,7 @@ use std::{
 
 use mdc_runtime::{
     CancelReason, HandleResult, RequestContext, Service, ServiceGroup, ServiceLifecycle,
-    ShutdownMode, Submission, TaskContext, TaskExit, TaskKey, TaskMeta, TaskSpec,
+    ShutdownMode, Submission, TaskExit, TaskKey, TaskMeta, TaskSpec,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -46,21 +46,35 @@ impl Drop for DropMarker {
 struct TestService;
 
 impl TestService {
-    async fn work(self: Arc<Self>, task: TaskContext) -> Result<Response, Error> {
-        task.cancelled().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        Ok(Response::Finished)
+    fn query(&self) -> HandleResult<Response, Error> {
+        HandleResult::ok(Response::Value(7))
     }
 
-    async fn never(
+    fn work_workflow(self: Arc<Self>) -> HandleResult<Response, Error> {
+        HandleResult::task(TaskSpec::new(
+            TaskMeta::new(TaskKey::new("work"), "test work"),
+            move |task| async move {
+                task.cancelled().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(Response::Finished)
+            },
+        ))
+    }
+
+    fn never_workflow(
         self: Arc<Self>,
         marker: DropMarker,
         started: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<Response, Error> {
-        let _marker = marker;
-        let _ = started.send(());
-        pending::<()>().await;
-        Ok(Response::Finished)
+    ) -> HandleResult<Response, Error> {
+        HandleResult::task(TaskSpec::new(
+            TaskMeta::new(TaskKey::new("never"), "never completes"),
+            move |_| async move {
+                let _marker = marker;
+                let _ = started.send(());
+                pending::<()>().await;
+                Ok(Response::Finished)
+            },
+        ))
     }
 }
 
@@ -75,21 +89,15 @@ impl Service for TestService {
         _context: RequestContext,
     ) -> HandleResult<Response, Error> {
         match request {
-            Request::Query => HandleResult::ok(Response::Value(7)),
-            Request::Work => HandleResult::task(TaskSpec::new(
-                TaskMeta::new(TaskKey::new("work"), "test work"),
-                move |task| self.work(task),
-            )),
-            Request::Never { marker, started } => HandleResult::task(TaskSpec::new(
-                TaskMeta::new(TaskKey::new("never"), "never completes"),
-                move |_| self.never(marker, started),
-            )),
+            Request::Query => self.query(),
+            Request::Work => self.work_workflow(),
+            Request::Never { marker, started } => self.never_workflow(marker, started),
         }
     }
 }
 
 #[tokio::test]
-async fn handle_decides_between_an_immediate_reply_and_a_managed_task() {
+async fn service_method_decides_between_an_immediate_reply_and_a_managed_task() {
     let mut services = ServiceGroup::new();
     let service = services
         .spawn(Kind::Test, Arc::new(TestService), 8)

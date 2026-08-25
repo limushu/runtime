@@ -22,12 +22,14 @@ impl DiskMetadata {
 
 工作流拿不到锁和 `&mut` 引用，因此无法把锁带过 `.await`。
 
-## 2. `handle` 只做一次选择
+## 2. `handle` 只做协议分发
 
 ```text
 Request
-  ├── Reply：查询、校验、读取内存元数据
-  └── Task：RPC、等待、长流程、需要取消和观测的操作
+  └── handle
+        └── 对应的 Service 成员方法
+              ├── Reply：查询、校验、读取内存元数据
+              └── Task：RPC、等待、长流程、需要取消和观测的操作
 ```
 
 ```rust
@@ -42,36 +44,51 @@ impl Service for DiskService {
         _context: RequestContext,
     ) -> HandleResult<DiskResponse, DiskError> {
         match request {
-            DiskRequest::Query(disk) => {
-                HandleResult::ok(DiskResponse::Snapshot(self.metadata.query(&disk)))
-            }
-            DiskRequest::Offline(disk) => {
-                HandleResult::task(self.offline_task(disk))
-            }
+            DiskRequest::Query(disk) => self.query(&disk),
+            DiskRequest::Offline(disk) => self.offline_workflow(disk),
         }
     }
 }
 ```
 
-不要为查询创建 Task。立即回复不会进入 TaskSet，也不会产生 Task 观测事件。
+`handle` 不知道 TaskKey、冲突策略或工作流步骤。新增业务请求时，只在这里增加一条到成员方法的静态路由。
 
-## 3. Task 与 Future 分开
+## 3. 工作流自己决定是否创建 Task
+
+查询成员方法直接回复：
 
 ```rust
-fn offline_task(self: Arc<Self>, disk: DiskId) -> TaskSpec<DiskResponse, DiskError> {
+fn query(&self, disk: &DiskId) -> HandleResult<DiskResponse, DiskError> {
+    HandleResult::ok(DiskResponse::Snapshot(self.metadata.query(disk)))
+}
+```
+
+需要受管执行的工作流自行构造 Task：
+
+```rust
+fn offline_workflow(
+    self: Arc<Self>,
+    disk: DiskId,
+) -> HandleResult<DiskResponse, DiskError> {
     let meta = TaskMeta::new(
         TaskKey::new(format!("disk/{disk}")),
         format!("offline disk {disk}"),
     )
     .public();
 
-    TaskSpec::new(meta, move |task| {
-        self.offline_workflow(disk, task)
-    })
+    HandleResult::task(TaskSpec::new(meta, move |task| async move {
+        self.metadata.begin_offline(&disk)?;
+        task.call(&self.rebuild, StartRebuild { disk: disk.clone() })
+            .await?;
+        self.metadata.complete_offline(&disk)?;
+        Ok(DiskResponse::OfflineCompleted)
+    }))
 }
 ```
 
-`TaskMeta` 定义身份和观测信息，async workflow 定义执行步骤。Executor 独占 Future 的 poll、索引、完成回复和最终回收。
+工作流拥有“是否形成 Task、Task 是谁、与同对象任务如何冲突”的业务决策。Executor 仍独占 Future 的 poll、索引、完成回复和最终回收；所谓工作流管理 Task，不是让业务直接修改 `TaskSet`。
+
+不要为查询创建 Task。立即回复不会进入 TaskSet，也不会产生 Task 观测事件。
 
 ## 4. 跨 Service 调用
 
@@ -115,8 +132,18 @@ ticket.cancel_and_wait(CancelReason::requested("operator cancel"))
 高优先级操作需要替换旧操作时：
 
 ```rust
-TaskSpec::new(meta, move |task| self.fault_workflow(disk, task))
-    .replace_running(CancelReason::Preempted { by: key })
+fn fault_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<DiskResponse, DiskError> {
+    let key = TaskKey::new(format!("disk/{disk}"));
+    let meta = TaskMeta::new(key.clone(), format!("fault disk {disk}"));
+
+    HandleResult::task(
+        TaskSpec::new(meta, move |_task| async move {
+            self.metadata.mark_faulted(&disk)?;
+            Ok(DiskResponse::Faulted)
+        })
+        .replace_running(CancelReason::Preempted { by: key }),
+    )
+}
 ```
 
 新 Task 先进入 `Queued`。只有旧 Task 完成整条优雅取消链后，Executor 才启动新 Task；二者不会重叠执行。
@@ -140,7 +167,8 @@ match client.submit(request).await? {
 ## 8. Code review 清单
 
 - 查询是否直接 `Reply`，而不是创建空 Task？
-- workflow 是否是 Service 的 async 成员方法？
+- `handle` 是否只做 Request 到成员方法的静态路由？
+- 是否由工作流成员方法决定 Reply/Task 以及 Task 策略？
 - Service 是否只持有自己的核心元数据？
 - 跨模块是否只通过类型化 Client？
 - 是否存在 workflow 内部的 `tokio::spawn`？
