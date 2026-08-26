@@ -5,17 +5,19 @@ skinparam componentStyle rectangle
 actor Caller
 component ServiceClient
 component "Service Executor\n(one Tokio task)" as Executor
-component "Service::handle" as Handle
+collections "HandlerSet\nFuturesUnordered" as Handlers
+component "Service::handle\nasync Future" as Handle
 database "Service core metadata" as Metadata
-collections "TaskSet\nFuturesUnordered" as Tasks
-component "Child ServiceClient" as Child
+component "ServiceTaskManager\n(no Futures)" as Tasks
+component Router
 
-Caller --> ServiceClient : call / submit
-ServiceClient --> Executor : business mpsc
-Executor --> Handle : direct call
-Handle --> Metadata : short domain methods
-Handle --> Executor : Reply or TaskSpec
-Executor --> Tasks : insert and poll
-Tasks --> Child : TaskContext::call
+Caller --> ServiceClient : call / submit / send
+ServiceClient --> Executor : RequestEnvelope
+Executor --> Handle : create Future
+Executor --> Handlers : insert / poll
+Handle --> Metadata : domain methods
+Handle --> Tasks : optional create_new_task
+Handle --> Router : call + RequestContext
+Router --> ServiceClient : typed downstream request
 Executor --> Caller : oneshot / TaskTicket
 @enduml

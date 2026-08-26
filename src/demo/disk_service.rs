@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    CancelReason, HandleResult, RequestContext, Router, Service, TaskKey, TaskMeta, TaskSpec,
+    CancelReason, ConflictPolicy, RequestContext, Router, Service, ServiceTaskManager, TaskKey,
+    TaskMeta,
 };
 
 use super::{
@@ -12,6 +13,7 @@ use super::{
 pub struct DiskService {
     metadata: DiskMetadata,
     router: Router<ServiceKind>,
+    tasks: ServiceTaskManager<ServiceKind>,
 }
 
 impl DiskService {
@@ -19,70 +21,90 @@ impl DiskService {
         Self {
             metadata: DiskMetadata::new(disks),
             router,
+            tasks: ServiceTaskManager::new(ServiceKind::Disk),
         }
     }
 
-    fn query(&self, disk: &DiskId) -> HandleResult<DiskResponse, DemoError> {
-        HandleResult::ok(DiskResponse::Snapshot(self.metadata.query(disk)))
+    fn query(&self, disk: &DiskId) -> DiskResponse {
+        DiskResponse::Snapshot(self.metadata.query(disk))
     }
 
-    fn offline_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<DiskResponse, DemoError> {
-        let meta = TaskMeta::new(
-            TaskKey::new(format!("disk/{disk}")),
-            format!("offline disk {disk}"),
-        )
-        .public();
+    async fn offline_workflow(
+        self: Arc<Self>,
+        disk: DiskId,
+        context: RequestContext,
+    ) -> Result<DiskResponse, DemoError> {
+        let task = self
+            .create_new_task(
+                &context,
+                TaskMeta::new(
+                    TaskKey::new(format!("disk/{disk}")),
+                    format!("offline disk {disk}"),
+                )
+                .public(),
+                ConflictPolicy::Reject,
+            )
+            .await?;
 
-        HandleResult::task(TaskSpec::new(meta, move |task| async move {
-            self.metadata.set(&disk, DiskState::Offlining)?;
-            let rebuild = self
-                .router
-                .client::<RebuildService>(&ServiceKind::Rebuild)?;
-            let result = task
-                .call(&rebuild, RebuildRequest::Start(disk.clone()))
-                .await;
+        self.metadata.set(&disk, DiskState::Offlining)?;
+        let result = self
+            .router
+            .call::<RebuildService>(
+                &ServiceKind::Rebuild,
+                RebuildRequest::Start(disk.clone()),
+                context.with_task(&task),
+            )
+            .await;
 
-            match result {
-                Ok(_) => {
-                    self.metadata.set(&disk, DiskState::Offline)?;
-                    Ok(DiskResponse::OfflineCompleted)
-                }
-                Err(error) => {
-                    self.metadata.set(&disk, DiskState::Online)?;
-                    Err(error.into())
-                }
+        match result {
+            Ok(_) => {
+                self.metadata.set(&disk, DiskState::Offline)?;
+                Ok(DiskResponse::OfflineCompleted)
             }
-        }))
+            Err(error) => {
+                self.metadata.set(&disk, DiskState::Online)?;
+                Err(error.into())
+            }
+        }
     }
 
-    fn fault_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<DiskResponse, DemoError> {
+    async fn fault_workflow(
+        self: Arc<Self>,
+        disk: DiskId,
+        context: RequestContext,
+    ) -> Result<DiskResponse, DemoError> {
         let key = TaskKey::new(format!("disk/{disk}"));
-        let meta = TaskMeta::new(key.clone(), format!("fault disk {disk}")).public();
-
-        HandleResult::task(
-            TaskSpec::new(meta, move |_task| async move {
-                self.metadata.set(&disk, DiskState::Faulted)?;
-                Ok(DiskResponse::Faulted)
-            })
-            .replace_running(CancelReason::Preempted { by: key }),
-        )
+        let _task = self
+            .create_new_task(
+                &context,
+                TaskMeta::new(key.clone(), format!("fault disk {disk}")).public(),
+                ConflictPolicy::Replace(CancelReason::Preempted { by: key }),
+            )
+            .await?;
+        self.metadata.set(&disk, DiskState::Faulted)?;
+        Ok(DiskResponse::Faulted)
     }
 }
 
 impl Service for DiskService {
+    type Key = ServiceKind;
     type Request = DiskRequest;
     type Response = DiskResponse;
     type Error = DemoError;
 
-    fn handle(
+    fn task_manager(&self) -> &ServiceTaskManager<ServiceKind> {
+        &self.tasks
+    }
+
+    async fn handle(
         self: Arc<Self>,
         request: DiskRequest,
-        _context: RequestContext,
-    ) -> HandleResult<DiskResponse, DemoError> {
+        context: RequestContext,
+    ) -> Result<DiskResponse, DemoError> {
         match request {
-            DiskRequest::Query(disk) => self.query(&disk),
-            DiskRequest::Offline(disk) => self.offline_workflow(disk),
-            DiskRequest::Fault(disk) => self.fault_workflow(disk),
+            DiskRequest::Query(disk) => Ok(self.query(&disk)),
+            DiskRequest::Offline(disk) => self.offline_workflow(disk, context).await,
+            DiskRequest::Fault(disk) => self.fault_workflow(disk, context).await,
         }
     }
 }

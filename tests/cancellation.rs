@@ -23,6 +23,14 @@ async fn cancellation_waits_for_the_complete_downstream_chain() {
     };
     wait_until(|| !backend.snapshot().started.is_empty()).await;
 
+    let disk_task = pool.disk.observer.task_snapshots().remove(0);
+    let rebuild_task = pool.rebuild.observer.task_snapshots().remove(0);
+    let bg_task = pool.bg.observer.task_snapshots().remove(0);
+    assert_eq!(disk_task.operation_id, rebuild_task.operation_id);
+    assert_eq!(rebuild_task.operation_id, bg_task.operation_id);
+    assert_eq!(rebuild_task.trace.parent_task, Some(disk_task.task_id));
+    assert_eq!(bg_task.trace.parent_task, Some(rebuild_task.task_id));
+
     let started = Instant::now();
     let exit = ticket
         .cancel_and_wait(CancelReason::requested("operator cancel"))

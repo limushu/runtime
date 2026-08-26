@@ -8,8 +8,8 @@ use std::{
 };
 
 use mdc_runtime::{
-    CancelReason, HandleResult, RequestContext, Service, ServiceGroup, ServiceLifecycle,
-    ShutdownMode, Submission, TaskExit, TaskKey, TaskMeta, TaskSpec,
+    CancelReason, ConflictPolicy, RequestContext, Service, ServiceGroup, ServiceLifecycle,
+    ServiceTaskManager, ShutdownMode, Submission, TaskExit, TaskKey, TaskMeta,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -43,64 +43,71 @@ impl Drop for DropMarker {
     }
 }
 
-struct TestService;
+struct TestService {
+    tasks: ServiceTaskManager<Kind>,
+}
 
 impl TestService {
-    fn query(&self) -> HandleResult<Response, Error> {
-        HandleResult::ok(Response::Value(7))
+    fn new() -> Self {
+        Self {
+            tasks: ServiceTaskManager::new(Kind::Test),
+        }
     }
 
-    fn work_workflow(self: Arc<Self>) -> HandleResult<Response, Error> {
-        HandleResult::task(TaskSpec::new(
-            TaskMeta::new(TaskKey::new("work"), "test work"),
-            move |task| async move {
-                task.cancelled().await;
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                Ok(Response::Finished)
-            },
-        ))
+    async fn work_workflow(self: Arc<Self>, context: RequestContext) -> Result<Response, Error> {
+        let task = self
+            .create_new_task(
+                &context,
+                TaskMeta::new(TaskKey::new("work"), "test work"),
+                ConflictPolicy::Reject,
+            )
+            .await
+            .map_err(|_| Error)?;
+        task.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(Response::Finished)
     }
 
-    fn never_workflow(
+    async fn never_workflow(
         self: Arc<Self>,
         marker: DropMarker,
         started: tokio::sync::oneshot::Sender<()>,
-    ) -> HandleResult<Response, Error> {
-        HandleResult::task(TaskSpec::new(
-            TaskMeta::new(TaskKey::new("never"), "never completes"),
-            move |_| async move {
-                let _marker = marker;
-                let _ = started.send(());
-                pending::<()>().await;
-                Ok(Response::Finished)
-            },
-        ))
+    ) -> Result<Response, Error> {
+        let _marker = marker;
+        let _ = started.send(());
+        pending::<()>().await;
+        Ok(Response::Finished)
     }
 }
 
 impl Service for TestService {
+    type Key = Kind;
     type Request = Request;
     type Response = Response;
     type Error = Error;
 
-    fn handle(
+    fn task_manager(&self) -> &ServiceTaskManager<Kind> {
+        &self.tasks
+    }
+
+    async fn handle(
         self: Arc<Self>,
         request: Request,
-        _context: RequestContext,
-    ) -> HandleResult<Response, Error> {
+        context: RequestContext,
+    ) -> Result<Response, Error> {
         match request {
-            Request::Query => self.query(),
-            Request::Work => self.work_workflow(),
-            Request::Never { marker, started } => self.never_workflow(marker, started),
+            Request::Query => Ok(Response::Value(7)),
+            Request::Work => self.work_workflow(context).await,
+            Request::Never { marker, started } => self.never_workflow(marker, started).await,
         }
     }
 }
 
 #[tokio::test]
-async fn service_method_decides_between_an_immediate_reply_and_a_managed_task() {
+async fn handler_future_can_optionally_create_a_managed_task() {
     let mut services = ServiceGroup::new();
     let service = services
-        .spawn(Kind::Test, Arc::new(TestService), 8)
+        .spawn(Kind::Test, Arc::new(TestService::new()), 8)
         .await
         .unwrap();
     let mut events = service.observer.task_events();
@@ -132,7 +139,7 @@ async fn service_method_decides_between_an_immediate_reply_and_a_managed_task() 
 async fn lifecycle_control_rejects_new_requests_while_paused() {
     let mut services = ServiceGroup::new();
     let service = services
-        .spawn(Kind::Test, Arc::new(TestService), 8)
+        .spawn(Kind::Test, Arc::new(TestService::new()), 8)
         .await
         .unwrap();
 
@@ -160,23 +167,25 @@ async fn lifecycle_control_rejects_new_requests_while_paused() {
 }
 
 #[tokio::test]
-async fn dropping_the_service_group_drops_every_managed_future() {
+async fn dropping_the_service_group_drops_every_handler_future() {
     let mut services = ServiceGroup::new();
     let service = services
-        .spawn(Kind::Test, Arc::new(TestService), 8)
+        .spawn(Kind::Test, Arc::new(TestService::new()), 8)
         .await
         .unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
     let (started, ready) = tokio::sync::oneshot::channel();
-    let _submission = service
+    service
         .client
-        .submit(Request::Never {
+        .send(Request::Never {
             marker: DropMarker(dropped.clone()),
             started,
         })
         .await
         .unwrap();
     ready.await.unwrap();
+    assert_eq!(service.observer.snapshot().inflight_requests, 1);
+    assert!(service.observer.task_snapshots().is_empty());
 
     drop(services);
     tokio::time::timeout(Duration::from_secs(1), async {

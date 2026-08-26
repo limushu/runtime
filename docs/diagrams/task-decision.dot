@@ -2,13 +2,16 @@ digraph decision {
   graph [rankdir=TB, bgcolor="transparent", pad=0.3, nodesep=0.4, ranksep=0.5];
   node [shape=box, style="rounded,filled", fontname="Arial", color="#64748b", fillcolor="#f8fafc", fontcolor="#0f172a"];
   edge [fontname="Arial", color="#475569", fontcolor="#334155"];
-  request [label="Request", shape=oval, fillcolor="#eef2ff"];
-  handle [label="Service::handle(request)\nroute only", fillcolor="#dbeafe"];
-  workflow [label="Service member workflow", fillcolor="#e0f2fe"];
-  choice [label="needs managed task?", shape=diamond, fillcolor="#fef3c7"];
-  reply [label="HandleResult::Reply\noneshot response", fillcolor="#dcfce7"];
-  task [label="workflow builds TaskSpec\nTaskSet poll + TaskExit", fillcolor="#f3e8ff"];
-  request -> handle -> workflow -> choice;
-  choice -> reply [label=" no"];
-  choice -> task [label=" yes"];
+  request [label="RequestEnvelope", shape=oval, fillcolor="#eef2ff"];
+  handler [label="Service::handle -> Handler Future", fillcolor="#dbeafe"];
+  poll [label="HandlerSet polls Future", fillcolor="#e0f2fe"];
+  choice [label="needs managed control scope?", shape=diamond, fillcolor="#fef3c7"];
+  plain [label="continue without Task", fillcolor="#dcfce7"];
+  manager [label="Service::create_new_task\nServiceTaskManager admission", fillcolor="#f3e8ff"];
+  result [label="Handler Result\nreply or TaskTicket terminal", fillcolor="#dcfce7"];
+  request -> handler -> poll -> choice;
+  choice -> plain [label=" no"];
+  choice -> manager [label=" yes"];
+  plain -> result;
+  manager -> result [label=" TaskContext"];
 }
