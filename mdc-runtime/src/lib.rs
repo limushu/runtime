@@ -1,7 +1,7 @@
-//! One Tokio task per service, many explicitly managed workflow futures.
+//! One Tokio task per service, polling many request handler futures.
 //!
-//! A service handles a request in one of two ways: reply immediately, or return
-//! a [`TaskSpec`] whose future is polled by the service executor.
+//! Services own their task managers. A handler may create a managed task scope,
+//! while the executor remains responsible only for polling handler futures.
 
 mod cancellation;
 mod executor;
@@ -18,13 +18,15 @@ pub use observation::{
     TaskState,
 };
 pub use protocol::{
-    CallError, CancelReason, OperationId, RuntimeError, TaskExit, TaskId, TaskKey, TraceContext,
+    CallError, CancelReason, OperationId, RequestId, RuntimeError, TaskExit, TaskId, TaskKey,
+    TraceContext,
 };
 pub use router::Router;
 pub use service::{
-    ControlHandle, HandleResult, Service, ServiceClient, ServiceGroup, ServiceKey, ServiceRef,
-    ShutdownMode, Submission, TaskTicket,
+    ControlHandle, Service, ServiceClient, ServiceGroup, ServiceKey, ServiceRef, ShutdownMode,
+    Submission, TaskTicket,
 };
 pub use task::{
-    ConflictPolicy, RequestContext, TaskContext, TaskFuture, TaskMeta, TaskSpec, TaskVisibility,
+    ConflictPolicy, RequestContext, ServiceTaskManager, TaskContext, TaskMeta, TaskRef,
+    TaskVisibility,
 };

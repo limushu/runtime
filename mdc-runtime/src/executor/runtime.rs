@@ -1,33 +1,39 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    CancelReason, HandleResult, RuntimeError, Service, ServiceActivity, ServiceKey,
-    ServiceLifecycle, ServiceObserver, ServiceRef, ServiceSnapshot, ShutdownMode, TaskSnapshot,
+    RuntimeError, Service, ServiceActivity, ServiceKey, ServiceLifecycle, ServiceObserver,
+    ServiceRef, ServiceSnapshot, ShutdownMode, Submission, TaskExit,
     service::{
-        RequestEnvelope, RuntimeControl, ServiceTaskGuard, SpawnedService, client, control,
-        lifecycle_snapshot,
+        Accepted, RequestEnvelope, RuntimeControl, ServiceTaskGuard, SpawnedService, client,
+        control, lifecycle_snapshot,
     },
+    task::HandlerOutcome,
 };
 
-use super::task_set::TaskSet;
+use super::handler_set::{FinishedHandler, HandlerExit, HandlerSet};
+
+type ManagedCompletion<S> =
+    oneshot::Sender<TaskExit<<S as Service>::Response, <S as Service>::Error>>;
 
 struct ServiceRuntime<K, S>
 where
     K: ServiceKey,
-    S: Service,
+    S: Service<Key = K>,
 {
     key: K,
     service: Arc<S>,
     requests: mpsc::Receiver<RequestEnvelope<S>>,
     controls: mpsc::Receiver<RuntimeControl>,
     control_handle: crate::ControlHandle,
-    tasks: TaskSet<K, S::Response, S::Error>,
+    handlers: HandlerSet<S::Response, S::Error>,
+    pending_submissions: HashMap<crate::RequestId, oneshot::Sender<Accepted<S>>>,
+    managed_completions: HashMap<crate::RequestId, ManagedCompletion<S>>,
+    task_updates: watch::Receiver<Vec<crate::TaskSnapshot<K>>>,
     lifecycle: ServiceLifecycle,
     lifecycle_tx: watch::Sender<ServiceLifecycle>,
     status_tx: watch::Sender<ServiceSnapshot<K>>,
-    tasks_tx: watch::Sender<Vec<TaskSnapshot<K>>>,
     activity: ServiceActivity,
     drain_reply: Option<oneshot::Sender<()>>,
     shutdown_reply: Option<oneshot::Sender<()>>,
@@ -37,7 +43,7 @@ where
 impl<K, S> ServiceRuntime<K, S>
 where
     K: ServiceKey,
-    S: Service,
+    S: Service<Key = K>,
 {
     async fn run(mut self) {
         self.lifecycle = ServiceLifecycle::Running;
@@ -62,36 +68,119 @@ where
                         self.handle_control(control);
                     }
                 }
-                finished = self.tasks.next_finished(), if self.tasks.has_running() => {
-                    let _ = finished;
+                finished = self.handlers.next_finished(), if self.handlers.has_running() => {
+                    if let Some(finished) = finished {
+                        self.finish_handler(finished);
+                    }
+                }
+                changed = self.task_updates.changed() => {
+                    let _ = changed;
                 }
                 envelope = self.requests.recv(), if receive_requests => {
                     if let Some(envelope) = envelope {
-                        self.handle_request(envelope);
+                        self.start_handler(envelope);
                     }
                 }
                 else => break,
             }
+            self.acknowledge_managed_requests();
             self.publish();
         }
     }
 
-    fn handle_request(&mut self, envelope: RequestEnvelope<S>) {
-        let result = self
+    fn start_handler(&mut self, envelope: RequestEnvelope<S>) {
+        let request_id = envelope.context.request_id;
+        self.pending_submissions
+            .insert(request_id, envelope.accepted);
+        self.handlers
+            .start(self.service.clone(), envelope.request, envelope.context);
+    }
+
+    fn acknowledge_managed_requests(&mut self) {
+        let managed: Vec<_> = self
+            .pending_submissions
+            .keys()
+            .filter_map(|request_id| {
+                self.service
+                    .task_manager()
+                    .task_for_request(*request_id)
+                    .map(|task_id| (*request_id, task_id))
+            })
+            .collect();
+
+        for (request_id, task_id) in managed {
+            let Some(accepted) = self.pending_submissions.remove(&request_id) else {
+                continue;
+            };
+            let (completion, ticket) = oneshot::channel();
+            let submission = Submission::Task(crate::TaskTicket::new(
+                task_id,
+                self.control_handle.clone(),
+                ticket,
+            ));
+            if accepted.send(Ok(submission)).is_ok() {
+                self.managed_completions.insert(request_id, completion);
+            }
+        }
+    }
+
+    fn finish_handler(&mut self, finished: FinishedHandler<S::Response, S::Error>) {
+        self.acknowledge_one(finished.request_id);
+        let cancellation = self
             .service
-            .clone()
-            .handle(envelope.request, envelope.context.clone());
-        match result {
-            HandleResult::Reply(reply) => {
-                let _ = envelope.accepted.send(Ok(crate::Submission::Reply(reply)));
-            }
-            HandleResult::Task(task) => {
-                let submission = self
-                    .tasks
-                    .submit(task, envelope.context, self.control_handle.clone())
-                    .map(crate::Submission::Task);
-                let _ = envelope.accepted.send(submission);
-            }
+            .task_manager()
+            .cancellation_for_request(finished.request_id);
+        let outcome = match &finished.exit {
+            HandlerExit::Finished(Ok(_)) => HandlerOutcome::Completed,
+            HandlerExit::Finished(Err(_)) => HandlerOutcome::Failed,
+            HandlerExit::Aborted => HandlerOutcome::Aborted,
+        };
+        let cancellation = self
+            .service
+            .task_manager()
+            .finish_request(finished.request_id, outcome)
+            .or(cancellation);
+
+        if let Some(completion) = self.managed_completions.remove(&finished.request_id) {
+            let exit = match finished.exit {
+                HandlerExit::Aborted => TaskExit::Aborted,
+                HandlerExit::Finished(Ok(_)) if cancellation.is_some() => {
+                    TaskExit::Cancelled(cancellation.expect("cancellation exists"))
+                }
+                HandlerExit::Finished(Err(_)) if cancellation.is_some() => {
+                    TaskExit::Cancelled(cancellation.expect("cancellation exists"))
+                }
+                HandlerExit::Finished(Ok(value)) => TaskExit::Completed(value),
+                HandlerExit::Finished(Err(error)) => TaskExit::Failed(error),
+            };
+            let _ = completion.send(exit);
+            return;
+        }
+
+        if let Some(accepted) = self.pending_submissions.remove(&finished.request_id) {
+            let result = match finished.exit {
+                HandlerExit::Finished(result) => Ok(Submission::Reply(result)),
+                HandlerExit::Aborted => Err(RuntimeError::ResponseDropped),
+            };
+            let _ = accepted.send(result);
+        }
+    }
+
+    fn acknowledge_one(&mut self, request_id: crate::RequestId) {
+        let Some(task_id) = self.service.task_manager().task_for_request(request_id) else {
+            return;
+        };
+        let Some(accepted) = self.pending_submissions.remove(&request_id) else {
+            return;
+        };
+        let (completion, ticket) = oneshot::channel();
+        let submission = Submission::Task(crate::TaskTicket::new(
+            task_id,
+            self.control_handle.clone(),
+            ticket,
+        ));
+        if accepted.send(Ok(submission)).is_ok() {
+            self.managed_completions.insert(request_id, completion);
         }
     }
 
@@ -128,7 +217,7 @@ where
                 reason,
                 reply,
             } => {
-                let _ = reply.send(self.tasks.request_cancel(task_id, reason, false));
+                let _ = reply.send(self.service.task_manager().cancel(task_id, reason));
             }
         }
     }
@@ -136,7 +225,7 @@ where
     fn finish_drain_if_ready(&mut self) {
         if self.lifecycle != ServiceLifecycle::Draining
             || !self.requests.is_empty()
-            || !self.tasks.is_empty()
+            || !self.handlers.is_empty()
         {
             return;
         }
@@ -153,11 +242,14 @@ where
 
     async fn stop(&mut self) {
         self.lifecycle = ServiceLifecycle::Stopping;
-        self.tasks.cancel_all(CancelReason::ServiceStopping, true);
+        self.handlers.abort_all();
+        self.service.task_manager().abort_all();
         self.publish();
-        while self.tasks.has_running() {
-            let _ = self.tasks.next_finished().await;
-            self.publish();
+        while self.handlers.has_running() {
+            if let Some(finished) = self.handlers.next_finished().await {
+                self.finish_handler(finished);
+                self.publish();
+            }
         }
         self.service.on_shutdown();
         self.lifecycle = ServiceLifecycle::Stopped;
@@ -171,7 +263,7 @@ where
     }
 
     fn publish(&mut self) {
-        let activity = if self.requests.is_empty() && self.tasks.is_empty() {
+        let activity = if self.requests.is_empty() && self.handlers.is_empty() {
             ServiceActivity::Idle
         } else {
             ServiceActivity::Busy
@@ -186,9 +278,9 @@ where
             lifecycle: self.lifecycle,
             activity,
             queued_requests: self.requests.len(),
-            managed_tasks: self.tasks.len(),
+            inflight_requests: self.handlers.len(),
+            managed_tasks: self.service.task_manager().len(),
         });
-        self.tasks_tx.send_replace(self.tasks.snapshots());
     }
 }
 
@@ -200,7 +292,7 @@ pub(crate) async fn spawn_service<K, S>(
 ) -> Result<SpawnedService<K, S>, RuntimeError>
 where
     K: ServiceKey,
-    S: Service,
+    S: Service<Key = K>,
 {
     let (request_tx, request_rx) = mpsc::channel(queue_capacity);
     let (control_tx, control_rx) = mpsc::channel(32);
@@ -209,22 +301,27 @@ where
         key.clone(),
         ServiceLifecycle::Initializing,
     ));
-    let (tasks_tx, tasks_rx) = watch::channel(Vec::new());
-    let (events, _) = broadcast::channel(256);
+    let task_updates = service.task_manager().watch_snapshots();
     let client = client(name.clone(), request_tx, lifecycle_rx.clone());
     let control = control(name, control_tx);
-    let observer = ServiceObserver::new(status_rx, tasks_rx, events.clone());
+    let observer = ServiceObserver::new(
+        status_rx,
+        task_updates.clone(),
+        service.task_manager().events(),
+    );
     let runtime = ServiceRuntime {
         key: key.clone(),
         service,
         requests: request_rx,
         controls: control_rx,
         control_handle: control.clone(),
-        tasks: TaskSet::new(key.clone(), events),
+        handlers: HandlerSet::new(),
+        pending_submissions: HashMap::new(),
+        managed_completions: HashMap::new(),
+        task_updates,
         lifecycle: ServiceLifecycle::Initializing,
         lifecycle_tx,
         status_tx,
-        tasks_tx,
         activity: ServiceActivity::Idle,
         drain_reply: None,
         shutdown_reply: None,

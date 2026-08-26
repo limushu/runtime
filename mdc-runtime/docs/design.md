@@ -1,129 +1,124 @@
 # 设计说明
 
-## 1. 最终抽象
+## 1. 最终所有权
 
 ```text
-Service = 核心元数据 + Client + 请求路由 + workflow
-Task    = 身份/控制/观测 + Future 执行体
-Executor = 业务通道 + 控制通道 + TaskSet + 唯一 poll 循环
-Router  = ServiceKind -> 类型化 ServiceClient
+Service = 核心元数据 + Router + ServiceTaskManager + async handle/workflow
+Executor = 业务通道 + 控制通道 + HandlerSet + 唯一 poll 循环
+Handler Future = 一次请求的执行主体
+Task = Handler 内可选的准入/取消/观测作用域
+Router = ServiceKey -> 类型化 ServiceClient + RequestContext 传播
 ```
 
-没有 HandlerRegistry、Scheduler、Effect、Directive，也没有每业务一个 Tokio spawn。
+没有 HandlerRegistry、TaskSpec、Future factory、Effect 或 Directive，也没有每业务一个 Tokio spawn。
 
-![请求决策](diagrams/task-decision.svg)
+![运行结构](diagrams/runtime.svg)
 
-## 2. 请求边界
+## 2. 请求执行
 
-`Service::handle` 是短小同步分发方法，只负责把 Request 路由到对应的 Service 成员方法。成员方法返回：
-
-```rust
-pub enum HandleResult<T, E> {
-    Reply(Result<T, E>),
-    Task(TaskSpec<T, E>),
-}
+```text
+RequestEnvelope
+    -> Executor 调用 Service::handle
+    -> HandlerSet 保存并 poll 返回的 Future
+    -> Future 直接返回 Result<Response, Error>
+    -> Executor 完成 oneshot 或 TaskTicket
 ```
 
-Reply/Task 决策及 TaskKey、可见性、冲突策略属于具体工作流，不属于 `handle`。因此简单 Query 只有一次 mpsc + oneshot；只有需要长期执行、取消、排重和观测的请求才成为 Task。
+所有请求都会形成内部 Handler Future。只有业务显式调用 `Service::create_new_task` 时才形成可观测、可取消、可排重的 Task。
 
-## 3. Task 所有权
+![任务决策](diagrams/task-decision.svg)
 
-公开结构：
+## 3. ServiceTaskManager
 
-- `TaskMeta`：key、label、visibility；
-- `TaskSpec`：meta、冲突策略、Future factory；
-- `TaskContext`：当前任务身份、trace、父子调用与取消；
-- `TaskTicket`：等待、请求取消；
-- `TaskSnapshot/TaskEvent`：TUI 观测。
+每个 Service 实例持有自己的 Manager：
 
-内部结构：
+```text
+ServiceTaskManager
+├── running: TaskId -> RunningTask
+├── by_key: TaskKey -> TaskId
+├── pending: TaskKey -> PendingTask
+├── request -> Task 映射
+├── CancellationScope
+├── watch snapshots
+└── broadcast events
+```
 
-- `TaskSet`；
-- `TaskSlot`；
-- `FuturesUnordered`；
-- AbortHandle；
-- pending replacement。
+Executor 不持有 Task，也不 poll Task Future。它只在以下通用边界调用 Manager：
 
-工作流成员方法能定义 Task，但不能直接 poll、删除或篡改 TaskSlot。
+- 控制通道取消指定 Task；
+- Handler 返回时通知请求终态；
+- Immediate Shutdown 时清理全部 Task 状态；
+- 读取数量用于 Idle/Busy 与状态快照。
 
-## 4. 结构化取消
+Task 的创建时机、TaskKey 和 ConflictPolicy 由 Service 工作流决定。Service 可以覆写 `create_new_task` 实现模块特有策略，公共 Manager 负责不值得重复实现的机械能力。
+
+## 4. RequestContext 与传播
+
+```text
+RequestContext
+├── request_id
+├── operation_id
+├── trace
+└── task: Option<TaskRef>
+```
+
+`TaskRef` 是附加到请求的传播信息，不是通信句柄。Router 使用它建立父子 trace 和取消链；Task 本身不知道下游 Service。
+
+本地 Router 使用 mpsc + oneshot 和 CancellationToken。未来 RPC Router 可以把 operation/task/parent 标识放入线协议，并将取消转换为显式 RPC。
+
+## 5. 结构化取消
 
 ![取消链](diagrams/cancellation.svg)
 
-正常取消不 drop Future。Task 继续被 Executor poll，直到所有下游 Task 返回终态。
-
 ```text
-取消信号：Disk -> Rebuild -> BG
-终态确认：Disk <- Rebuild <- BG
+控制信号：Disk TaskManager -> Disk TaskRef -> Router -> Rebuild -> BG
+终态确认：Disk Handler <- Rebuild Handler <- BG Handler <- external I/O
 ```
 
-每个 child call 使用子取消作用域：父取消会影响所有后代，子任务单独取消不会误伤父亲和兄弟。
+正常取消只触发 CancellationScope。Handler Future 继续被 Executor poll，从而能够等待下游和外部 I/O 返回终态。取消完成后，Handler 的业务错误被统一映射为 `TaskExit::Cancelled`。
 
-`TaskContext::call` 是取消语义的统一实现点。未来改成 RPC 时，Local Client 的子 scope 可替换为 `CancelOperation(operation_id)` RPC，workflow 不变。
-
-## 5. 同对象串行
-
-TaskSet 以 `TaskKey` 建立对象槽：
+## 6. 同对象串行
 
 ```text
 Running(old)
-    │ replace request
+    │ Replace(new)
     ├── old -> Cancelling
-    └── new -> Queued
+    └── new -> Queued；new Handler 在 create_new_task().await 处挂起
 
-old -> Cancelled
-    └── new -> Running
+old Handler -> terminal
+    └── new -> Running；唤醒 new Handler
 ```
 
-这保证同一对象的旧任务和新任务不重叠。本地核心元数据不需要用 generation 防止旧 Future 回写；如果将来存在跨进程旧 RPC、重启恢复或多实例写入，再在外部协议中加入 operation fencing。
+准入等待是 Handler Future 自身的 Pending，不产生新的 Tokio Task。旧 Handler 完整退出前，新 Handler 不会越过 Task 申请点。
 
-## 6. 元数据模型
+## 7. 生命周期与清理
 
-Service 是其核心元数据的所有者：
-
-```text
-DiskService    -> DiskMetadata
-RebuildService -> RebuildMetadata
-BgService      -> BgMetadata
-```
-
-元数据锁是 Service 内部实现细节。workflow 只能调用短小同步领域方法，不能取得 guard 或 `&mut Metadata`，因此不会产生持锁跨 `.await` 的后门。
-
-## 7. 服务生命周期
-
-- `Pause`：停止接收新业务，继续 poll 在途 Task；
-- `Drain`：处理已经进入队列的请求并等待 Task 自然完成，然后 Paused；
+- `Pause`：停止接收新业务，继续 poll 在途 Handler；
+- `Drain`：处理已入队请求并等待全部 Handler 返回，然后 Paused；
 - `Graceful Shutdown`：Drain 后停止；
-- `Immediate Shutdown`：唯一允许强制 abort 全部 Future 的正常 API；
-- Drop `ServiceGroup`：异常卸载保险，abort 唯一宿主 Tokio Task。
+- `Immediate Shutdown`：abort 全部 Handler Future，并清理 TaskManager；
+- Drop `ServiceGroup`：abort 唯一 Service 宿主 Tokio Task，宿主内的全部 Handler Future 随之 drop。
 
-控制通道在 `tokio::select! { biased; ... }` 中优先于 Task 完成和业务通道。
+Service 状态同时报告：
 
-## 8. 观测
+- `queued_requests`：尚未进入 HandlerSet 的请求；
+- `inflight_requests`：正在被 poll 的 Handler Future；
+- `managed_tasks`：ServiceTaskManager 中的 Running/Queued Task。
 
-`ServiceObserver` 提供：
-
-- Service Lifecycle 与 Idle/Busy；
-- 队列请求数和受管 Task 数；
-- 当前 TaskSnapshot 列表；
-- Task 状态事件：Queued、Running、Cancelling、Completed、Failed、Cancelled、Aborted。
-
-TUI 只订阅 Observer，不读取 Service 元数据。
-
-## 9. 代码导航
+## 8. 代码导航
 
 ```text
-service/mod.rs          Service trait 和 HandleResult
-service/client.rs       call/submit/Ticket/父子调用
+service/mod.rs          Service trait 与 create_new_task 抽象
+service/client.rs       call/submit/send、TaskTicket
 service/control.rs      生命周期与 Task 取消控制
 service/group.rs        Pool 级 Service 容器
 executor/runtime.rs     唯一 select/poll 循环
-executor/task_set.rs    Task 索引、替换、取消、完成
-task.rs                 业务可见 Task API
-demo/disk_service.rs    Query 直返、Offline Task、Fault 替换
-demo/rebuild_service.rs 中游取消传播
-demo/bg_service.rs      下游 Task
-demo/backend.rs         最末端 I/O 的优雅取消
+executor/handler_set.rs Handler Future 索引、poll 与硬终止
+task/                   Manager、Context、Task policy
+router.rs               类型化路由、上下文和取消传播
+demo/disk_service.rs    Query、Offline、Fault Replace
+demo/rebuild_service.rs 中游 Service 自治任务
+demo/bg_service.rs      下游 Service 与末端 I/O
 ```
 
-自动化测试覆盖 Query 零 Task、三级取消等待、同对象替换串行和生命周期清理。
+自动化测试覆盖 Query 零 Task、无 Task 长 Handler 的统一清理、三级取消等待、同对象替换串行和服务生命周期。

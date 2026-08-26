@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::{HandleResult, RequestContext, Router, Service, TaskKey, TaskMeta, TaskSpec};
+use crate::{
+    ConflictPolicy, RequestContext, Router, Service, ServiceTaskManager, TaskKey, TaskMeta,
+};
 
 use super::{
     BgRequest, BgService, DemoError, DiskId, RebuildRequest, RebuildResponse, ServiceKind,
@@ -10,6 +12,7 @@ use super::{
 pub struct RebuildService {
     metadata: ActiveDisks,
     router: Router<ServiceKind>,
+    tasks: ServiceTaskManager<ServiceKind>,
 }
 
 impl RebuildService {
@@ -17,40 +20,58 @@ impl RebuildService {
         Self {
             metadata: ActiveDisks::new(),
             router,
+            tasks: ServiceTaskManager::new(ServiceKind::Rebuild),
         }
     }
 
-    fn rebuild_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<RebuildResponse, DemoError> {
-        let meta = TaskMeta::new(
-            TaskKey::new(format!("rebuild/{disk}")),
-            format!("rebuild disk {disk}"),
-        );
+    async fn rebuild_workflow(
+        self: Arc<Self>,
+        disk: DiskId,
+        context: RequestContext,
+    ) -> Result<RebuildResponse, DemoError> {
+        let task = self
+            .create_new_task(
+                &context,
+                TaskMeta::new(
+                    TaskKey::new(format!("rebuild/{disk}")),
+                    format!("rebuild disk {disk}"),
+                ),
+                ConflictPolicy::Reject,
+            )
+            .await?;
 
-        HandleResult::task(TaskSpec::new(meta, move |task| async move {
-            self.metadata.begin(disk.clone());
-
-            let bg = self.router.client::<BgService>(&ServiceKind::Bg)?;
-            let result = task.call(&bg, BgRequest::Rebuild(disk.clone())).await;
-
-            self.metadata.finish(&disk);
-            result?;
-            Ok(RebuildResponse::Completed)
-        }))
+        self.metadata.begin(disk.clone());
+        let result = self
+            .router
+            .call::<BgService>(
+                &ServiceKind::Bg,
+                BgRequest::Rebuild(disk.clone()),
+                context.with_task(&task),
+            )
+            .await;
+        self.metadata.finish(&disk);
+        result?;
+        Ok(RebuildResponse::Completed)
     }
 }
 
 impl Service for RebuildService {
+    type Key = ServiceKind;
     type Request = RebuildRequest;
     type Response = RebuildResponse;
     type Error = DemoError;
 
-    fn handle(
+    fn task_manager(&self) -> &ServiceTaskManager<ServiceKind> {
+        &self.tasks
+    }
+
+    async fn handle(
         self: Arc<Self>,
         request: RebuildRequest,
-        _context: RequestContext,
-    ) -> HandleResult<RebuildResponse, DemoError> {
+        context: RequestContext,
+    ) -> Result<RebuildResponse, DemoError> {
         match request {
-            RebuildRequest::Start(disk) => self.rebuild_workflow(disk),
+            RebuildRequest::Start(disk) => self.rebuild_workflow(disk, context).await,
         }
     }
 }

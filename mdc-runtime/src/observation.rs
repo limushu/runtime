@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, watch};
 
-use crate::{OperationId, TaskId, TaskKey, TaskVisibility, TraceContext};
+use crate::{OperationId, RequestId, TaskId, TaskKey, TaskVisibility, TraceContext};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceLifecycle {
@@ -26,6 +26,7 @@ pub struct ServiceSnapshot<K> {
     pub lifecycle: ServiceLifecycle,
     pub activity: ServiceActivity,
     pub queued_requests: usize,
+    pub inflight_requests: usize,
     pub managed_tasks: usize,
 }
 
@@ -48,6 +49,7 @@ pub struct TaskSnapshot<K> {
     pub label: Arc<str>,
     pub state: TaskState,
     pub visibility: TaskVisibility,
+    pub request_id: RequestId,
     pub operation_id: OperationId,
     pub trace: TraceContext,
 }

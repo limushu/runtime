@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
-use crate::{HandleResult, RequestContext, Service, TaskKey, TaskMeta, TaskSpec};
+use crate::{ConflictPolicy, RequestContext, Service, ServiceTaskManager, TaskKey, TaskMeta};
 
-use super::{BgBackend, BgRequest, BgResponse, DemoError, DiskId, metadata::ActiveDisks};
+use super::{
+    BgBackend, BgRequest, BgResponse, DemoError, DiskId, ServiceKind, metadata::ActiveDisks,
+};
 
 pub struct BgService {
     metadata: ActiveDisks,
     backend: BgBackend,
+    tasks: ServiceTaskManager<ServiceKind>,
 }
 
 impl BgService {
@@ -14,37 +17,51 @@ impl BgService {
         Self {
             metadata: ActiveDisks::new(),
             backend,
+            tasks: ServiceTaskManager::new(ServiceKind::Bg),
         }
     }
 
-    fn rebuild_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<BgResponse, DemoError> {
-        let meta = TaskMeta::new(
-            TaskKey::new(format!("bg/{disk}")),
-            format!("rebuild BGs for {disk}"),
-        );
+    async fn rebuild_workflow(
+        self: Arc<Self>,
+        disk: DiskId,
+        context: RequestContext,
+    ) -> Result<BgResponse, DemoError> {
+        let task = self
+            .create_new_task(
+                &context,
+                TaskMeta::new(
+                    TaskKey::new(format!("bg/{disk}")),
+                    format!("rebuild BGs for {disk}"),
+                ),
+                ConflictPolicy::Reject,
+            )
+            .await?;
 
-        HandleResult::task(TaskSpec::new(meta, move |task| async move {
-            self.metadata.begin(disk.clone());
-            let result = self.backend.rebuild(&task, disk.clone()).await;
-            self.metadata.finish(&disk);
-            result?;
-            Ok(BgResponse::Completed)
-        }))
+        self.metadata.begin(disk.clone());
+        let result = self.backend.rebuild(&task, disk.clone()).await;
+        self.metadata.finish(&disk);
+        result?;
+        Ok(BgResponse::Completed)
     }
 }
 
 impl Service for BgService {
+    type Key = ServiceKind;
     type Request = BgRequest;
     type Response = BgResponse;
     type Error = DemoError;
 
-    fn handle(
+    fn task_manager(&self) -> &ServiceTaskManager<ServiceKind> {
+        &self.tasks
+    }
+
+    async fn handle(
         self: Arc<Self>,
         request: BgRequest,
-        _context: RequestContext,
-    ) -> HandleResult<BgResponse, DemoError> {
+        context: RequestContext,
+    ) -> Result<BgResponse, DemoError> {
         match request {
-            BgRequest::Rebuild(disk) => self.rebuild_workflow(disk),
+            BgRequest::Rebuild(disk) => self.rebuild_workflow(disk, context).await,
         }
     }
 }

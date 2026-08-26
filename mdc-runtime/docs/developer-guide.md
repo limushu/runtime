@@ -1,178 +1,182 @@
 # 开发指南
 
-## 1. 一个 Service 写什么
+## 1. Service 拥有什么
 
 ```rust
-pub struct DiskService {
-    metadata: DiskMetadata,
+pub struct RebuildService {
+    metadata: RebuildMetadata,
     router: Router<ServiceKind>,
+    tasks: ServiceTaskManager<ServiceKind>,
 }
 ```
 
-核心元数据属于 Service。其他模块只能获得 `ServiceClient`，不能取得 Service 或它的元数据。
-
-元数据内部可以使用私有短锁，但只暴露同步领域方法：
+核心元数据和任务策略都属于 Service。其他模块只能通过 Router 找到类型化 `ServiceClient`，不能取得 Service 或其元数据。
 
 ```rust
-impl DiskMetadata {
-    fn begin_offline(&self, disk: &DiskId) -> Result<(), DiskError>;
-    fn complete_offline(&self, disk: &DiskId) -> Result<(), DiskError>;
-}
-```
+impl Service for RebuildService {
+    type Key = ServiceKind;
 
-工作流拿不到锁和 `&mut` 引用，因此无法把锁带过 `.await`。
-
-## 2. `handle` 只做协议分发
-
-```text
-Request
-  └── handle
-        └── 对应的 Service 成员方法
-              ├── Reply：查询、校验、读取内存元数据
-              └── Task：RPC、等待、长流程、需要取消和观测的操作
-```
-
-```rust
-impl Service for DiskService {
-    type Request = DiskRequest;
-    type Response = DiskResponse;
-    type Error = DiskError;
-
-    fn handle(
-        self: Arc<Self>,
-        request: DiskRequest,
-        _context: RequestContext,
-    ) -> HandleResult<DiskResponse, DiskError> {
-        match request {
-            DiskRequest::Query(disk) => self.query(&disk),
-            DiskRequest::Offline(disk) => self.offline_workflow(disk),
-        }
+    fn task_manager(&self) -> &ServiceTaskManager<ServiceKind> {
+        &self.tasks
     }
 }
 ```
 
-`handle` 不知道 TaskKey、冲突策略或工作流步骤。新增业务请求时，只在这里增加一条到成员方法的静态路由。
+框架提供 `ServiceTaskManager` 的 TaskId、槽位、取消、等待和观测机制。Service 决定何时调用 `create_new_task` 以及使用何种冲突策略；复杂模块可以覆写 `Service::create_new_task`。
 
-## 3. 工作流自己决定是否创建 Task
-
-查询成员方法直接回复：
+## 2. Handler Future 是执行主体
 
 ```rust
-fn query(&self, disk: &DiskId) -> HandleResult<DiskResponse, DiskError> {
-    HandleResult::ok(DiskResponse::Snapshot(self.metadata.query(disk)))
-}
-```
-
-需要受管执行的工作流自行构造 Task：
-
-```rust
-fn offline_workflow(
+async fn handle(
     self: Arc<Self>,
-    disk: DiskId,
-) -> HandleResult<DiskResponse, DiskError> {
-    let meta = TaskMeta::new(
-        TaskKey::new(format!("disk/{disk}")),
-        format!("offline disk {disk}"),
-    )
-    .public();
-
-    HandleResult::task(TaskSpec::new(meta, move |task| async move {
-        self.metadata.begin_offline(&disk)?;
-        task.call(&self.rebuild, StartRebuild { disk: disk.clone() })
-            .await?;
-        self.metadata.complete_offline(&disk)?;
-        Ok(DiskResponse::OfflineCompleted)
-    }))
+    request: RebuildRequest,
+    context: RequestContext,
+) -> Result<RebuildResponse, RebuildError> {
+    match request {
+        RebuildRequest::Start(disk) => {
+            self.rebuild_workflow(disk, context).await
+        }
+        RebuildRequest::Query(disk) => Ok(self.query(&disk)),
+    }
 }
 ```
 
-工作流拥有“是否形成 Task、Task 是谁、与同对象任务如何冲突”的业务决策。Executor 仍独占 Future 的 poll、索引、完成回复和最终回收；所谓工作流管理 Task，不是让业务直接修改 `TaskSet`。
+Executor 调用 `service.handle()` 取得 Future，并将其放入 `HandlerSet`。Service 的唯一 Tokio 宿主任务通过 `FuturesUnordered` poll 所有 Handler Future；业务代码不需要 `tokio::spawn`，也不需要 Future factory 闭包。
 
-不要为查询创建 Task。立即回复不会进入 TaskSet，也不会产生 Task 观测事件。
-
-## 4. 跨 Service 调用
-
-Router 只存通信 Client：
+## 3. Task 是可选控制作用域
 
 ```rust
-let rebuild = self.router.client::<RebuildService>(&ServiceKind::Rebuild)?;
-
-task.call(&rebuild, RebuildRequest::Start(disk.clone()))
-    .await?;
-```
-
-不要直接调用另一个 Service 的成员方法，也不要在 workflow 内 `tokio::spawn`。
-
-本地实现使用 mpsc + oneshot。未来替换成 RPC Client 时，上层仍保持 `submit/call/cancel_and_wait` 语义。
-
-## 5. 优雅取消
-
-正常取消只有一个入口：
-
-```rust
-ticket.cancel_and_wait(CancelReason::requested("operator cancel"))
-    .await?;
-```
-
-框架行为：
-
-1. Task 进入 `Cancelling`；
-2. 取消作用域向所有 child call 传播；
-3. `TaskContext::call` 请求下游取消；
-4. 等待下游返回 `Completed/Cancelled/Failed/Aborted`；
-5. 当前 workflow 才返回；
-6. Executor 发布当前 Task 的最终状态。
-
-业务不需要在每个 handler 检查 token。只有最末端的真实 I/O 能力需要定义“如何停止外部操作”，示例见 `demo/backend.rs`。
-
-## 6. 同对象替换
-
-同一个对象使用相同 `TaskKey`。默认冲突返回 `TaskAlreadyRunning`。
-
-高优先级操作需要替换旧操作时：
-
-```rust
-fn fault_workflow(self: Arc<Self>, disk: DiskId) -> HandleResult<DiskResponse, DiskError> {
-    let key = TaskKey::new(format!("disk/{disk}"));
-    let meta = TaskMeta::new(key.clone(), format!("fault disk {disk}"));
-
-    HandleResult::task(
-        TaskSpec::new(meta, move |_task| async move {
-            self.metadata.mark_faulted(&disk)?;
-            Ok(DiskResponse::Faulted)
-        })
-        .replace_running(CancelReason::Preempted { by: key }),
+let task = self
+    .create_new_task(
+        &context,
+        TaskMeta::new(
+            TaskKey::new(format!("rebuild/{disk}")),
+            format!("rebuild disk {disk}"),
+        ),
+        ConflictPolicy::Reject,
     )
-}
+    .await?;
 ```
 
-新 Task 先进入 `Queued`。只有旧 Task 完成整条优雅取消链后，Executor 才启动新 Task；二者不会重叠执行。
+这一步完成：
 
-## 7. 调用方式
+- 申请 TaskId；
+- 按 TaskKey 准入、排队或替换；
+- 建立取消作用域；
+- 发布 Task 快照和事件；
+- 返回 `TaskContext`。
+
+Task 不保存也不 poll Handler Future。当前实现把 Task 生命周期绑定到创建它的 Handler 请求：Handler 返回时，ServiceTaskManager 根据请求结果发布 Completed、Failed、Cancelled 或 Aborted，并释放对象槽位。
+
+查询不调用 `create_new_task`，因此只产生一个很短的内部 Handler Future，不会进入 Task 观测和排重系统。
+
+## 4. Router 负责跨 Service 调用
 
 ```rust
-// 只关心最终业务结果
+let child_context = context.with_task(&task);
+
+self.router
+    .call::<BgService>(
+        &ServiceKind::Bg,
+        BgRequest::Rebuild(disk.clone()),
+        child_context,
+    )
+    .await?;
+```
+
+`RequestContext` 的关键字段：
+
+```text
+request_id    当前 Service 内唯一的请求身份
+operation_id  整条入口操作共享的身份
+trace         trace 传播信息
+task          Option<TaskRef>，可选父 Task 信息和取消作用域
+```
+
+Router 负责查找 Client、mpsc/oneshot、传播上下文、等待下游结果，以及父取消时请求下游 Task 优雅取消。`TaskContext` 不知道 Router、ServiceKind 或请求协议。
+
+未来切换 RPC 时，只需把 `TaskRef` 转换为可序列化的 task/operation 标识，并由 Router Client 实现取消 RPC；工作流调用形式不变。
+
+## 5. 冲突和替换
+
+默认拒绝同 TaskKey 并发：
+
+```rust
+ConflictPolicy::Reject
+```
+
+高优先级操作替换旧操作：
+
+```rust
+ConflictPolicy::Replace(CancelReason::Preempted {
+    by: key.clone(),
+})
+```
+
+替换过程：
+
+```text
+旧 Handler 持有 Running Task
+        │ 新 Handler 请求相同 TaskKey
+        ├── 旧 Task -> Cancelling
+        └── 新 Task -> Queued，新 Handler 在 create_new_task().await 处 Pending
+
+旧 Handler 等待下游终态后返回
+        └── ServiceTaskManager 释放槽位并唤醒新 Handler
+```
+
+旧、新业务逻辑不会重叠执行。
+
+## 6. 优雅取消
+
+```rust
+ticket
+    .cancel_and_wait(CancelReason::requested("operator cancel"))
+    .await?;
+```
+
+取消链：
+
+1. ControlHandle 将取消请求交给目标 Service 的 TaskManager；
+2. Task 进入 Cancelling，取消作用域触发；
+3. Router 感知父取消，请求下游 Service 取消对应 Task；
+4. 最末端 I/O 使用自己的 TaskContext 停止外部动作并等待确认；
+5. 下游 Handler 逐级返回；
+6. 根 Handler 返回后，TaskTicket 收到最终 Cancelled。
+
+正常取消不 drop Handler Future。只有 `ShutdownMode::Immediate` 或 `ServiceGroup` 异常 Drop 才强制终止宿主 Future。
+
+## 7. Client 调用方式
+
+```rust
+// RPC 风格：只关心最终结果
 let response = client.call(request).await?;
 
-// 需要控制任务
+// 控制风格：若工作流创建 Task，则取得 TaskTicket
 match client.submit(request).await? {
-    Submission::Reply(result) => { /* 即时请求 */ }
+    Submission::Reply(result) => { /* 无 Task 的短请求 */ }
     Submission::Task(ticket) => {
-        let id = ticket.task_id();
+        let task_id = ticket.task_id();
         let exit = ticket.wait().await?;
     }
 }
+
+// 消息风格：只确认入队
+client.send(request).await?;
 ```
+
+`submit()` 会等待 Handler 创建首个 Task 或直接完成；`send()` 不等待分类，适合真正的 fire-and-forget 请求。
 
 ## 8. Code review 清单
 
-- 查询是否直接 `Reply`，而不是创建空 Task？
-- `handle` 是否只做 Request 到成员方法的静态路由？
-- 是否由工作流成员方法决定 Reply/Task 以及 Task 策略？
-- Service 是否只持有自己的核心元数据？
-- 跨模块是否只通过类型化 Client？
-- 是否存在 workflow 内部的 `tokio::spawn`？
+- `handle` 是否是自然的 async 成员方法？
+- 查询是否不创建 Task？
+- 长流程是否只在确实需要排重、取消或观测时创建 Task？
+- Service 是否持有自己的 `ServiceTaskManager`？
+- 跨模块是否只通过 `router.call()`？
+- `TaskContext` 是否没有承担通信职责？
+- 是否存在工作流内部的 `tokio::spawn`？
 - 相同对象是否使用稳定 TaskKey？
-- 替换任务是否等待旧任务真正退出？
-- 真实 I/O 的取消是否等待下游确认？
-- 元数据锁是否保持私有且只出现在同步领域方法内？
+- Replace 是否等待旧 Handler 真正退出？
+- 最末端 I/O 是否响应 TaskContext 的取消？
+- 元数据锁是否保持私有且不跨 `.await`？

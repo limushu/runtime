@@ -12,7 +12,7 @@ use super::{ControlHandle, ServiceClient, ServiceKey, ShutdownMode};
 pub struct ServiceRef<K, S>
 where
     K: ServiceKey,
-    S: Service,
+    S: Service<Key = K>,
 {
     pub key: K,
     pub client: ServiceClient<S>,
@@ -23,7 +23,7 @@ where
 impl<K, S> Clone for ServiceRef<K, S>
 where
     K: ServiceKey,
-    S: Service,
+    S: Service<Key = K>,
 {
     fn clone(&self) -> Self {
         Self {
@@ -38,7 +38,7 @@ where
 pub(crate) struct SpawnedService<K, S>
 where
     K: ServiceKey,
-    S: Service,
+    S: Service<Key = K>,
 {
     pub reference: ServiceRef<K, S>,
     pub guard: ServiceTaskGuard,
@@ -83,7 +83,7 @@ impl<K: ServiceKey> ServiceGroup<K> {
         self.router.clone()
     }
 
-    pub async fn spawn<S: Service>(
+    pub async fn spawn<S: Service<Key = K>>(
         &mut self,
         key: K,
         service: Arc<S>,
@@ -132,6 +132,7 @@ pub(crate) fn lifecycle_snapshot<K: Clone>(
         lifecycle,
         activity: ServiceActivity::Idle,
         queued_requests: 0,
+        inflight_requests: 0,
         managed_tasks: 0,
     }
 }

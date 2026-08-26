@@ -55,7 +55,10 @@ impl std::error::Error for DemoError {}
 
 impl From<RuntimeError> for DemoError {
     fn from(error: RuntimeError) -> Self {
-        Self::Runtime(error.to_string())
+        match error {
+            RuntimeError::TaskCancelled(_) => Self::Cancelled,
+            error => Self::Runtime(error.to_string()),
+        }
     }
 }
 

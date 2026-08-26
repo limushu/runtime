@@ -4,6 +4,9 @@ use std::{fmt, sync::Arc};
 pub struct OperationId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TaskId(pub u64);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -69,6 +72,7 @@ pub enum RuntimeError {
     ChannelClosed(String),
     ResponseDropped,
     TaskAlreadyRunning(TaskKey),
+    TaskCancelled(CancelReason),
     TaskNotFound(TaskId),
 }
 

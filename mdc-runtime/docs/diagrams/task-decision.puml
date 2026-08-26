@@ -1,16 +1,21 @@
 @startuml
 start
-:Service::handle(request);
-:route to Service member method;
-if (workflow needs managed task?) then (no)
-  :HandleResult::Reply;
-  :send oneshot response;
+:Executor calls Service::handle;
+:HandlerSet polls Handler Future;
+if (workflow needs control scope?) then (no)
+  :continue normal async workflow;
 else (yes)
-  :workflow builds TaskSpec;
-  :HandleResult::Task;
-  :TaskSet checks TaskKey;
-  :poll workflow Future;
-  :send TaskExit;
+  :Service::create_new_task;
+  :ServiceTaskManager applies TaskKey policy;
+  if (slot available?) then (yes)
+    :return TaskContext;
+  else (replace)
+    :cancel old Task;
+    :current Handler Future Pending;
+    :resume after old Handler exits;
+  endif
 endif
+:Handler returns Result;
+:Executor completes reply / TaskTicket;
 stop
 @enduml
