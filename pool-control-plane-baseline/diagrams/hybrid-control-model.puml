@@ -1,0 +1,93 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "输入事实与命令" {
+  component Command
+  component "DiskMap Fact" as DiskFact
+  component "NodeMap Fact" as NodeFact
+  component Timer
+  component EffectResult
+}
+
+package "PoolRuntime" {
+  component PoolIngress
+
+  package "领域状态与策略" {
+    component PoolCore
+    component "MemberDisk FSM" as DiskFSM
+    component "PoolNode FSM" as NodeFSM
+    component "VD / BG FSM" as BgFSM
+  }
+
+  component "Domain Policy\n对象键 / 冲突决定" as Policy
+  component "Domain Workflows\nService上的async fn" as Workflow
+  component "Reconcile\n状态收敛" as Reconcile
+  component PoolView
+}
+
+package "执行机制" {
+  component "Admission Registry" as Admission
+  component "Service Runtime" as Runtime
+  component "Router\ncall / submit / query" as Router
+  component "Task / Future / Cancel / Trace" as Task
+}
+
+package "外部能力" {
+  database SDB
+  component user_dp
+  component VNODE
+}
+
+Command --> PoolIngress
+DiskFact --> PoolIngress
+NodeFact --> PoolIngress
+Timer --> PoolIngress
+EffectResult --> PoolIngress
+
+PoolIngress --> PoolCore
+PoolIngress --> DiskFSM
+PoolIngress --> NodeFSM
+PoolIngress --> BgFSM
+
+PoolCore --> Policy
+DiskFSM --> Policy
+NodeFSM --> Policy
+BgFSM --> Policy
+Policy --> Admission : Start / Join / Merge / Queue / Cancel / Reject
+Admission --> Workflow : 已准入请求
+Workflow --> Router : 跨领域能力
+Workflow --> Runtime : 业务Future
+Runtime --> Task
+Router --> Runtime : 目标服务请求
+Task --> SDB
+Task --> user_dp
+Task --> VNODE
+SDB --> EffectResult
+user_dp --> EffectResult
+VNODE --> EffectResult
+
+Reconcile --> PoolCore
+Reconcile --> DiskFSM
+Reconcile --> NodeFSM
+Reconcile --> BgFSM
+SDB --> Reconcile : 已提交决策
+user_dp --> Reconcile : 实际状态
+
+PoolCore --> PoolView
+DiskFSM --> PoolView
+NodeFSM --> PoolView
+BgFSM --> PoolView
+
+note right of Policy
+领域声明语义
+框架原子执行机制
+end note
+
+note right of Runtime
+只负责执行，不拥有业务真相
+Operation Context不是状态机
+end note
+@enduml

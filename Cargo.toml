@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/foundation/control-runtime",
+    "crates/pool-control-plane",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+control-runtime = { path = "crates/foundation/control-runtime" }
+pool-control-plane = { path = "crates/pool-control-plane" }

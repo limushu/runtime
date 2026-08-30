@@ -1,0 +1,55 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "Cargo Workspace" {
+  package "control-runtime crate" as Runtime {
+    component Protocol
+    component Context
+    component Router
+    component Observation
+    package "service module" {
+      component Contract
+      component ServiceContainer
+      component ObjectActor
+    }
+  }
+
+  package "pool-control-plane crate" as Pool {
+    component Kernel
+    component PoolRuntime
+    package "domains module" {
+      component MemberDisk
+      component VirtualDisk
+      component PoolNode
+      component Tier
+      component PoolCore
+    }
+  }
+}
+
+Pool --> Runtime : only Cargo dependency
+PoolRuntime --> MemberDisk : create/register
+PoolRuntime --> VirtualDisk : create/register
+PoolRuntime --> PoolNode : create/register
+MemberDisk ..> VirtualDisk : Router request
+MemberDisk ..> PoolNode : Router request
+VirtualDisk ..> Tier : future Router request
+
+ServiceContainer --> Contract
+ServiceContainer --> ObjectActor
+Router --> Context
+Observation .. ServiceContainer
+
+note bottom of Pool
+Domain 是 Rust mod
+不是 Cargo crate
+end note
+
+note bottom of Runtime
+完全业务无关
+禁止依赖 Pool
+end note
+@enduml

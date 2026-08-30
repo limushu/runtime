@@ -1,0 +1,44 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
+
+package "不可变事实" {
+  component "Event E1\nDisk-1 Down" as E1 #LightBlue
+  component "Event E2\nDisk-2 Down" as E2 #LightBlue
+}
+
+package "Operation Context / 业务因果身份" {
+  component "O1\nDisk-1 Offline\nowner: DiskDomain" as O1 #LightGreen
+  component "O2\nDisk-2 Offline\nowner: DiskDomain" as O2 #LightGreen
+  component "O3\nNode State Publish\nowner: NodeDomain" as O3 #LightGreen
+  component "O4\nVD Evacuation Disk-1\nowner: VdDomain" as O4 #LightGreen
+  component "O5\nVD Evacuation Disk-2\nowner: VdDomain" as O5 #LightGreen
+  component "O6\nBG-10 Rebuild\nowner: VdDomain" as O6 #LightGreen
+}
+
+package "运行时Task Attempt" {
+  component "T1\nattempt-1 timeout" as T1 #Wheat
+  component "T2\nattempt-2 failover" as T2 #Wheat
+  component "T3\nattempt-3 completed" as T3 #Wheat
+}
+
+E1 --> O1 : caused_by
+E2 --> O2 : caused_by
+O1 --> O3 : requested
+O1 --> O4 : requested
+O2 --> O5 : requested
+O4 --> O6 : affected
+O5 --> O6 : merged_into
+O6 --> T1 : executed_by
+O6 --> T2 : retried_by
+O6 --> T3 : retried_by
+
+note bottom of O6
+一个BG重建可以有多个原因
+因果身份不随Task Attempt改变
+Operation Context不保存业务phase/status
+end note
+@enduml

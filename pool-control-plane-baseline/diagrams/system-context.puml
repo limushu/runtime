@@ -1,0 +1,53 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+
+actor "外部管理面" as Admin
+cloud "硬盘/硬件事实" as Hardware
+database "SDB\n决策元数据" as SDB
+component "Cold Standby Monitor" as Standby
+node "Node / user_dp" as UserDP
+component "VNODE模块\n分片与DHT寻址" as VNode
+
+rectangle "Active Monitor" {
+  component MonitorKernel as Kernel
+  component "DiskMap\n全局硬盘视图" as DiskMap
+  component "NodeMap\nuser_dp网络连通性" as NodeMap
+  component "TopologyEventRouter\n候选路由实现" as TopoRouter
+  component PoolRegistry as Registry
+  component "PoolRuntime A" as PoolA
+  component "PoolRuntime B" as PoolB
+
+  Kernel --> Registry
+  DiskMap --> TopoRouter : 硬盘拓扑通知
+  NodeMap --> TopoRouter : 节点拓扑通知
+  TopoRouter --> Registry : 定位受影响Pool
+  Registry --> PoolA
+  Registry --> PoolB
+}
+
+Admin --> Kernel : 管理请求
+Hardware --> DiskMap : 原始硬盘事实
+UserDP --> NodeMap : 网络连通性
+PoolA <--> UserDP : Pool加载/服务/数据操作
+PoolB <--> UserDP : Pool加载/服务/数据操作
+PoolA --> SDB : 持久化/加载决策
+PoolB --> SDB : 持久化/加载决策
+PoolA --> VNode : Pool服务视图
+PoolB --> VNode : Pool服务视图
+SDB ..> Standby : 切主后重新加载
+
+note right of DiskMap
+DDM属于Monitor内部
+普通盘只属于一个Pool
+共享缓存盘允许跨Pool共享
+end note
+
+note right of NodeMap
+只表示网络是否畅通
+不表示Pool是否可服务
+end note
+@enduml

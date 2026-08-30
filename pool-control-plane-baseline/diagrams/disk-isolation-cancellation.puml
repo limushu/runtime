@@ -1,0 +1,38 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+
+state "UA\nUP + ACTIVE" as UA
+state "DA\nDOWN + ACTIVE" as DA
+state "DI\nDOWN + INACTIVE\n排空中" as DI
+state "UI\nUP + INACTIVE\n等待排空停止" as UI
+state "REMOVED" as Removed
+
+[*] --> UA
+UA --> DA : DiskDown
+DA --> UA : DiskUp
+DA --> DI : BeginDrain
+DI --> UI : DiskUp\n请求停止后续排空
+UI --> DI : DiskDown
+UI --> UA : 下游稳定收敛\nDrainStopped
+DI --> DA : 下游稳定收敛\nDrainStopped且仍DOWN
+DI --> Removed : DrainCompleted
+UI --> Removed : DrainCompleted
+
+note right of DI
+DA -> DI 可逆
+不代表必须走到 REMOVED
+end note
+
+note bottom of UI
+已提交BG remap保持不变
+在途BG到安全点后返回
+未调度BG不再启动
+end note
+
+note bottom of Removed
+当前示例中的终局边界
+精确定义留给专项流程
+end note
+@enduml

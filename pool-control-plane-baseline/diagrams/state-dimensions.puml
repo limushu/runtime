@@ -1,0 +1,50 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
+
+rectangle "Pool" as Pool {
+  component Lifecycle
+  component Health
+  component "Activity Set" as Activity
+}
+
+rectangle "MemberDisk" as MD {
+  component "Compound FSM\nUA / DA / DI / UI / REMOVED" as DiskState
+  component "PhysicalProjection\nUP / DOWN" as PhysicalState
+  component "AllocationProjection\nACTIVE / INACTIVE" as AllocationState
+}
+
+rectangle "PoolNode" as PN {
+  component Membership
+  component "Connectivity\n来自NodeMap" as Connectivity
+  component "Pool ServiceState" as ServiceState
+}
+
+rectangle "BGEntry" as Entry {
+  component "MediaState\n由MemberDisk派生" as MediaState
+  component DataState
+}
+
+Entry --> Health : BG -> VD -> Pool派生
+MD --> MediaState : 物理状态输入
+DiskState --> PhysicalState : 派生
+DiskState --> AllocationState : 派生
+Connectivity --> ServiceState : 必要但不充分
+
+note bottom of Pool
+PoolState = Lifecycle × Health × Activity
+end note
+
+note bottom of PN
+Connected(n) 不代表 PoolServing(p,n)
+end note
+
+note bottom of MD
+分析时可分维度观察
+实现时只枚举合法组合
+DA -> DI不是不可逆承诺
+end note
+@enduml

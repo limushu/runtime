@@ -1,0 +1,61 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
+
+actor "业务开发者" as Developer
+
+package "Domain Service" {
+  component "Query async fn\n不强制创建Task" as Query
+  component "Workflow async fn\n自然业务编排" as Workflow
+  component "Domain Policy\nkey + conflict" as Policy
+  database "Private Domain State" as State
+}
+
+package "Service Runtime" {
+  component "Control Channel\nPause / Resume / Drain / Stop" as Control
+  component "Business Channel\nQuery / Call / Submit" as Business
+  component "Static Dispatch" as Dispatch
+  component "Admission Registry\nJoin / Merge / Queue / Cancel" as Admission
+  component "Workflow Set\npoll Futures" as Futures
+  component "Task Registry\nAttempt + parent/child" as Tasks
+  component "Observation\nIdle/Busy + progress + trace" as Observation
+}
+
+component "Typed Router\noneshot + context propagation" as Router
+component "Other Domain Services" as Other
+
+Developer --> Query : 编写
+Developer --> Workflow : 编写
+Developer --> Policy : 声明业务语义
+Business --> Dispatch
+Control --> Futures : 控制生命周期
+Dispatch --> Query
+Dispatch --> Policy : 工作流请求
+Policy --> Admission
+Admission --> Futures : 准入
+Futures --> Workflow : poll
+Workflow --> State : 短临界区读写
+Workflow --> Router : call / submit / query
+Router --> Other
+Futures --> Tasks
+Tasks --> Observation
+Admission --> Observation
+
+note bottom of Developer
+不编写TaskSpec、BoxFuture、move闭包
+不管理channel、oneshot、JoinHandle
+end note
+
+note bottom of State
+只有所属Service可修改
+不得把可变访问跨过await
+end note
+
+note bottom of Admission
+领域决定语义
+框架原子执行机制
+end note
+@enduml
