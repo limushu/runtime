@@ -155,8 +155,9 @@ impl PoolRuntime {
     }
 
     pub async fn shutdown(self) -> RuntimeResult<()> {
-        self.member_disk.shutdown().await?;
-        self.virtual_disk.shutdown().await?;
-        self.pool_node.shutdown().await
+        let member_disk = self.member_disk.shutdown().await;
+        let virtual_disk = self.virtual_disk.shutdown().await;
+        let pool_node = self.pool_node.shutdown().await;
+        member_disk.and(virtual_disk).and(pool_node)
     }
 }

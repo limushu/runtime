@@ -17,7 +17,7 @@ pub use observation::{
 pub use protocol::{CallId, ObjectKey, OperationId, ServiceId, ServiceRequest, TaskAttemptId};
 pub use router::Router;
 pub use service::{
-    spawn_service, ControlHandle, ExecutionClass, Footprint, ManagedService, ObjectActivity,
-    ObjectDecision, RuntimeConfig, Service, WorkflowMeta,
+    spawn_service, Admission, ControlHandle, ManagedService, ObjectActivity, OrphanPolicy,
+    RequestRoute, RuntimeConfig, Service, WorkflowMeta,
 };
 pub use state_cell::StateCell;

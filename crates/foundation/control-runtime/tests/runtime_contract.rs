@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use control_runtime::{
-    spawn_service, ExecutionClass, ObjectActivity, ObjectDecision, ObjectKey, Router, RuntimeError,
+    spawn_service, Admission, ObjectActivity, ObjectKey, RequestRoute, Router, RuntimeError,
     RuntimeResult, Service, ServiceId, ServiceRequest, StateCell, WorkflowContext, WorkflowMeta,
 };
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 enum LeafRequest {
     Run(&'static str),
+    Panic,
     Stats,
 }
 
@@ -29,6 +30,7 @@ impl ServiceRequest for LeafRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeafWorkflow {
     Run,
+    Panic,
 }
 
 #[derive(Debug, Default)]
@@ -47,29 +49,32 @@ impl Service for LeafService {
     type Request = LeafRequest;
     type WorkflowKind = LeafWorkflow;
 
-    fn classify(&self, request: &Self::Request) -> ExecutionClass<Self::WorkflowKind> {
+    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
         match request {
-            LeafRequest::Run(key) => ExecutionClass::Workflow(WorkflowMeta::object(
+            LeafRequest::Run(key) => RequestRoute::Workflow(WorkflowMeta::object(
                 ObjectKey::new(*key),
                 LeafWorkflow::Run,
                 format!("run {key}"),
             )),
-            LeafRequest::Stats => ExecutionClass::Inline,
+            LeafRequest::Panic => RequestRoute::Workflow(WorkflowMeta::object(
+                ObjectKey::new("leaf/panic"),
+                LeafWorkflow::Panic,
+                "panic",
+            )),
+            LeafRequest::Stats => RequestRoute::Untracked,
         }
     }
 
-    fn decide(
+    fn admit(
         &self,
         _context: &WorkflowContext,
         _request: &Self::Request,
-        _incoming: &WorkflowMeta<Self::WorkflowKind>,
         activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<ObjectDecision<LeafReply>> {
-        Ok(match activity {
-            ObjectActivity::Idle => ObjectDecision::Start,
-            ObjectActivity::Pending { .. } => ObjectDecision::JoinPending,
-            ObjectActivity::Running { .. } => ObjectDecision::JoinExisting,
-            ObjectActivity::Cancelling { .. } => ObjectDecision::JoinReplacement,
+    ) -> RuntimeResult<Admission<LeafReply>> {
+        Ok(if activity.is_idle() {
+            Admission::Start
+        } else {
+            Admission::Join
         })
     }
 
@@ -91,6 +96,7 @@ impl Service for LeafService {
                     _ = tokio::time::sleep(Duration::from_millis(50)) => Ok(LeafReply::Done),
                 }
             }
+            LeafRequest::Panic => panic!("domain workflow panic"),
             LeafRequest::Stats => Ok(self.stats.read(|stats| LeafReply::Stats {
                 started: stats.started,
                 stable: stats.stable,
@@ -126,8 +132,8 @@ impl Service for ParentService {
     type Request = ParentRequest;
     type WorkflowKind = ParentWorkflow;
 
-    fn classify(&self, _request: &Self::Request) -> ExecutionClass<Self::WorkflowKind> {
-        ExecutionClass::Workflow(WorkflowMeta::object(
+    fn route(&self, _request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
+        RequestRoute::Workflow(WorkflowMeta::object(
             ObjectKey::new("parent/run"),
             ParentWorkflow::Run,
             "parent run",
@@ -170,6 +176,56 @@ async fn duplicate_object_intents_join_one_runtime_task() {
     assert_eq!(first.unwrap(), LeafReply::Done);
     assert_eq!(second.unwrap(), LeafReply::Done);
     assert_eq!(leaf_stats(&router).await, (1, 0));
+    leaf.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_one_joined_caller_does_not_cancel_the_shared_workflow() {
+    let router = Router::new();
+    let leaf = spawn_service(
+        Arc::new(LeafService::default()),
+        &router,
+        Default::default(),
+    );
+
+    let first_router = router.clone();
+    let first = tokio::spawn(async move {
+        first_router
+            .call_root("first", LeafRequest::Run("leaf/shared"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let second_router = router.clone();
+    let second = tokio::spawn(async move {
+        second_router
+            .call_root("second", LeafRequest::Run("leaf/shared"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    first.abort();
+    let _ = first.await;
+    assert_eq!(second.await.unwrap().unwrap(), LeafReply::Done);
+    assert_eq!(leaf_stats(&router).await, (1, 0));
+    leaf.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_domain_panic_fails_only_its_workflow() {
+    let router = Router::new();
+    let leaf = spawn_service(
+        Arc::new(LeafService::default()),
+        &router,
+        Default::default(),
+    );
+
+    assert!(matches!(
+        router.call_root("panic", LeafRequest::Panic).await,
+        Err(RuntimeError::WorkflowPanicked(message)) if message == "domain workflow panic"
+    ));
+    assert_eq!(leaf_stats(&router).await, (0, 0));
+    assert_eq!(leaf.observer.snapshot().active_tasks, 0);
     leaf.shutdown().await.unwrap();
 }
 

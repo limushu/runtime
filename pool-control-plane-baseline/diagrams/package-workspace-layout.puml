@@ -13,7 +13,7 @@ package "Cargo Workspace" {
     package "service module" {
       component Contract
       component ServiceContainer
-      component ObjectActor
+      component ObjectSlot
     }
   }
 
@@ -39,7 +39,7 @@ MemberDisk ..> PoolNode : Router request
 VirtualDisk ..> Tier : future Router request
 
 ServiceContainer --> Contract
-ServiceContainer --> ObjectActor
+ServiceContainer --> ObjectSlot
 Router --> Context
 Observation .. ServiceContainer
 

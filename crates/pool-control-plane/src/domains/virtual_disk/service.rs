@@ -2,7 +2,7 @@ use super::protocol::{VirtualDiskReply, VirtualDiskRequest, VirtualDiskStats};
 use crate::kernel::MemberDiskId;
 use async_trait::async_trait;
 use control_runtime::{
-    ExecutionClass, ObjectActivity, ObjectDecision, ObjectKey, RuntimeResult, Service, StateCell,
+    Admission, ObjectActivity, ObjectKey, RequestRoute, RuntimeResult, Service, StateCell,
     WorkflowContext, WorkflowMeta,
 };
 use std::time::Duration;
@@ -67,11 +67,11 @@ impl Service for VirtualDiskService {
     type Request = VirtualDiskRequest;
     type WorkflowKind = VirtualDiskWorkflowKind;
 
-    fn classify(&self, request: &Self::Request) -> ExecutionClass<Self::WorkflowKind> {
+    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
         match request {
-            VirtualDiskRequest::Stats => ExecutionClass::Inline,
+            VirtualDiskRequest::Stats => RequestRoute::Untracked,
             VirtualDiskRequest::EvacuateMemberDisk(disk) => {
-                ExecutionClass::Workflow(WorkflowMeta::object(
+                RequestRoute::Workflow(WorkflowMeta::object(
                     ObjectKey::new(format!("member-disk/{disk}")),
                     VirtualDiskWorkflowKind::EvacuateMemberDisk,
                     format!("evacuate all BGs on {disk}"),
@@ -80,18 +80,16 @@ impl Service for VirtualDiskService {
         }
     }
 
-    fn decide(
+    fn admit(
         &self,
         _context: &WorkflowContext,
         _request: &Self::Request,
-        _incoming: &WorkflowMeta<Self::WorkflowKind>,
         activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<ObjectDecision<VirtualDiskReply>> {
-        Ok(match activity {
-            ObjectActivity::Idle => ObjectDecision::Start,
-            ObjectActivity::Pending { .. } => ObjectDecision::JoinPending,
-            ObjectActivity::Running { .. } => ObjectDecision::JoinExisting,
-            ObjectActivity::Cancelling { .. } => ObjectDecision::JoinReplacement,
+    ) -> RuntimeResult<Admission<VirtualDiskReply>> {
+        Ok(if activity.is_idle() {
+            Admission::Start
+        } else {
+            Admission::Join
         })
     }
 

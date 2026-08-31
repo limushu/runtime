@@ -1,4 +1,4 @@
-use crate::{CallId, CancelCause, Footprint, OperationId, ServiceId, TaskAttemptId};
+use crate::{CallId, CancelCause, ObjectKey, OperationId, ServiceId, TaskAttemptId};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
@@ -109,7 +109,7 @@ pub enum ObservationEvent {
         parent_task_attempt_id: Option<TaskAttemptId>,
         operation_id: OperationId,
         call_id: CallId,
-        footprint: Footprint,
+        object: ObjectKey,
         kind: Arc<str>,
     },
     TaskCancelRequested {
@@ -126,17 +126,19 @@ pub enum ObservationEvent {
     },
     RequestJoined {
         service_id: ServiceId,
-        operation_id: OperationId,
-        footprint: Footprint,
+        active_operation_id: OperationId,
+        joined_operation_id: OperationId,
+        object: ObjectKey,
     },
     RequestMerged {
         service_id: ServiceId,
         operation_id: OperationId,
-        footprint: Footprint,
+        object: ObjectKey,
     },
     RequestQueued {
         service_id: ServiceId,
-        footprint: Footprint,
+        operation_id: OperationId,
+        object: ObjectKey,
     },
 }
 

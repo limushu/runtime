@@ -9,7 +9,7 @@
 ### 1. 实现入口
 
 - [`Cargo.toml`](Cargo.toml)：唯一生产 Workspace；
-- [`crates/foundation/control-runtime/`](crates/foundation/control-runtime/README.md)：业务无关 Service/ObjectActor Runtime；
+- [`crates/foundation/control-runtime/`](crates/foundation/control-runtime/README.md)：业务无关 Service/ObjectSlot Runtime；
 - [`crates/pool-control-plane/`](crates/pool-control-plane/README.md)：全部 Pool 领域、Workflow 和一个 Pool 的装配根。
 
 验证命令：
@@ -29,7 +29,7 @@ python3 scripts/verify_architecture.py
 - [`pool-control-plane-baseline/07-pool-control-plane-theory.md`](pool-control-plane-baseline/07-pool-control-plane-theory.md)
 - [`pool-control-plane-baseline/08-package-and-workspace-layout.md`](pool-control-plane-baseline/08-package-and-workspace-layout.md)
 
-这里定义 Pool、MemberDisk、Tier、VD/BG、PoolNode、SDB 权威、领域 Workflow、协作取消、ObjectActor 和目标 Cargo 包边界。
+这里定义 Pool、MemberDisk、Tier、VD/BG、PoolNode、SDB 权威、领域 Workflow、协作取消、ObjectSlot 和目标 Cargo 包边界。
 
 ## 当前结构
 

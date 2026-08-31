@@ -94,6 +94,30 @@ async fn online_cooperatively_preempts_only_its_disk_intent() {
 }
 
 #[tokio::test]
+async fn recovery_before_the_first_await_settles_cannot_commit_stale_state() {
+    let disk = MemberDiskId::new("disk-1");
+    let pool = PoolRuntime::new([disk.clone()]);
+    let router = pool.router();
+    let offline_disk = disk.clone();
+    let offline = tokio::spawn(async move {
+        router
+            .call_root("offline", MemberDiskRequest::Offline(offline_disk))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let online = pool.online(disk.clone()).await.unwrap();
+
+    assert_eq!(offline.await.unwrap(), Err(RuntimeError::Cancelled));
+    assert_eq!(online.state, MemberDiskState::Ua);
+    assert_eq!(
+        pool.member_disk(disk).await.unwrap().state,
+        MemberDiskState::Ua
+    );
+    pool.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn one_disk_recovery_does_not_cancel_the_rest_of_a_batch() {
     let disk_1 = MemberDiskId::new("disk-1");
     let disk_2 = MemberDiskId::new("disk-2");
@@ -241,7 +265,7 @@ async fn drain_waits_for_accepted_work_and_finishes_paused() {
 }
 
 #[tokio::test]
-async fn dropping_a_root_call_cancels_submitted_downstream_work() {
+async fn an_admitted_topology_fact_survives_its_callers_disconnect() {
     let disk = MemberDiskId::new("disk-1");
     let pool = PoolRuntime::new([disk.clone()]);
     let router = pool.router();
@@ -254,18 +278,19 @@ async fn dropping_a_root_call_cancels_submitted_downstream_work() {
     tokio::time::sleep(Duration::from_millis(35)).await;
     caller.abort();
     let _ = caller.await;
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
 
     let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
         panic!("expected stats")
     };
-    assert_eq!(stats.stable_stops, 1);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.stable_stops, 0);
     assert_eq!(pool.member_disk_observer().snapshot().active_tasks, 0);
     pool.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn dropping_a_batch_cancels_every_submitted_item() {
+async fn admitted_batch_facts_survive_their_callers_disconnect() {
     let disks = vec![MemberDiskId::new("disk-1"), MemberDiskId::new("disk-2")];
     let pool = PoolRuntime::new(disks.clone());
     let router = pool.router();
@@ -281,12 +306,13 @@ async fn dropping_a_batch_cancels_every_submitted_item() {
     tokio::time::sleep(Duration::from_millis(35)).await;
     caller.abort();
     let _ = caller.await;
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
 
     let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
         panic!("expected stats")
     };
-    assert_eq!(stats.stable_stops, 2);
+    assert_eq!(stats.completed, 2);
+    assert_eq!(stats.stable_stops, 0);
     assert_eq!(pool.member_disk_observer().snapshot().active_tasks, 0);
     pool.shutdown().await.unwrap();
 }

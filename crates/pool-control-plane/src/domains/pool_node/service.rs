@@ -1,7 +1,7 @@
 use super::protocol::{MemberDiskIoAvailability, PoolNodeReply, PoolNodeRequest};
 use crate::kernel::MemberDiskId;
 use async_trait::async_trait;
-use control_runtime::{ExecutionClass, RuntimeResult, Service, StateCell, WorkflowContext};
+use control_runtime::{RequestRoute, RuntimeResult, Service, StateCell, WorkflowContext};
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -37,8 +37,8 @@ impl Service for PoolNodeService {
     type Request = PoolNodeRequest;
     type WorkflowKind = Infallible;
 
-    fn classify(&self, _request: &Self::Request) -> ExecutionClass<Self::WorkflowKind> {
-        ExecutionClass::Inline
+    fn route(&self, _request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
+        RequestRoute::Untracked
     }
 
     async fn handle(

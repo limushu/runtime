@@ -1,8 +1,7 @@
 mod container;
 mod contract;
-mod object_actor;
+mod object_slot;
+mod service_loop;
 
 pub use container::{spawn_service, ControlHandle, ManagedService, RuntimeConfig};
-pub use contract::{
-    ExecutionClass, Footprint, ObjectActivity, ObjectDecision, Service, WorkflowMeta,
-};
+pub use contract::{Admission, ObjectActivity, OrphanPolicy, RequestRoute, Service, WorkflowMeta};

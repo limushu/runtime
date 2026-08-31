@@ -44,7 +44,7 @@
   <rect class="module" x="120" y="435" width="285" height="45" rx="6"/>
   <text class="text" x="262" y="463">container · root task · poll</text>
   <rect class="module" x="120" y="500" width="285" height="45" rx="6"/>
-  <text class="text" x="262" y="528">object_actor</text>
+  <text class="text" x="262" y="528">object_slot</text>
   <text class="small" x="265" y="595">禁止出现 Disk / BG / Node / Pool 业务知识</text>
 
   <rect class="crate" x="585" y="85" width="560" height="540" rx="14"/>

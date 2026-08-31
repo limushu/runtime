@@ -1,77 +1,81 @@
-use crate::{
-    CancelCause, ObjectKey, OperationId, RuntimeResult, ServiceId, ServiceRequest, WorkflowContext,
-};
+use crate::{CancelCause, ObjectKey, RuntimeResult, ServiceId, ServiceRequest, WorkflowContext};
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Footprint(Arc<[ObjectKey]>);
-
-impl Footprint {
-    pub fn one(key: ObjectKey) -> Self {
-        Self(Arc::from([key]))
-    }
-
-    pub fn keys(&self) -> &[ObjectKey] {
-        &self.0
-    }
+/// What should happen when every caller waiting for a workflow disappears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPolicy {
+    /// Request cooperative cancellation and wait for the workflow to settle.
+    Cancel,
+    /// Keep running after admission. Useful for facts that must converge even
+    /// when the producer disconnects.
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowMeta<K> {
     pub key: ObjectKey,
-    pub footprint: Footprint,
     pub kind: K,
     pub label: Arc<str>,
+    pub orphan_policy: OrphanPolicy,
 }
 
 impl<K> WorkflowMeta<K> {
     pub fn object(key: ObjectKey, kind: K, label: impl Into<Arc<str>>) -> Self {
         Self {
-            footprint: Footprint::one(key.clone()),
             key,
             kind,
             label: label.into(),
+            orphan_policy: OrphanPolicy::Cancel,
+        }
+    }
+
+    pub fn continue_when_orphaned(mut self) -> Self {
+        self.orphan_policy = OrphanPolicy::Continue;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestRoute<K> {
+    /// A normal Future without object admission or managed-task bookkeeping.
+    Untracked,
+    Workflow(WorkflowMeta<K>),
+}
+
+/// The small, business-facing projection of one object's intent slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectActivity<K> {
+    Idle,
+    Busy {
+        current_kind: K,
+        replacement_kind: Option<K>,
+    },
+}
+
+impl<K> ObjectActivity<K> {
+    pub fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    pub fn target_kind(&self) -> Option<&K> {
+        match self {
+            Self::Idle => None,
+            Self::Busy {
+                current_kind,
+                replacement_kind,
+            } => replacement_kind.as_ref().or(Some(current_kind)),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionClass<K> {
-    Inline,
-    Workflow(WorkflowMeta<K>),
-}
-
-/// Business-facing projection of the object registry. Runtime storage and
-/// TaskAttempt identity remain private to the service container.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObjectActivity<K> {
-    Idle,
-    Pending {
-        operation_id: OperationId,
-        kind: K,
-    },
-    Running {
-        operation_id: OperationId,
-        kind: K,
-    },
-    Cancelling {
-        current_operation_id: OperationId,
-        current_kind: K,
-        replacement_operation_id: OperationId,
-        replacement_kind: K,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObjectDecision<R> {
+pub enum Admission<R> {
     Start,
-    JoinExisting,
-    JoinPending,
-    JoinReplacement,
+    Join,
     Queue,
-    CancelThenStart { cause: CancelCause },
+    Replace { cause: CancelCause },
     Complete(R),
     Reject { reason: Arc<str> },
 }
@@ -85,20 +89,17 @@ pub trait Service: Send + Sync + 'static {
         <Self::Request as ServiceRequest>::service_id()
     }
 
-    fn classify(&self, request: &Self::Request) -> ExecutionClass<Self::WorkflowKind>;
+    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind>;
 
-    fn decide(
+    fn admit(
         &self,
         _context: &WorkflowContext,
         _request: &Self::Request,
-        _incoming: &WorkflowMeta<Self::WorkflowKind>,
         activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<ObjectDecision<<Self::Request as ServiceRequest>::Response>> {
+    ) -> RuntimeResult<Admission<<Self::Request as ServiceRequest>::Response>> {
         Ok(match activity {
-            ObjectActivity::Idle => ObjectDecision::Start,
-            ObjectActivity::Pending { .. }
-            | ObjectActivity::Running { .. }
-            | ObjectActivity::Cancelling { .. } => ObjectDecision::Queue,
+            ObjectActivity::Idle => Admission::Start,
+            ObjectActivity::Busy { .. } => Admission::Queue,
         })
     }
 

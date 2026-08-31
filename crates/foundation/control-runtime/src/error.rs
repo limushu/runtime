@@ -27,6 +27,8 @@ pub enum RuntimeError {
     InvalidState(String),
     #[error("operation timed out: {0}")]
     Timeout(String),
+    #[error("workflow panicked: {0}")]
+    WorkflowPanicked(String),
     #[error("internal runtime error: {0}")]
     Internal(String),
 }

@@ -209,3 +209,13 @@ Monitor 切主、Task 失败或执行重试不能改变 Operation Context 的因
 对象键、冲突集合和 `Start / Join / Merge / Queue / CancelThenStart / Reject` 的选择属于领域策略。Admission Registry 必须原子执行该决定并维护在途索引、等待者和并发配额。
 
 框架不能猜测业务冲突，业务代码也不能绕过 Admission Registry 直接启动受管 Workflow；否则同一对象的互斥、合并和取消保证无法成立。
+
+## 共享意图的生命期
+
+多个调用合并到同一对象意图时，Workflow 的生命期属于对象意图槽位，不属于第一个调用者。调用者只是结果订阅者：
+
+- 任一订阅者离开不能取消仍被其他订阅者等待的 Workflow；
+- 所有订阅者都离开时，Runtime 按请求声明的 orphan policy 决定协作取消或继续收敛；
+- 新意图替换旧意图时，由 ObjectSlot 请求旧 Workflow 取消，并等待其稳定退出后再启动替代 Workflow。
+
+Workflow 在已发出的下游效果返回后、提交下一次本地状态迁移前调用 `stable_boundary()`。该检查只出现在业务稳定边界，不要求开发者在每一行轮询取消状态。

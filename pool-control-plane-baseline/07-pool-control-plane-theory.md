@@ -722,23 +722,24 @@ impl DiskService {
 4. 业务代码不构造 `TaskSpec`、`BoxFuture` 或 `move |task| async move`；
 5. Operation Context 作为附加上下文传播因果、取消和 Trace，不成为执行主体；
 6. 元数据访问必须保证不会把可变借用或锁守卫带过 `.await`，具体机制留给运行时原型验证。
+7. 协作取消只在下游效果已稳定、准备提交下一次领域迁移时通过 `stable_boundary()` 检查，不在每个步骤散落取消轮询。
 
 ### 14.2 策略声明与机制执行
 
 业务策略必须显式，但其执行机制必须统一。领域为请求声明对象键、影响集合和冲突决策：
 
 ```rust
-enum ConflictDecision {
+enum Admission {
     Start,
-    JoinExisting,
-    MergeIntoExisting,
+    Join,
     Queue,
-    CancelThenStart,
+    Replace,
+    Complete,
     Reject,
 }
 ```
 
-框架负责原子准入、在途索引、等待者、并发配额、协作取消和完成通知。领域只回答“两个业务意图是什么关系”，不管理 `HashMap<TaskKey, JoinHandle>`。复杂模块可以提供自定义策略函数；简单模块只使用预置策略。
+框架负责原子准入、在途索引、订阅者、并发配额、协作取消和完成通知。领域只回答“两个业务意图是什么关系”，不区分 Join 的目标当前处于 Pending、Running 还是 Replacement，也不管理 `HashMap<TaskKey, JoinHandle>`。复杂模块可以提供自定义策略函数；简单模块只使用预置策略。
 
 ### 14.3 Service Runtime 契约
 

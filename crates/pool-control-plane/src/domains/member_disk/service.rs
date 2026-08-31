@@ -1,5 +1,5 @@
 use super::machine::{
-    MemberDiskActivity, MemberDiskEffect, MemberDiskEvent, MemberDiskMachine, MemberDiskTransition,
+    MemberDiskEffect, MemberDiskEvent, MemberDiskMachine, MemberDiskTransition,
     MemberDiskWorkflowKind,
 };
 use super::protocol::{MemberDiskReply, MemberDiskRequest, MemberDiskState};
@@ -8,7 +8,7 @@ use crate::domains::virtual_disk::protocol::{VirtualDiskReply, VirtualDiskReques
 use crate::kernel::MemberDiskId;
 use async_trait::async_trait;
 use control_runtime::{
-    CancelCause, ExecutionClass, ObjectActivity, ObjectDecision, ObjectKey, Router, RuntimeError,
+    Admission, CancelCause, ObjectActivity, ObjectKey, RequestRoute, Router, RuntimeError,
     RuntimeResult, Service, StateCell, WorkflowContext, WorkflowMeta,
 };
 use std::collections::HashMap;
@@ -30,9 +30,8 @@ impl MemberDiskMetadata {
         &mut self,
         disk: &MemberDiskId,
         event: MemberDiskEvent,
-        activity: MemberDiskActivity,
     ) -> RuntimeResult<MemberDiskTransition> {
-        let transition = MemberDiskMachine::transition(self.state(disk)?, event, activity)?;
+        let transition = MemberDiskMachine::transition(self.state(disk)?, event)?;
         self.disks.insert(disk.clone(), transition.to);
         Ok(transition)
     }
@@ -61,20 +60,23 @@ impl MemberDiskService {
         context: &WorkflowContext,
         disk: &MemberDiskId,
         event: MemberDiskEvent,
-        activity: MemberDiskActivity,
     ) -> RuntimeResult<MemberDiskTransition> {
         let transition = self
             .metadata
-            .update(|metadata| metadata.apply(disk, event, activity))?;
+            .update(|metadata| metadata.apply(disk, event))?;
         if transition.from != transition.to {
             context.state_transition(
-                ObjectKey::new(format!("member-disk/{disk}")),
+                Self::object_key(disk),
                 format!("{:?}", transition.from),
                 format!("{:?}", transition.to),
                 format!("{:?}", transition.event),
             );
         }
         Ok(transition)
+    }
+
+    fn object_key(disk: &MemberDiskId) -> ObjectKey {
+        ObjectKey::new(format!("member-disk/{disk}"))
     }
 
     fn reply(&self, disk: MemberDiskId) -> RuntimeResult<MemberDiskReply> {
@@ -99,13 +101,9 @@ impl MemberDiskService {
             )
             .await?;
         context.milestone("member disk down fact published to PoolNode");
+        context.stable_boundary()?;
 
-        self.apply_event(
-            &context,
-            &disk,
-            MemberDiskEvent::BeginDrain,
-            MemberDiskActivity::Running(MemberDiskWorkflowKind::Offline),
-        )?;
+        self.apply_event(&context, &disk, MemberDiskEvent::BeginDrain)?;
 
         let settled = self
             .router
@@ -117,7 +115,7 @@ impl MemberDiskService {
         context.milestone("VirtualDisk evacuation returned a stable result");
 
         match settled {
-            VirtualDiskReply::Evacuated { .. } => {}
+            VirtualDiskReply::Evacuated { .. } => context.stable_boundary()?,
             VirtualDiskReply::DrainStopped { .. } => return Err(RuntimeError::Cancelled),
             VirtualDiskReply::Stats(_) => {
                 return Err(RuntimeError::Internal(
@@ -126,12 +124,7 @@ impl MemberDiskService {
             }
         }
 
-        self.apply_event(
-            &context,
-            &disk,
-            MemberDiskEvent::DrainCompleted,
-            MemberDiskActivity::Running(MemberDiskWorkflowKind::Offline),
-        )?;
+        self.apply_event(&context, &disk, MemberDiskEvent::DrainCompleted)?;
         self.reply(disk)
     }
 
@@ -149,60 +142,40 @@ impl MemberDiskService {
                 },
             )
             .await?;
-        self.apply_event(
-            &context,
-            &disk,
-            MemberDiskEvent::OnlineSettled,
-            MemberDiskActivity::Running(MemberDiskWorkflowKind::Online),
-        )?;
+        context.stable_boundary()?;
+        self.apply_event(&context, &disk, MemberDiskEvent::OnlineSettled)?;
         self.reply(disk)
     }
 
-    fn decision(
+    fn admit_event(
         &self,
         context: &WorkflowContext,
         disk: &MemberDiskId,
         event: MemberDiskEvent,
+        kind: MemberDiskWorkflowKind,
         activity: &ObjectActivity<MemberDiskWorkflowKind>,
-    ) -> RuntimeResult<ObjectDecision<MemberDiskReply>> {
-        let activity = match activity {
-            ObjectActivity::Idle => MemberDiskActivity::Idle,
-            ObjectActivity::Pending { kind, .. } => MemberDiskActivity::Pending(*kind),
-            ObjectActivity::Running { kind, .. } => MemberDiskActivity::Running(*kind),
-            ObjectActivity::Cancelling {
-                current_kind,
-                replacement_kind,
-                ..
-            } => MemberDiskActivity::Cancelling {
-                current: *current_kind,
-                next: *replacement_kind,
-            },
-        };
-        let transition = self.apply_event(context, disk, event, activity)?;
+    ) -> RuntimeResult<Admission<MemberDiskReply>> {
+        if activity.target_kind() == Some(&kind) {
+            return Ok(Admission::Join);
+        }
+
+        let transition = self.apply_event(context, disk, event)?;
         Ok(match transition.effect {
-            MemberDiskEffect::Start(_) => ObjectDecision::Start,
-            MemberDiskEffect::Join => match activity {
-                MemberDiskActivity::Pending(_) => ObjectDecision::JoinPending,
-                MemberDiskActivity::Running(_) => ObjectDecision::JoinExisting,
-                MemberDiskActivity::Cancelling { .. } => ObjectDecision::JoinReplacement,
-                MemberDiskActivity::Idle => {
-                    return Err(RuntimeError::Internal(
-                        "idle MemberDisk statechart returned Join".into(),
-                    ))
-                }
-            },
-            MemberDiskEffect::Replace { cause, .. } => ObjectDecision::CancelThenStart {
-                cause: CancelCause::new(cause),
-            },
-            MemberDiskEffect::Complete => ObjectDecision::Complete(self.reply(disk.clone())?),
-            MemberDiskEffect::Reject(reason) => ObjectDecision::Reject {
+            MemberDiskEffect::Complete => Admission::Complete(self.reply(disk.clone())?),
+            MemberDiskEffect::Reject(reason) => Admission::Reject {
                 reason: reason.into(),
             },
-            MemberDiskEffect::None => {
-                return Err(RuntimeError::Internal(
-                    "internal MemberDisk effect escaped object admission".into(),
-                ))
-            }
+            MemberDiskEffect::Continue if activity.is_idle() => Admission::Start,
+            MemberDiskEffect::Continue => Admission::Replace {
+                cause: CancelCause::new(match kind {
+                    MemberDiskWorkflowKind::Offline => {
+                        "disk went down; replace the current online intent"
+                    }
+                    MemberDiskWorkflowKind::Online => {
+                        "disk recovered; stop draining at a stable boundary"
+                    }
+                }),
+            },
         })
     }
 }
@@ -212,38 +185,53 @@ impl Service for MemberDiskService {
     type Request = MemberDiskRequest;
     type WorkflowKind = MemberDiskWorkflowKind;
 
-    fn classify(&self, request: &Self::Request) -> ExecutionClass<Self::WorkflowKind> {
+    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
         match request {
-            MemberDiskRequest::Get(_) => ExecutionClass::Inline,
-            MemberDiskRequest::Offline(disk) => ExecutionClass::Workflow(WorkflowMeta::object(
-                ObjectKey::new(format!("member-disk/{disk}")),
-                MemberDiskWorkflowKind::Offline,
-                format!("take member disk {disk} offline"),
-            )),
-            MemberDiskRequest::Online(disk) => ExecutionClass::Workflow(WorkflowMeta::object(
-                ObjectKey::new(format!("member-disk/{disk}")),
-                MemberDiskWorkflowKind::Online,
-                format!("bring member disk {disk} online"),
-            )),
+            MemberDiskRequest::Get(_) => RequestRoute::Untracked,
+            // DiskMap facts must converge after admission even if their
+            // original producer disconnects.
+            MemberDiskRequest::Offline(disk) => RequestRoute::Workflow(
+                WorkflowMeta::object(
+                    Self::object_key(disk),
+                    MemberDiskWorkflowKind::Offline,
+                    format!("take member disk {disk} offline"),
+                )
+                .continue_when_orphaned(),
+            ),
+            MemberDiskRequest::Online(disk) => RequestRoute::Workflow(
+                WorkflowMeta::object(
+                    Self::object_key(disk),
+                    MemberDiskWorkflowKind::Online,
+                    format!("bring member disk {disk} online"),
+                )
+                .continue_when_orphaned(),
+            ),
         }
     }
 
-    fn decide(
+    fn admit(
         &self,
         context: &WorkflowContext,
         request: &Self::Request,
-        _incoming: &WorkflowMeta<Self::WorkflowKind>,
         activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<ObjectDecision<MemberDiskReply>> {
+    ) -> RuntimeResult<Admission<MemberDiskReply>> {
         match request {
-            MemberDiskRequest::Offline(disk) => {
-                self.decision(context, disk, MemberDiskEvent::DiskDown, activity)
-            }
-            MemberDiskRequest::Online(disk) => {
-                self.decision(context, disk, MemberDiskEvent::DiskUp, activity)
-            }
+            MemberDiskRequest::Offline(disk) => self.admit_event(
+                context,
+                disk,
+                MemberDiskEvent::DiskDown,
+                MemberDiskWorkflowKind::Offline,
+                activity,
+            ),
+            MemberDiskRequest::Online(disk) => self.admit_event(
+                context,
+                disk,
+                MemberDiskEvent::DiskUp,
+                MemberDiskWorkflowKind::Online,
+                activity,
+            ),
             MemberDiskRequest::Get(_) => Err(RuntimeError::Internal(
-                "inline request reached object admission".into(),
+                "untracked request reached object admission".into(),
             )),
         }
     }

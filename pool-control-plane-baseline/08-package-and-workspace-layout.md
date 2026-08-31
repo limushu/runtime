@@ -51,7 +51,8 @@ kube-managed-future-runner/
 │   │               ├── mod.rs
 │   │               ├── contract.rs
 │   │               ├── container.rs
-│   │               └── object_actor.rs
+│   │               ├── service_loop.rs
+│   │               └── object_slot.rs
 │   │
 │   └── pool-control-plane/
 │       └── src/
@@ -85,7 +86,7 @@ kube-managed-future-runner/
 - 每个 Service 一个根 Tokio task；
 - 业务通道与控制通道；
 - `FuturesUnordered` 统一 poll Workflow Future；
-- ObjectActor 的 `Idle/Pending/Running/Cancelling` 准入；
+- ObjectSlot 的 `Idle/Pending/Running/Cancelling` 原子准入；
 - Router 和类型化 oneshot 调用；
 - Operation/Call/Task 因果上下文；
 - 结构化取消、Service 生命周期和观测；
@@ -93,8 +94,9 @@ kube-managed-future-runner/
 
 它不能出现 Pool、Disk、Node、VD、BG、BLK、Tier、Rebuild、SDB 等业务知识。
 
-内部原来的 `runtime.rs` 已改为 `service/container.rs`。原因是整个 crate 已经是
-Runtime，而该文件实际只负责一个 Service 的执行容器，旧命名重复且掩盖职责。
+内部原来的 `runtime.rs` 已拆为 `service/container.rs` 与 `service/service_loop.rs`：
+前者只保存配置、控制句柄和 Service 所有权，后者保存根 task 的事件循环。整个
+crate 已经是 Runtime，不再创建含义重复的 `runtime.rs`。
 
 ## 5. `pool-control-plane` 的职责
 
@@ -218,7 +220,7 @@ Workflow Future
 ## 10. 当前实现状态
 
 - 已完成：`control-protocol` 合并进 `control-runtime::protocol`；
-- 已完成：`runtime.rs` 重组为 `service/contract + container + object_actor`；
+- 已完成：`runtime.rs` 重组为 `service/contract + container + service_loop + object_slot`；
 - 已完成：Pool Kernel 合并为 `pool-control-plane::kernel`；
 - 已完成：MemberDisk、VirtualDisk、PoolNode 合并为 Domain modules；
 - 已完成：PoolRuntime 与全部状态图/场景测试迁移；
