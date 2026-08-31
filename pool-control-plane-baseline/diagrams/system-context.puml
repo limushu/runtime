@@ -16,15 +16,15 @@ rectangle "Active Monitor" {
   component MonitorKernel as Kernel
   component "DiskMap\n全局硬盘视图" as DiskMap
   component "NodeMap\nuser_dp网络连通性" as NodeMap
-  component "TopologyEventRouter\n候选路由实现" as TopoRouter
+  component "PoolManager\n生命周期 + 事实路由" as PoolManager
   component PoolRegistry as Registry
-  component "PoolRuntime A" as PoolA
-  component "PoolRuntime B" as PoolB
+  component "Pool A" as PoolA
+  component "Pool B" as PoolB
 
-  Kernel --> Registry
-  DiskMap --> TopoRouter : 硬盘拓扑通知
-  NodeMap --> TopoRouter : 节点拓扑通知
-  TopoRouter --> Registry : 定位受影响Pool
+  Kernel --> PoolManager
+  PoolManager --> Registry
+  DiskMap --> PoolManager : 标准化硬盘事实
+  NodeMap --> PoolManager : 标准化节点事实
   Registry --> PoolA
   Registry --> PoolB
 }

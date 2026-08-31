@@ -8,7 +8,7 @@ package "Cargo Workspace" {
   package "control-runtime crate" as Runtime {
     component Protocol
     component Context
-    component Router
+    component ServiceClient
     component Observation
     package "service module" {
       component Contract
@@ -19,9 +19,11 @@ package "Cargo Workspace" {
 
   package "pool-control-plane crate" as Pool {
     component Kernel
-    component PoolRuntime
+    component PoolManager
+    component "Pool\nmetadata + assembly" as PoolInstance
+    component Ports
     package "domains module" {
-      component MemberDisk
+      component "MemberDisk\nmodel + actor + machine" as MemberDisk
       component VirtualDisk
       component PoolNode
       component Tier
@@ -31,16 +33,18 @@ package "Cargo Workspace" {
 }
 
 Pool --> Runtime : only Cargo dependency
-PoolRuntime --> MemberDisk : create/register
-PoolRuntime --> VirtualDisk : create/register
-PoolRuntime --> PoolNode : create/register
-MemberDisk ..> VirtualDisk : Router request
-MemberDisk ..> PoolNode : Router request
-VirtualDisk ..> Tier : future Router request
+PoolManager --> PoolInstance : create/restore/route
+PoolInstance --> MemberDisk : spawn + own
+PoolInstance --> VirtualDisk : spawn + own
+PoolInstance --> PoolNode : spawn + own
+PoolInstance --> Ports : persist/restore
+MemberDisk ..> VirtualDisk : explicit facade
+MemberDisk ..> PoolNode : explicit facade
+VirtualDisk ..> Tier : future explicit facade
 
 ServiceContainer --> Contract
 ServiceContainer --> ObjectSlot
-Router --> Context
+ServiceClient --> Context
 Observation .. ServiceContainer
 
 note bottom of Pool

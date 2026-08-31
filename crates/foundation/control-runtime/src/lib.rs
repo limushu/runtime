@@ -1,13 +1,14 @@
 //! Business-agnostic in-process control-plane runtime.
 
+pub mod client;
 pub mod context;
 pub mod error;
 pub mod observation;
 pub mod protocol;
-pub mod router;
 pub mod service;
 pub mod state_cell;
 
+pub use client::ServiceClient;
 pub use context::{CancelCause, CancellationScope, WorkflowContext};
 pub use error::{RuntimeError, RuntimeResult};
 pub use observation::{
@@ -15,7 +16,6 @@ pub use observation::{
     TaskOutcome,
 };
 pub use protocol::{CallId, ObjectKey, OperationId, ServiceId, ServiceRequest, TaskAttemptId};
-pub use router::Router;
 pub use service::{
     spawn_service, Admission, ControlHandle, ManagedService, ObjectActivity, OrphanPolicy,
     RequestRoute, RuntimeConfig, Service, WorkflowMeta,

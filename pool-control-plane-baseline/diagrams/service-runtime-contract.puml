@@ -24,7 +24,8 @@ package "Service Runtime" {
   component "Observation\nIdle/Busy + progress + trace" as Observation
 }
 
-component "Typed Router\noneshot + context propagation" as Router
+component "Domain Service Facade\nnamed methods" as Facade
+component "Typed ServiceClient\nexplicit instance + oneshot" as Client
 component "Other Domain Services" as Other
 
 Developer --> Query : 编写
@@ -38,8 +39,9 @@ Policy --> Admission
 Admission --> Futures : 准入
 Futures --> Workflow : poll
 Workflow --> State : 短临界区读写
-Workflow --> Router : call / submit / query
-Router --> Other
+Workflow --> Facade : named capability
+Facade --> Client
+Client --> Other : context + stable cancellation
 Futures --> Tasks
 Tasks --> Observation
 Admission --> Observation

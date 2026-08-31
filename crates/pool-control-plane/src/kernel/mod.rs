@@ -34,6 +34,7 @@ macro_rules! domain_id {
 }
 
 domain_id!(PoolId);
+domain_id!(PhysicalDiskId);
 domain_id!(MemberDiskId);
 domain_id!(TierId);
 domain_id!(VirtualDiskId);

@@ -12,9 +12,10 @@ rectangle "Pool" as Pool {
 }
 
 rectangle "MemberDisk" as MD {
-  component "Compound FSM\nUA / DA / DI / UI / REMOVED" as DiskState
-  component "PhysicalProjection\nUP / DOWN" as PhysicalState
-  component "AllocationProjection\nACTIVE / INACTIVE" as AllocationState
+  database "MemberDiskRecord (SDB)\nidentity/tier/capacity/topology\nallocation/membership/bitmap/revision" as Record
+  component "Physical Observation\nDiskMap: UP / DOWN" as PhysicalState
+  component "Operational Projection\nUA / DA / DI / UI / REMOVED" as DiskState
+  component "ObjectActivity\nObjectSlot: intent only" as ObjectActivity
 }
 
 rectangle "PoolNode" as PN {
@@ -30,8 +31,9 @@ rectangle "BGEntry" as Entry {
 
 Entry --> Health : BG -> VD -> Pool派生
 MD --> MediaState : 物理状态输入
-DiskState --> PhysicalState : 派生
-DiskState --> AllocationState : 派生
+Record --> DiskState : allocation + membership
+PhysicalState --> DiskState : observation
+ObjectActivity ..> DiskState : 只参与准入，不拥有状态
 Connectivity --> ServiceState : 必要但不充分
 
 note bottom of Pool
@@ -43,8 +45,7 @@ Connected(n) 不代表 PoolServing(p,n)
 end note
 
 note bottom of MD
-分析时可分维度观察
-实现时只枚举合法组合
-DA -> DI不是不可逆承诺
+Record / Observation / Projection / Activity 四层分离
+逻辑Actor拥有前三层，ObjectSlot拥有Activity
 end note
 @enduml

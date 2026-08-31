@@ -26,16 +26,18 @@ Monitor 是整个存储系统的中心化管控面。Active Monitor 管理所有
 Monitor 的逻辑结构为：
 
 \[
-Monitor=(Role,PoolRegistry,Gateways,\{PoolRuntime_p\mid p\in Pools\})
+Monitor=(Role,PoolManager,PoolRegistry,Gateways,\{Pool_p\mid p\in Pools\})
 \]
 
 其中：
 
 \[
-PoolRegistry:PoolId\rightarrow PoolRuntime
+PoolRegistry:PoolId\rightarrow Pool
 \]
 
-`PoolRuntime` 目前只是一个逻辑边界：它表示 Monitor 内属于同一个 Pool 的内存状态、领域能力和运行操作。它是否对应一个 task、多个 task 或其他执行模型，尚未决定。
+`Pool` 是业务对象和生命周期边界：它聚合本 Pool 的核心配置、领域能力、内存投影及其 Service 所有权。它不是通用 Runtime 的别名，也不等于一个 task。每个领域 Service 当前拥有一个根执行单元，并在该根中统一 poll 多个 Workflow Future。
+
+`PoolManager` 只负责创建、恢复、卸载、查找 Pool 和按归属路由事实，不实现 MemberDisk、Tier、VD/BG 的领域策略。
 
 ## 硬盘归属边界
 

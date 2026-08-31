@@ -9,7 +9,7 @@
 - 后续开发者主要编写业务能力和工作流，而不是理解复杂框架机制；
 - 为未来并行执行或进程拆分保留显式接口，但不提前引入分布式复杂度。
 
-## 候选组件视图
+## 组件视图
 
 ![Monitor 管控面组件](assets/control-plane-components.svg)
 
@@ -19,7 +19,7 @@
 
 ### MonitorKernel
 
-候选职责：
+职责：
 
 - Active/Standby 角色感知；
 - Monitor 启停和全局生命周期；
@@ -29,10 +29,10 @@
 
 ### PoolManager
 
-候选职责：
+职责：
 
 - 从 SDB 枚举和加载 Pool；
-- 创建、恢复、卸载 `PoolRuntime`；
+- 创建、恢复、卸载独立 `Pool`；
 - 维护 `PoolRegistry`；
 - 将 Pool 级请求和事件路由到目标 Pool；
 - 协调真正跨 Pool 的能力。
@@ -47,9 +47,9 @@ DiskMap 是 Monitor 全局组件，管理物理硬盘视图并向各 Pool 提供
 
 NodeMap 是 Monitor 全局组件，只管理 Monitor 与 user_dp 的网络连通性。外部 Node 拓扑变化由 NodeMap 标准化后通知受影响的 Pool。它不保存某个 Pool 在 user_dp 上是否加载、Ready 或提供服务。
 
-### TopologyEventRouter
+### 拓扑事实路由
 
-该名称是候选实现，职责已经确认：接收 DiskMap 和 NodeMap 的标准化通知，根据 Pool 归属和成员关系投递给受影响的 PoolRuntime。
+`PoolManager` 接收 DiskMap 和 NodeMap 的标准化通知，根据 Pool 归属和成员关系投递给受影响的 Pool。普通盘使用 `Exclusive` 归属并且只能有一个目标；只有显式标记为 `SharedCache` 的资源才可以拥有多个目标。两种模式不得在同一物理盘上混用。
 
 它只负责事实路由，不决定磁盘重建、Node 加载或 VNODE 迁移等业务策略。
 
@@ -59,23 +59,25 @@ NodeMap 是 Monitor 全局组件，只管理 Monitor 与 user_dp 的网络连通
 
 普通硬盘通过 Monitor 内的 DiskMap 接入，并由单个 Pool 独占。只有无法归入单 Pool 的业务事实才进入全局资源域，避免把 DiskMap 的硬盘管理能力复制进 Pool 模块。
 
-## PoolRuntime
+## Pool
 
-`PoolRuntime` 是单个 Pool 在 Monitor 内的逻辑容器：
+`Pool` 是单个 Pool 在 Monitor 内的业务对象、生命周期和装配边界：
 
 ```text
-PoolRuntime
+Pool
+├── PoolMetadata / Pool CRUD
 ├── PoolCore
-├── TierDomain
-├── VdDomain
-├── NodeDomain
+├── MemberDiskDomain / TierDomain
+├── VirtualDiskDomain
+├── PoolNodeDomain
 ├── Domain Workflows（分别定义在所属Service）
-├── Service Runtime / Router（候选基础设施）
+├── 显式领域 Service Facade
+├── 每 Service 内部的通用 Runtime
 ├── PoolView
 └── Reconcile
 ```
 
-当前确认的是责任分区，不是运行 task 数量。
+`Pool` 不叫 `PoolRuntime`：前者是业务概念，后者只是可复用的执行机制。当前每个领域 Service 一个根 task；逻辑对象 Actor 和 ObjectSlot 都不额外创建 task。
 
 ### PoolCore
 
@@ -124,9 +126,9 @@ PoolCore 不直接拥有全部 MemberDisk、VD 和 BG 数据。
 
 Workflow 优先实现为所属 Service 上的自然 `async fn`。Operation Context 只传播因果、取消和 Trace；决定流程走向的事实必须保存在领域对象中。
 
-### Service Runtime 与 Router
+### Service Runtime 与显式领域能力
 
-候选公共基础设施包括：
+公共基础设施包括：
 
 - 独立的控制通道与业务通道；
 - 请求到 Service 方法的静态分发；
@@ -136,7 +138,25 @@ Workflow 优先实现为所属 Service 上的自然 `async fn`。Operation Conte
 - Idle/Busy、队列、阻塞、进度和 Trace 观测；
 - 强制停止根执行单元前的结构化取消与收敛。
 
-Router 提供类型化 `call/submit/query`，内部封装 channel、oneshot 和 Operation Context 传播。业务代码不通过 Task 发起跨服务通信，也不直接管理 `JoinHandle`。
+`ServiceClient<R>` 是指向一个明确 Service 实例的类型化地址，内部封装 channel、oneshot 和 Operation Context 传播。请求类型本身不声明目的地，也不存在依据请求枚举自动选择服务的全局 Router。
+
+领域模块在 `ServiceClient` 外提供命名 facade，例如：
+
+```rust
+self.pool_nodes.publish_member_disk(&context, disk, Down).await?;
+self.virtual_disks.evacuate_member_disk(&context, disk).await?;
+```
+
+命令枚举、响应枚举、channel 和 oneshot 对领域外部不可见。业务代码不通过 Task 发起跨服务通信，也不直接管理 `JoinHandle`。
+
+### MemberDisk 逻辑 Actor 与 ObjectSlot
+
+两者解决不同问题：
+
+- `MemberDiskActor` 是领域对象：拥有完整 `MemberDiskRecord`、最新 DiskMap 观测和状态图决策；
+- `ObjectSlot` 是 Runtime 执行槽：拥有当前意图、订阅者、替代意图和等待队列；
+- Runtime 调用 Actor 的准入决策，再由 ObjectSlot 原子执行 `Start/Join/Queue/Replace`；
+- 一个盘一个逻辑 Actor，但不是一个盘一个 Tokio task/mailbox。
 
 ### PoolView
 
@@ -197,7 +217,7 @@ Types -> Config -> Repository/Ports -> Domain Service -> Runtime -> Interface
 - Types 定义 Pool、Tier、MemberDisk、VD、BG、Node 等值对象和协议；
 - Repository/Ports 定义 SDB、硬件事件、user_dp、VNODE 接口；
 - Domain Service 实现领域规则；
-- Runtime 装配 PoolRuntime、路由、执行和生命周期；
+- Pool 装配领域 Service；Runtime 在每个 Service 内提供执行和生命周期机制；
 - Interface 处理外部 API、事件和观测输出。
 
 ## 已明确的实现约束与仍待原型验证的判断
@@ -208,12 +228,15 @@ Types -> Config -> Repository/Ports -> Domain Service -> Runtime -> Interface
 - Query 不被强制包装为可观测 Task；
 - Task、Future 集合、channel、oneshot、取消传播和 Trace 由框架管理；
 - 业务与控制通道语义分离，控制消息具有独立准入和优先处理能力；
-- 跨服务通信属于 Router，不属于 Task；
+- 跨服务通信属于显式 Service facade/Client，不属于 Task；
 - 核心元数据只能由所属 Service 修改，且不得把可变访问跨过 `.await`。
 
-仍待原型验证：
+已经由当前纵切面验证：
 
-- `PoolRuntime` 与领域 Service 的具体根 task 数量；
-- “每 Service 一个根 task 并 poll 多个 Workflow Future”是否满足性能和可维护性目标；
-- Service 私有元数据采用闭包式 StateCell、内部 actor 消息还是其他不暴露锁守卫的机制；
-- 宏生成静态分发和 Admission 描述的最小复杂度。
+- `PoolManager -> Pool -> Domain Service` 的多 Pool 装配与路由；
+- 每 Service 一个根 task，并使用 `FuturesUnordered` poll 多个 Workflow Future；
+- `StateCell` 只允许同步闭包访问，无法把锁 Guard 跨过 `.await`；
+- MemberDisk 逻辑 Actor 与 Runtime ObjectSlot 的职责分离；
+- 自然 `async fn` Workflow、显式领域 facade，以及替代意图等待旧 Future 稳定退出。
+
+仍待验证的是 Tier/Partition 并行化、完整 VD/BG 恢复语义和真实 SDB 条件写适配器，而不是重新引入隐藏路由或每对象 task。

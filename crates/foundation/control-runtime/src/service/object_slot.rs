@@ -1,5 +1,5 @@
 use super::container::{Reply, ResponseOf};
-use crate::router::BusinessEnvelope;
+use crate::client::BusinessEnvelope;
 use crate::{
     CancelCause, CancellationScope, ObjectActivity, ObjectKey, OperationId, RuntimeError, Service,
     TaskAttemptId, WorkflowContext, WorkflowMeta,

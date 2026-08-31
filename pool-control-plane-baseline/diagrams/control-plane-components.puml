@@ -10,19 +10,20 @@ package "Monitor 全局层" {
   component PoolRegistry
   component "DiskMap\n全局硬盘视图" as DiskMap
   component "NodeMap\n网络连通性" as NodeMap
-  component "TopologyEventRouter\n候选" as TopoRouter
   component "GlobalResourceDomain\n候选：共享缓存" as GlobalResource
 }
 
-package "PoolRuntime[PoolId]" {
+package "Pool[PoolId]" {
+  component "PoolMetadata\nCRUD + lifecycle" as PoolMetadata
   component PoolCore
-  component TierDomain
-  component VdDomain
-  component NodeDomain
+  component "MemberDisk Domain\nEntity + Logical Actor" as MemberDiskDomain
+  component "Tier Domain" as TierDomain
+  component "VirtualDisk Domain" as VdDomain
+  component "PoolNode Domain" as NodeDomain
   component "Domain Workflows\n位于所属Service" as Workflow
-  component "Service Runtime\n候选公共机制" as ServiceRuntime
+  component "Service Runtime\n每Service一个根task" as ServiceRuntime
   component PoolView
-  component "PoolRouter\n候选" as Router
+  component "Explicit Service Facades\n明确目标实例" as Facades
 }
 
 package "外部端口" {
@@ -37,19 +38,21 @@ MonitorKernel --> DiskMap
 MonitorKernel --> NodeMap
 PoolManager --> PoolRegistry
 PoolManager --> GlobalResource
-PoolRegistry --> PoolCore : 管理PoolRuntime
-DiskMap --> TopoRouter : 硬盘拓扑通知
-NodeMap --> TopoRouter : 节点拓扑通知
-TopoRouter --> PoolRegistry : 定位受影响Pool
-TopoRouter --> PoolCore : 投递标准化事实
+PoolRegistry --> PoolMetadata : 管理Pool实例
+DiskMap --> PoolManager : 标准化硬盘事实
+NodeMap --> PoolManager : 标准化节点事实
+PoolManager --> PoolRegistry : 定位受影响Pool
+PoolManager --> MemberDiskDomain : 投递标准化事实
 
-PoolCore --> Router
-Router --> TierDomain
-Router --> VdDomain
-Router --> NodeDomain
-Workflow ..> Router : 跨领域能力
+PoolMetadata --> PoolCore
+PoolCore --> Facades
+Facades --> MemberDiskDomain
+Facades --> TierDomain
+Facades --> VdDomain
+Facades --> NodeDomain
+Workflow ..> Facades : 命名领域能力
 ServiceRuntime --> Workflow : poll Future
-ServiceRuntime --> Router : 请求分发/上下文传播
+ServiceRuntime --> Facades : ServiceClient/上下文传播
 PoolCore --> PoolView
 TierDomain --> PoolView
 VdDomain --> PoolView
@@ -74,8 +77,9 @@ note bottom of Workflow
 Workflow属于最终结果的领域
 end note
 
-note bottom of Router
-提供call / submit / query
+note bottom of Facades
+请求不携带隐藏目标
+提供命名call / submit / query
 Task不是通信能力所有者
 end note
 @enduml

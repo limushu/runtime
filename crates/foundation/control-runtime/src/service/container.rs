@@ -1,6 +1,6 @@
 use super::service_loop::ServiceLoop;
 use crate::{
-    CancelCause, CancellationScope, Router, RuntimeError, RuntimeResult, Service, ServiceId,
+    CancelCause, CancellationScope, RuntimeError, RuntimeResult, Service, ServiceClient, ServiceId,
     ServiceObserver, ServiceRequest,
 };
 use std::sync::Arc;
@@ -151,8 +151,7 @@ impl Drop for ManagedService {
 
 pub fn spawn_service<S: Service>(
     service: Arc<S>,
-    router: &Router,
     config: RuntimeConfig,
-) -> ManagedService {
-    ServiceLoop::spawn(service, router, config)
+) -> (ServiceClient<S::Request>, ManagedService) {
+    ServiceLoop::spawn(service, config)
 }

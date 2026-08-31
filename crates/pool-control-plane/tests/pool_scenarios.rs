@@ -1,344 +1,239 @@
-use control_runtime::{Activity, ObservationEvent, RuntimeConfig, RuntimeError, ServiceLifecycle};
+use control_runtime::{RuntimeConfig, RuntimeError};
 use pool_control_plane::{
-    MemberDiskId, MemberDiskRequest, MemberDiskState, PoolRuntime, VirtualDiskReply,
+    ByteCount, FailureDomainId, InMemoryControlPlaneStore, MediaClass, MemberDiskId,
+    MemberDiskSpec, MemberDiskState, PhysicalDiskId, PhysicalState, PoolId, PoolManager, PoolPatch,
+    PoolSpec, TierId,
 };
-use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
-#[tokio::test]
-async fn query_is_a_future_but_not_a_managed_task() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    assert_eq!(
-        pool.member_disk(disk).await.unwrap().state,
-        MemberDiskState::Ua
-    );
-    let snapshot = pool.member_disk_observer().snapshot();
-    assert_eq!(snapshot.activity, Activity::Idle);
-    assert_eq!(snapshot.active_tasks, 0);
-    pool.shutdown().await.unwrap();
+fn member_disk(pool: &PoolId, id: &str, physical: &str) -> MemberDiskSpec {
+    MemberDiskSpec::new(
+        MemberDiskId::new(id),
+        PhysicalDiskId::new(physical),
+        pool.clone(),
+        TierId::new("capacity"),
+        MediaClass::new("hdd"),
+        ByteCount::new(4 * 1024 * 1024 * 1024),
+        vec![FailureDomainId::new("rack-a")],
+    )
+}
+
+fn manager(store: Arc<InMemoryControlPlaneStore>) -> PoolManager {
+    PoolManager::new(store, RuntimeConfig::default())
 }
 
 #[tokio::test]
-async fn duplicate_object_intents_join_one_workflow() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-    let first = router.call_root("first", MemberDiskRequest::Offline(disk.clone()));
-    let second = router.call_root("second", MemberDiskRequest::Offline(disk));
-    let (first, second) = tokio::join!(first, second);
-    assert_eq!(first.unwrap(), second.unwrap());
-    let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
-        panic!("expected stats")
-    };
-    assert_eq!(stats.started, 1);
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn one_batch_operation_drives_independent_disk_intents() {
-    let disks = vec![
-        MemberDiskId::new("disk-1"),
-        MemberDiskId::new("disk-2"),
-        MemberDiskId::new("disk-3"),
-    ];
-    let pool = PoolRuntime::new(disks.clone());
-    let mut events = pool.member_disk_observer().subscribe_events();
-
-    let reply = pool.offline_many(disks).await.unwrap();
-    assert_eq!(reply.items.len(), 3);
-    assert!(reply
-        .items
-        .iter()
-        .all(|item| item.result == Ok(MemberDiskState::Removed)));
-
-    let starts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
-        .filter_map(|event| match event {
-            ObservationEvent::TaskStarted {
-                task_attempt_id,
-                parent_task_attempt_id,
-                operation_id,
-                ..
-            } => Some((task_attempt_id, parent_task_attempt_id, operation_id)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(starts.len(), 3, "only the three object intents are tasks");
-    let operations: HashSet<_> = starts.iter().map(|(_, _, operation)| *operation).collect();
-    assert_eq!(operations.len(), 1);
-    assert!(starts.iter().all(|(_, parent, _)| parent.is_none()));
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn online_cooperatively_preempts_only_its_disk_intent() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-    let offline_disk = disk.clone();
-    let offline = tokio::spawn(async move {
-        router
-            .call_root("offline", MemberDiskRequest::Offline(offline_disk))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(35)).await;
-
-    let online = pool.online(disk.clone()).await.unwrap();
-    assert_eq!(offline.await.unwrap(), Err(RuntimeError::Cancelled));
-    assert_eq!(online.state, MemberDiskState::Ua);
-    let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
-        panic!("expected stats")
-    };
-    assert_eq!(stats.stable_stops, 1);
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn recovery_before_the_first_await_settles_cannot_commit_stale_state() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-    let offline_disk = disk.clone();
-    let offline = tokio::spawn(async move {
-        router
-            .call_root("offline", MemberDiskRequest::Offline(offline_disk))
-            .await
-    });
-
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    let online = pool.online(disk.clone()).await.unwrap();
-
-    assert_eq!(offline.await.unwrap(), Err(RuntimeError::Cancelled));
-    assert_eq!(online.state, MemberDiskState::Ua);
-    assert_eq!(
-        pool.member_disk(disk).await.unwrap().state,
-        MemberDiskState::Ua
-    );
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn one_disk_recovery_does_not_cancel_the_rest_of_a_batch() {
-    let disk_1 = MemberDiskId::new("disk-1");
-    let disk_2 = MemberDiskId::new("disk-2");
-    let disk_3 = MemberDiskId::new("disk-3");
-    let pool = PoolRuntime::new([disk_1.clone(), disk_2.clone(), disk_3.clone()]);
-    let router = pool.router();
-    let batch_disks = vec![disk_1.clone(), disk_2.clone(), disk_3.clone()];
-
-    let batch = tokio::spawn(async move {
-        router
-            .call_batch(
-                "offline batch",
-                batch_disks.into_iter().map(MemberDiskRequest::Offline),
-            )
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(35)).await;
-    assert_eq!(
-        pool.online(disk_1.clone()).await.unwrap().state,
-        MemberDiskState::Ua
-    );
-
-    let response = batch.await.unwrap().unwrap();
-    assert_eq!(response[0], Err(RuntimeError::Cancelled));
-    assert_eq!(
-        response[1].as_ref().unwrap().state,
-        MemberDiskState::Removed
-    );
-    assert_eq!(
-        response[2].as_ref().unwrap().state,
-        MemberDiskState::Removed
-    );
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_new_event_can_replace_the_pending_replacement() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-
-    let offline_router = router.clone();
-    let offline_disk = disk.clone();
-    let offline = tokio::spawn(async move {
-        offline_router
-            .call_root("offline", MemberDiskRequest::Offline(offline_disk))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(35)).await;
-
-    let online_router = router.clone();
-    let online_disk = disk.clone();
-    let online = tokio::spawn(async move {
-        online_router
-            .call_root("online", MemberDiskRequest::Online(online_disk))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(1)).await;
-
-    let latest = router
-        .call_root("offline again", MemberDiskRequest::Offline(disk))
+async fn pool_manager_routes_one_disk_fact_to_its_pool() {
+    let store = Arc::new(InMemoryControlPlaneStore::default());
+    let manager = manager(store);
+    let pool_a = PoolId::new("pool-a");
+    let pool_b = PoolId::new("pool-b");
+    let disk_a = member_disk(&pool_a, "md-a", "pd-a");
+    let disk_b = member_disk(&pool_b, "md-b", "pd-b");
+    manager
+        .create_pool(PoolSpec::new(pool_a.clone(), "A"), vec![disk_a])
         .await
         .unwrap();
-    assert_eq!(offline.await.unwrap(), Err(RuntimeError::Cancelled));
-    assert!(matches!(
-        online.await.unwrap(),
-        Err(RuntimeError::Superseded(_))
-    ));
-    assert_eq!(latest.state, MemberDiskState::Removed);
-    pool.shutdown().await.unwrap();
-}
+    manager
+        .create_pool(PoolSpec::new(pool_b.clone(), "B"), vec![disk_b])
+        .await
+        .unwrap();
 
-#[tokio::test]
-async fn duplicate_pending_intents_join_before_capacity_is_available() {
-    let disk_1 = MemberDiskId::new("disk-1");
-    let disk_2 = MemberDiskId::new("disk-2");
-    let pool = PoolRuntime::with_config(
-        [disk_1.clone(), disk_2.clone()],
-        RuntimeConfig {
-            max_active_workflows: 1,
-            ..RuntimeConfig::default()
-        },
-    );
-    let router = pool.router();
-
-    let first_router = router.clone();
-    let first = tokio::spawn(async move {
-        first_router
-            .call_root("first disk", MemberDiskRequest::Offline(disk_1))
+    let routed = manager
+        .route_disk_fact(&PhysicalDiskId::new("pd-a"), PhysicalState::Up)
+        .await
+        .unwrap();
+    assert_eq!(routed.len(), 1);
+    assert_eq!(routed[0].pool, pool_a);
+    assert_eq!(
+        manager
+            .pool(&PoolId::new("pool-a"))
+            .unwrap()
+            .member_disks()
+            .get(MemberDiskId::new("md-a"))
             .await
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let pending = router.call_root("pending", MemberDiskRequest::Offline(disk_2.clone()));
-    let duplicate = router.call_root("duplicate pending", MemberDiskRequest::Offline(disk_2));
-    let (pending, duplicate) = tokio::join!(pending, duplicate);
-    assert_eq!(pending.unwrap(), duplicate.unwrap());
-    assert!(first.await.unwrap().is_ok());
-
-    let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
-        panic!("expected stats")
-    };
-    assert_eq!(
-        stats.started, 2,
-        "the pending duplicate must not start twice"
-    );
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn pause_rejects_new_business_and_resume_accepts_it() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let control = pool.member_disk_control();
-    control.pause().await.unwrap();
-    assert!(matches!(
-        pool.member_disk(disk.clone()).await,
-        Err(RuntimeError::ServicePaused(_))
-    ));
-    control.resume().await.unwrap();
-    assert_eq!(
-        pool.member_disk(disk).await.unwrap().state,
+            .unwrap()
+            .operational_state,
         MemberDiskState::Ua
     );
-    pool.shutdown().await.unwrap();
+    assert_eq!(
+        manager
+            .pool(&pool_b)
+            .unwrap()
+            .member_disks()
+            .get(MemberDiskId::new("md-b"))
+            .await
+            .unwrap()
+            .operational_state,
+        MemberDiskState::Da
+    );
 }
 
 #[tokio::test]
-async fn drain_waits_for_accepted_work_and_finishes_paused() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-    let control = pool.member_disk_control();
-    let observer = pool.member_disk_observer();
-    let work = tokio::spawn(async move {
-        router
-            .call_root("offline", MemberDiskRequest::Offline(disk))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(15)).await;
-    control.drain().await.unwrap();
-    assert!(work.await.unwrap().is_ok());
-    assert_eq!(observer.snapshot().lifecycle, ServiceLifecycle::Paused);
-    pool.shutdown().await.unwrap();
-}
+async fn shared_cache_fans_out_but_exclusive_ownership_cannot_be_mixed() {
+    let store = Arc::new(InMemoryControlPlaneStore::default());
+    let manager = manager(store);
+    let pool_a = PoolId::new("pool-a");
+    let pool_b = PoolId::new("pool-b");
+    manager
+        .create_pool(
+            PoolSpec::new(pool_a.clone(), "A"),
+            vec![member_disk(&pool_a, "cache-a", "shared-cache").shared_cache()],
+        )
+        .await
+        .unwrap();
+    manager
+        .create_pool(
+            PoolSpec::new(pool_b.clone(), "B"),
+            vec![member_disk(&pool_b, "cache-b", "shared-cache").shared_cache()],
+        )
+        .await
+        .unwrap();
 
-#[tokio::test]
-async fn an_admitted_topology_fact_survives_its_callers_disconnect() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-    let caller = tokio::spawn(async move {
-        router
-            .call_root("abandoned offline", MemberDiskRequest::Offline(disk))
-            .await
-    });
+    let routed = manager
+        .route_disk_fact(&PhysicalDiskId::new("shared-cache"), PhysicalState::Up)
+        .await
+        .unwrap();
+    assert_eq!(routed.len(), 2);
 
-    tokio::time::sleep(Duration::from_millis(35)).await;
-    caller.abort();
-    let _ = caller.await;
-    tokio::time::sleep(Duration::from_millis(120)).await;
-
-    let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
-        panic!("expected stats")
-    };
-    assert_eq!(stats.completed, 1);
-    assert_eq!(stats.stable_stops, 0);
-    assert_eq!(pool.member_disk_observer().snapshot().active_tasks, 0);
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn admitted_batch_facts_survive_their_callers_disconnect() {
-    let disks = vec![MemberDiskId::new("disk-1"), MemberDiskId::new("disk-2")];
-    let pool = PoolRuntime::new(disks.clone());
-    let router = pool.router();
-    let caller = tokio::spawn(async move {
-        router
-            .call_batch(
-                "abandoned offline batch",
-                disks.into_iter().map(MemberDiskRequest::Offline),
-            )
-            .await
-    });
-
-    tokio::time::sleep(Duration::from_millis(35)).await;
-    caller.abort();
-    let _ = caller.await;
-    tokio::time::sleep(Duration::from_millis(120)).await;
-
-    let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
-        panic!("expected stats")
-    };
-    assert_eq!(stats.completed, 2);
-    assert_eq!(stats.stable_stops, 0);
-    assert_eq!(pool.member_disk_observer().snapshot().active_tasks, 0);
-    pool.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn force_aborting_a_service_first_cancels_its_downstream_calls() {
-    let disk = MemberDiskId::new("disk-1");
-    let pool = PoolRuntime::new([disk.clone()]);
-    let router = pool.router();
-    let caller = tokio::spawn(async move {
-        router
-            .call_root("offline before unload", MemberDiskRequest::Offline(disk))
-            .await
-    });
-
-    tokio::time::sleep(Duration::from_millis(35)).await;
-    pool.force_abort_member_disk();
+    let pool_c = PoolId::new("pool-c");
     assert!(matches!(
-        caller.await.unwrap(),
-        Err(RuntimeError::ChannelClosed(_))
+        manager
+            .create_pool(
+                PoolSpec::new(pool_c.clone(), "C"),
+                vec![member_disk(&pool_c, "md-c", "shared-cache")],
+            )
+            .await,
+        Err(RuntimeError::Rejected(_))
     ));
-    tokio::time::sleep(Duration::from_millis(60)).await;
+}
 
-    let VirtualDiskReply::Stats(stats) = pool.virtual_disk_stats().await.unwrap() else {
-        panic!("expected stats")
-    };
+#[tokio::test]
+async fn member_disk_keeps_core_metadata_and_allocation_bitmap() {
+    let store = Arc::new(InMemoryControlPlaneStore::default());
+    let manager = manager(store);
+    let pool_id = PoolId::new("pool-a");
+    let pool = manager
+        .create_pool(
+            PoolSpec::new(pool_id.clone(), "A"),
+            vec![member_disk(&pool_id, "md-a", "pd-a")],
+        )
+        .await
+        .unwrap();
+    manager
+        .route_disk_fact(&PhysicalDiskId::new("pd-a"), PhysicalState::Up)
+        .await
+        .unwrap();
+
+    let blk = pool
+        .member_disks()
+        .allocate(MemberDiskId::new("md-a"))
+        .await
+        .unwrap();
+    let allocated = pool
+        .member_disks()
+        .get(MemberDiskId::new("md-a"))
+        .await
+        .unwrap();
+    assert_eq!(allocated.spec.physical_disk, PhysicalDiskId::new("pd-a"));
+    assert_eq!(allocated.spec.tier, TierId::new("capacity"));
+    assert_eq!(allocated.spec.media_class.as_str(), "hdd");
+    assert_eq!(allocated.total_blocks, 4);
+    assert_eq!(allocated.allocated_blocks, 1);
+
+    pool.member_disks()
+        .release(MemberDiskId::new("md-a"), blk)
+        .await
+        .unwrap();
+    assert_eq!(
+        pool.member_disks()
+            .get(MemberDiskId::new("md-a"))
+            .await
+            .unwrap()
+            .allocated_blocks,
+        0
+    );
+}
+
+#[tokio::test]
+async fn disk_actor_replaces_offline_only_after_it_settles() {
+    let store = Arc::new(InMemoryControlPlaneStore::default());
+    let manager = manager(store);
+    let pool_id = PoolId::new("pool-a");
+    let pool = manager
+        .create_pool(
+            PoolSpec::new(pool_id.clone(), "A"),
+            vec![member_disk(&pool_id, "md-a", "pd-a")],
+        )
+        .await
+        .unwrap();
+    let disks = pool.member_disks().clone();
+    disks
+        .apply_physical(MemberDiskId::new("md-a"), PhysicalState::Up)
+        .await
+        .unwrap();
+
+    let offline_disks = disks.clone();
+    let offline = tokio::spawn(async move {
+        offline_disks
+            .apply_physical(MemberDiskId::new("md-a"), PhysicalState::Down)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let online = disks
+        .apply_physical(MemberDiskId::new("md-a"), PhysicalState::Up)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        offline.await.unwrap(),
+        Err(RuntimeError::Cancelled)
+    ));
+    assert_eq!(online.operational_state, MemberDiskState::Ua);
+    let stats = pool.virtual_disks().stats().await.unwrap();
+    assert_eq!(stats.cancelled, 1);
     assert_eq!(stats.stable_stops, 1);
-    drop(pool);
+}
+
+#[tokio::test]
+async fn pool_metadata_crud_and_cold_restore_use_the_store() {
+    let store = Arc::new(InMemoryControlPlaneStore::default());
+    let pool_id = PoolId::new("pool-a");
+    let first = manager(store.clone());
+    let pool = first
+        .create_pool(
+            PoolSpec::new(pool_id.clone(), "before"),
+            vec![member_disk(&pool_id, "md-a", "pd-a")],
+        )
+        .await
+        .unwrap();
+    first
+        .update_pool(
+            &pool_id,
+            PoolPatch {
+                name: Some("after".into()),
+            },
+        )
+        .await
+        .unwrap();
+    pool.shutdown().await.unwrap();
+    drop(first);
+
+    let restored = manager(store);
+    assert_eq!(restored.restore_all().await.unwrap(), vec![pool_id.clone()]);
+    let snapshot = restored.get_pool(&pool_id).await.unwrap();
+    assert_eq!(snapshot.metadata.spec.name.as_ref(), "after");
+    assert_eq!(snapshot.member_disk_count, 1);
+    assert_eq!(
+        restored
+            .pool(&pool_id)
+            .unwrap()
+            .member_disks()
+            .get(MemberDiskId::new("md-a"))
+            .await
+            .unwrap()
+            .operational_state,
+        MemberDiskState::Da
+    );
 }

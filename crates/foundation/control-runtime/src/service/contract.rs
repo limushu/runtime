@@ -85,9 +85,7 @@ pub trait Service: Send + Sync + 'static {
     type Request: ServiceRequest;
     type WorkflowKind: Clone + Debug + Eq + Send + Sync + 'static;
 
-    fn id(&self) -> ServiceId {
-        <Self::Request as ServiceRequest>::service_id()
-    }
+    fn id(&self) -> ServiceId;
 
     fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind>;
 

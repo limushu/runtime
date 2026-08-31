@@ -1,52 +1,104 @@
-use super::protocol::{VirtualDiskReply, VirtualDiskRequest, VirtualDiskStats};
-use crate::kernel::MemberDiskId;
+use super::protocol::{
+    EvacuationResult, VirtualDiskCommand, VirtualDiskResponse, VirtualDiskStats,
+};
+use crate::kernel::{MemberDiskId, PoolId};
 use async_trait::async_trait;
 use control_runtime::{
-    Admission, ObjectActivity, ObjectKey, RequestRoute, RuntimeResult, Service, StateCell,
+    spawn_service, Admission, ManagedService, ObjectActivity, ObjectKey, RequestRoute,
+    RuntimeConfig, RuntimeError, RuntimeResult, Service, ServiceClient, ServiceId, StateCell,
     WorkflowContext, WorkflowMeta,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VirtualDiskWorkflowKind {
-    EvacuateMemberDisk,
-}
-
-#[derive(Debug, Default)]
+#[derive(Clone)]
 pub struct VirtualDiskService {
-    state: StateCell<VirtualDiskStats>,
+    client: ServiceClient<VirtualDiskCommand>,
 }
 
 impl VirtualDiskService {
+    pub(crate) fn spawn(pool: &PoolId, config: RuntimeConfig) -> (Self, ManagedService) {
+        let worker = Arc::new(VirtualDiskWorker::new(pool));
+        let (client, managed) = spawn_service(worker, config);
+        (Self { client }, managed)
+    }
+
+    pub async fn evacuate_member_disk(
+        &self,
+        context: &WorkflowContext,
+        disk: MemberDiskId,
+    ) -> RuntimeResult<EvacuationResult> {
+        match self
+            .client
+            .call(
+                context,
+                format!("evacuate BGs on {disk}"),
+                VirtualDiskCommand::EvacuateMemberDisk(disk),
+            )
+            .await?
+        {
+            VirtualDiskResponse::Evacuated(result) => Ok(result),
+            VirtualDiskResponse::Stats(_) => Err(RuntimeError::Internal(
+                "VirtualDisk returned Stats to evacuate_member_disk".into(),
+            )),
+        }
+    }
+
+    pub async fn stats(&self) -> RuntimeResult<VirtualDiskStats> {
+        match self
+            .client
+            .call_root("query virtual disk stats", VirtualDiskCommand::Stats)
+            .await?
+        {
+            VirtualDiskResponse::Stats(stats) => Ok(stats),
+            VirtualDiskResponse::Evacuated(_) => Err(RuntimeError::Internal(
+                "VirtualDisk returned Evacuated to stats".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualDiskWorkflowKind {
+    EvacuateMemberDisk,
+}
+
+struct VirtualDiskWorker {
+    id: ServiceId,
+    state: StateCell<VirtualDiskStats>,
+}
+
+impl VirtualDiskWorker {
     const BG_COUNT: usize = 4;
 
-    pub fn new() -> Self {
-        Self::default()
+    fn new(pool: &PoolId) -> Self {
+        Self {
+            id: ServiceId::new(format!("pool/{pool}/virtual-disk")),
+            state: StateCell::new(VirtualDiskStats::default()),
+        }
     }
 
     async fn evacuate_member_disk(
         &self,
         _disk: MemberDiskId,
         context: WorkflowContext,
-    ) -> RuntimeResult<VirtualDiskReply> {
+    ) -> RuntimeResult<VirtualDiskResponse> {
         self.state.update(|state| state.started += 1);
         let mut committed = 0;
 
+        // Cancellation is interpreted once by the VD scheduler, not by every
+        // parent workflow. An issued BG step settles before cancellation is
+        // returned; unissued BGs are not scheduled.
         for _ in 0..Self::BG_COUNT {
             tokio::select! {
                 biased;
                 _ = context.cancellation().requested() => {
-                    // An issued BG operation is not dropped. Its stable result
-                    // is awaited before the service reports DrainStopped.
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     self.state.update(|state| {
                         state.cancelled += 1;
                         state.stable_stops += 1;
                     });
-                    return Ok(VirtualDiskReply::DrainStopped {
-                        committed,
-                        skipped: Self::BG_COUNT - committed,
-                    });
+                    return Err(RuntimeError::Cancelled);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
                     committed += 1;
@@ -56,21 +108,25 @@ impl VirtualDiskService {
         }
 
         self.state.update(|state| state.completed += 1);
-        Ok(VirtualDiskReply::Evacuated {
-            bg_count: Self::BG_COUNT,
-        })
+        Ok(VirtualDiskResponse::Evacuated(EvacuationResult {
+            bg_count: committed,
+        }))
     }
 }
 
 #[async_trait]
-impl Service for VirtualDiskService {
-    type Request = VirtualDiskRequest;
+impl Service for VirtualDiskWorker {
+    type Request = VirtualDiskCommand;
     type WorkflowKind = VirtualDiskWorkflowKind;
+
+    fn id(&self) -> ServiceId {
+        self.id.clone()
+    }
 
     fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
         match request {
-            VirtualDiskRequest::Stats => RequestRoute::Untracked,
-            VirtualDiskRequest::EvacuateMemberDisk(disk) => {
+            VirtualDiskCommand::Stats => RequestRoute::Untracked,
+            VirtualDiskCommand::EvacuateMemberDisk(disk) => {
                 RequestRoute::Workflow(WorkflowMeta::object(
                     ObjectKey::new(format!("member-disk/{disk}")),
                     VirtualDiskWorkflowKind::EvacuateMemberDisk,
@@ -85,7 +141,7 @@ impl Service for VirtualDiskService {
         _context: &WorkflowContext,
         _request: &Self::Request,
         activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<Admission<VirtualDiskReply>> {
+    ) -> RuntimeResult<Admission<VirtualDiskResponse>> {
         Ok(if activity.is_idle() {
             Admission::Start
         } else {
@@ -97,13 +153,13 @@ impl Service for VirtualDiskService {
         &self,
         request: Self::Request,
         context: WorkflowContext,
-    ) -> RuntimeResult<VirtualDiskReply> {
+    ) -> RuntimeResult<VirtualDiskResponse> {
         match request {
-            VirtualDiskRequest::EvacuateMemberDisk(disk) => {
+            VirtualDiskCommand::EvacuateMemberDisk(disk) => {
                 self.evacuate_member_disk(disk, context).await
             }
-            VirtualDiskRequest::Stats => {
-                Ok(VirtualDiskReply::Stats(self.state.read(|state| *state)))
+            VirtualDiskCommand::Stats => {
+                Ok(VirtualDiskResponse::Stats(self.state.read(|state| *state)))
             }
         }
     }

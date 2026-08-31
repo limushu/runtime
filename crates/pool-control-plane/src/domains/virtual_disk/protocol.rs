@@ -1,10 +1,8 @@
 use crate::kernel::MemberDiskId;
-use control_runtime::{ServiceId, ServiceRequest};
-
-pub const SERVICE_ID: &str = "pool.virtual-disk";
+use control_runtime::ServiceRequest;
 
 #[derive(Debug, Clone)]
-pub enum VirtualDiskRequest {
+pub(crate) enum VirtualDiskCommand {
     EvacuateMemberDisk(MemberDiskId),
     Stats,
 }
@@ -18,17 +16,17 @@ pub struct VirtualDiskStats {
     pub stable_stops: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvacuationResult {
+    pub bg_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VirtualDiskReply {
-    Evacuated { bg_count: usize },
-    DrainStopped { committed: usize, skipped: usize },
+pub(crate) enum VirtualDiskResponse {
+    Evacuated(EvacuationResult),
     Stats(VirtualDiskStats),
 }
 
-impl ServiceRequest for VirtualDiskRequest {
-    type Response = VirtualDiskReply;
-
-    fn service_id() -> ServiceId {
-        ServiceId::new(SERVICE_ID)
-    }
+impl ServiceRequest for VirtualDiskCommand {
+    type Response = VirtualDiskResponse;
 }

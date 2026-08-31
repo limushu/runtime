@@ -74,26 +74,38 @@ SDB 不提供覆盖 Tier 位图与 VD/BGMap 的统一事务或业务 WAL。系�
 
 领域声明对象键、影响集合以及 Start、Join、Merge、Queue、CancelThenStart、Reject 等冲突语义；Runtime 的 Admission Registry 原子执行准入、在途索引、等待者、取消传播和并发配额。框架不猜测业务语义，普通业务代码不重复实现机制。
 
-### D-019 跨服务通信属于 Router
+### D-019 跨服务通信属于显式 Service 能力
 
-领域之间使用类型化 `call/submit/query`。Router 封装 channel、oneshot、路由和 Operation Context 传播；Task 不是跨服务通信能力的所有者。
+领域之间使用指向明确目标实例的类型化 Service facade。其内部 `ServiceClient<R>` 封装 channel、oneshot 和 Operation Context 传播；请求不携带隐藏的目标 ServiceId，也不通过请求类型自动查找服务。Task 不是跨服务通信能力的所有者。
 
 ### D-020 Operation 观测不能成为隐形业务 WAL
 
 Operation 的开始、里程碑、完成和结果可以追加记录并用于 TUI 投影，但不能保存决定业务流程的独立权威状态。影响恢复正确性的中间事实必须进入所属领域元数据。
 
+### D-021 Pool 是业务边界，Runtime 是执行机制
+
+Monitor 的 `PoolManager` 维护 `PoolId -> Arc<Pool>`。`Pool` 拥有 Pool 元数据 CRUD、领域 Service facade 和根执行单元的生命周期；不再使用 `PoolRuntime` 混淆业务对象与通用执行机制。
+
+### D-022 MemberDisk Actor 与 ObjectSlot 分工
+
+每个 MemberDisk 是一个逻辑 Actor，拥有完整 MemberDisk 实体、最新物理观测和状态图决策，但不创建独立 Tokio task/mailbox。Runtime 的 `ObjectSlot` 只管理该对象的执行意图、订阅者、替代和排队。Actor 决定策略，ObjectSlot 原子执行机制。
+
+### D-023 取消在调用边界自动传播
+
+普通 Workflow 不散落取消轮询。显式 Service Client 等待下游稳定返回，并在父 Workflow 开始下一步前统一传播取消；下游领域执行器在自己的最小原子工作单元边界解释取消。旧 Future 不被直接 drop，替代意图等待其稳定退出。
+
+### D-024 MemberDisk 信息分层
+
+MemberDisk 的 SDB 决策记录、DiskMap 物理观测、由二者派生的 UA/DA/DI/UI/Removed 投影、Runtime 在途意图是四类不同信息。状态图不能取代容量、Tier、故障域、位图和成员关系等核心元数据。
+
 ## 候选架构判断
 
 以下内容尚未成为最终决策：
 
-1. Monitor 全局层使用 `PoolManager + PoolRegistry` 管理 PoolRuntime；
-2. 每个 Pool 使用一个 PoolRuntime 作为内存和运行隔离边界；
-3. PoolRuntime 内部按 PoolCore、TierDomain、VdDomain、NodeDomain 划分职责；
-4. 共享缓存层由 Monitor 全局资源域管理；
-5. 领域之间通过显式 `call/submit/query` 接口协作；
-6. PoolView 作为统一只读聚合视图，避免外部直接拼接多个领域状态；
-7. 每个 Service 使用一个根执行单元统一 poll 多个 Workflow Future；
-8. Service 私有元数据通过不暴露锁守卫的短临界区 API 访问。
+1. 共享缓存层由 Monitor 全局资源域管理；
+2. PoolView 作为统一只读聚合视图，避免外部直接拼接多个领域状态；
+3. Tier、VD/BG、Node 的最终服务实例粒度；
+4. 真实 SDB 适配器的条件写和不确定结果确认协议。
 
 ## 系统级待决问题
 
@@ -108,13 +120,13 @@ Operation 的开始、里程碑、完成和结果可以追加记录并用于 TUI
 - 共享缓存盘的权威所有者是谁；
 - 多个 Pool 如何分配配额和空间；
 - 单盘故障如何传播到使用它的全部 Pool；
-- 是否需要独立于 PoolRuntime 的全局服务与持久化模型。
+- 是否需要独立于 Pool 的全局服务与持久化模型。
 
 ### Q-003 Pool 生命周期
 
 - Pool 的创建、恢复、启用、暂停、排空、卸载和删除状态；
 - 哪些状态持久化，哪些属于 Monitor 运行生命周期；
-- PoolRuntime 何时允许接收业务请求。
+- Pool 处于何种生命周期时允许接收业务请求。
 
 ### Q-004 Node 成员关系
 
@@ -178,7 +190,7 @@ Operation 的开始、里程碑、完成和结果可以追加记录并用于 TUI
 
 ## 推荐的后续建模顺序
 
-1. Monitor 全局层与 PoolRuntime 生命周期；
+1. Monitor 全局层与 Pool 生命周期；
 2. Pool 内领域所有权和服务实例粒度；
 3. Pool 与 DiskMap、NodeMap、user_dp、VNODE、SDB 的接口契约；
 4. Pool 创建/恢复作为第一个系统级贯穿场景；

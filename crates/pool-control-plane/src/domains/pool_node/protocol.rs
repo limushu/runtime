@@ -1,7 +1,5 @@
 use crate::kernel::MemberDiskId;
-use control_runtime::{ServiceId, ServiceRequest};
-
-pub const SERVICE_ID: &str = "pool.node";
+use control_runtime::ServiceRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberDiskIoAvailability {
@@ -10,7 +8,7 @@ pub enum MemberDiskIoAvailability {
 }
 
 #[derive(Debug, Clone)]
-pub enum PoolNodeRequest {
+pub(crate) enum PoolNodeCommand {
     PublishMemberDisk {
         disk: MemberDiskId,
         availability: MemberDiskIoAvailability,
@@ -19,15 +17,11 @@ pub enum PoolNodeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PoolNodeReply {
+pub(crate) enum PoolNodeResponse {
     Published,
     PublishedCount(usize),
 }
 
-impl ServiceRequest for PoolNodeRequest {
-    type Response = PoolNodeReply;
-
-    fn service_id() -> ServiceId {
-        ServiceId::new(SERVICE_ID)
-    }
+impl ServiceRequest for PoolNodeCommand {
+    type Response = PoolNodeResponse;
 }

@@ -79,7 +79,7 @@ Harel 将持续响应外部和内部刺激的系统称为 reactive system，并�
 
 Actor 模型强调封装状态、通过消息交互以及并发实体之间的隔离。[Hewitt、Bishop 和 Steiger 的原始 Actor 论文](https://www.ijcai.org/Proceedings/73/Papers/027B.pdf)为“服务拥有自己的核心状态、外部通过显式通信句柄访问”提供理论支撑。
 
-本文只采用 Actor 的所有权与通信思想，不接受“每个领域对象必须对应一个 actor/task”的机械映射。一个服务是否对应一个 spawn task 属于运行时决策，不属于领域模型。
+本文采用 Actor 的状态所有权思想，但把“逻辑 Actor”和“执行 task”明确分开。当前 MemberDisk 纵切面为每个盘建立一个逻辑 Actor，由它拥有完整实体、最新 DiskMap 观测和状态图决策；全部 Actor 由 MemberDisk Service 的一个根执行单元驱动，不为每盘创建 Tokio task 或 mailbox。对象粒度来自业务并发边界，task 粒度来自运行时机制，二者不是一一对应关系。
 
 ### 3.3 Saga、Process Manager 与自然工作流
 
@@ -112,10 +112,10 @@ Kubernetes 官方将 Controller 描述为持续观察当前状态并使其接近
 其中：
 
 \[
-Registry:PoolId\rightarrow PoolRuntime
+Registry:PoolId\rightarrow Pool
 \]
 
-DiskMap 和 NodeMap 是全局事实视图；PoolRuntime 是单 Pool 的内存和业务隔离边界。
+DiskMap 和 NodeMap 是全局事实视图；`PoolManager` 维护 Registry 并路由事实；`Pool` 是单 Pool 的业务、内存和生命周期隔离边界。通用 Runtime 只存在于每个领域 Service 内部，不能代替 Pool 业务对象。
 
 ### 4.2 Pool 状态
 
@@ -183,7 +183,7 @@ Input_P=Command\cup TopologyFact\cup EffectResult\cup Timer
 PoolState=Lifecycle\times Health\times Activity
 \]
 
-- `Lifecycle`：PoolRuntime 是否正在加载、可接收请求、排空或卸载；
+- `Lifecycle`：Pool 是否正在加载、可接收请求、排空或卸载；
 - `Health`：由最差 VD 派生；
 - `Activity`：当前重建、迁移、扩缩容等操作集合。
 
@@ -191,7 +191,18 @@ PoolState=Lifecycle\times Health\times Activity
 
 ### 5.2 MemberDisk
 
-MemberDisk 的物理可访问性、空间分配能力和成员生命周期在分析上可以分别观察，但当前工作示例更适合使用只包含合法组合的复合状态：
+MemberDisk 不能被下面的状态枚举替代。它至少由四层信息组成：
+
+```text
+MemberDiskRecord(SDB decision)
+  = identity + pool/tier + media/capacity + failure domains
+  + allocation state + membership + BLK bitmap + revision
+PhysicalState(DiskMap observation)
+MemberDiskState = project(record, physical observation)
+ObjectActivity = Runtime execution intent
+```
+
+核心元数据只有 MemberDisk 领域可以修改；物理状态来自 DiskMap；UA/DA/DI/UI/Removed 是派生的运行投影；ObjectActivity 只表示 Future 的在途状态。四者不能混成一份状态。物理可访问性、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
 
 ```rust
 enum MemberDiskState {
@@ -209,7 +220,7 @@ enum MemberDiskState {
 Allocatable(m)=PhysicalUp(m)\land AllocationActive(m)
 \]
 
-因此 `DA` 保留的是“恢复后可直接重新服务”的策略含义，而不是允许向一块 DOWN 盘实际分配空间。该枚举是当前用于验证架构的示例，最终迁移表、持久化边界和 `Removed` 的对象生命周期仍由 MemberDisk 专项设计确认。
+因此 `DA` 保留的是“恢复后可直接重新服务”的策略含义，而不是允许向一块 DOWN 盘实际分配空间。`MemberDiskActor` 对外部物理事实与当前 `ObjectActivity` 作出 `Start/Join/Replace/Complete/Reject` 决定；Runtime 的 `ObjectSlot` 原子执行决定。状态图不持有 channel、Future、task 或锁。
 
 ### 5.3 PoolNode
 
@@ -284,7 +295,7 @@ DomainEvent：发布已经发生的状态变化
 - 需要取消、恢复、审计或明确完成语义；
 - 失败后不能简单从头重做。
 
-工作流不是新的状态所有者，也不是第二套业务状态机。它是一个自然 `async fn`，读取和修改所属领域的核心状态，并通过 Router 调用其他领域能力。工作流的所有者由最终业务结果决定：
+工作流不是新的状态所有者，也不是第二套业务状态机。它是一个自然 `async fn`，读取和修改所属领域的核心状态，并通过明确目标实例的领域 Service facade 调用其他领域能力。工作流的所有者由最终业务结果决定：
 
 \[
 Owner(Workflow)=Owner(BusinessOutcome)
@@ -500,7 +511,7 @@ CancelDecision(State_o,CommittedEffects,Cause)
 \in\{Stop,SettleThenStop,Continue,Reject\}
 \]
 
-当领域决定停止时，Runtime 通过共享的 `CancellationScope` 唤醒整个调用链；父 Workflow 不直接 drop 子 Future，而是等待 Router 返回下游已经停止、完成当前不可中断动作或继续到安全提交点后的稳定结果。跨模块通信始终由 Router/Client 提供，Task 不是 RPC 能力所有者。
+当领域决定停止时，Runtime 通过共享的 `CancellationScope` 唤醒整个调用链；父 Workflow 不直接 drop 子 Future。显式 Service Client 等待下游停止、完成当前不可中断动作或到达安全提交点并返回稳定结果，然后在控制权交回父 Workflow 前统一返回取消。跨模块通信由命名的领域 facade 提供，Task 不是 RPC 能力所有者。
 
 不可逆性是局部提交属性，不是整个 Workflow 的全局开关。某个 BG remap 一旦正式提交便不回滚，但硬盘排空 Workflow 仍可以停止调度其余 BG。这种语义称为前向恢复：保留已经安全提交的成果，停止尚未开始或仍可停止的工作，再由对象状态决定新的稳态。
 
@@ -518,9 +529,8 @@ DA --DiskUp------------> UA
 DA --BeginDrain--------> DI
 DI --DiskUp------------> UI
 UI --DiskDown----------> DI
-DI/UI --DrainCompleted-> REMOVED
-UI --DrainStopped------> UA
-DI --DrainStopped------> DA
+DI --DrainCompleted----> REMOVED
+UI --Offline稳定退出---> Online Workflow --OnlineSettled--> UA
 ```
 
 其中 `DA -> DI` 不是不可逆承诺。`DI` 期间收到 `DiskUp` 后先进入 `UI`：物理盘已经恢复，但在途疏散尚未收敛，因此继续禁止新分配。DiskDomain 请求 VdDomain 停止继续调度新的 BG，并等待所有在途 BG 返回稳定结果；之后才从 `UI` 进入 `UA`。
@@ -679,37 +689,24 @@ Reconcile(P^{mem},P^{real})
 普通开发者主要编写定义在领域 Service 上的自然 `async fn`：
 
 ```rust
-#[service(kind = Disk)]
-impl DiskService {
-    #[query]
-    async fn get_disk(&self, req: GetDisk) -> Result<DiskView> {
-        self.metadata.read(|state| state.view(&req.disk))
-    }
-
-    #[workflow(
-        key = |req| req.disk.clone(),
-        conflict = disk_event_policy
-    )]
-    async fn offline(
+impl MemberDiskWorker {
+    async fn offline_workflow(
         &self,
-        req: OfflineDisk,
-        ctx: WorkflowContext,
-    ) -> Result<()> {
-        let plan = self.metadata.update(|state| {
-            state.begin_offline(&req.disk)
-        })?;
-
-        self.router
-            .call(&ctx, VdRequest::EvacuateMemberDisk(plan))
+        disk: MemberDiskId,
+        context: WorkflowContext,
+    ) -> RuntimeResult<MemberDiskSnapshot> {
+        self.pool_nodes
+            .publish_member_disk(&context, disk.clone(), Down)
             .await?;
 
-        self.router
-            .call(&ctx, NodeRequest::PublishDiskState(req.disk.clone()))
+        self.commit_progress(&context, &disk, DrainStarted).await?;
+
+        self.virtual_disks
+            .evacuate_member_disk(&context, disk.clone())
             .await?;
 
-        self.metadata.update(|state| {
-            state.finish_offline(&req.disk)
-        })
+        self.commit_progress(&context, &disk, DrainCompleted).await?;
+        self.snapshot(&disk)
     }
 }
 ```
@@ -718,11 +715,11 @@ impl DiskService {
 
 1. Workflow 是 `self` 上的业务方法，不是注册表中的转发函数；
 2. Query 可以直接执行，不被强制包装成可观测 Task；
-3. 跨服务通信由 Router 提供类型化 `call/submit/query`，不是 `task.call(...)`；
+3. 跨服务通信由目标领域的命名 facade 提供，不是 `task.call(...)`，也不是依据请求类型自动选路的 Router；
 4. 业务代码不构造 `TaskSpec`、`BoxFuture` 或 `move |task| async move`；
 5. Operation Context 作为附加上下文传播因果、取消和 Trace，不成为执行主体；
-6. 元数据访问必须保证不会把可变借用或锁守卫带过 `.await`，具体机制留给运行时原型验证。
-7. 协作取消只在下游效果已稳定、准备提交下一次领域迁移时通过 `stable_boundary()` 检查，不在每个步骤散落取消轮询。
+6. 元数据访问使用不暴露 Guard 的同步闭包，不能把可变借用或锁守卫带过 `.await`；
+7. 普通 Workflow 不显式检查取消。Service Client 在下游稳定返回后统一传播取消，领域执行器只在自己的最小原子工作单元边界解释取消。
 
 ### 14.2 策略声明与机制执行
 
@@ -756,19 +753,20 @@ Service Runtime
 └── Observation：Idle/Busy、队列、阻塞、进度、Trace
 ```
 
-“一个 Service 一个根 spawn task，由根任务 poll 多个 Workflow Future”是优先验证的实现候选，而不是领域模型定理。无论具体实现如何，都必须满足结构化并发：Service 停止接收请求后，先传播取消并等待子调用稳定收敛；超时才强制终止根执行单元，且任何遗留不一致由 Reconcile 处理。
+当前原型已经采用“一个 Service 一个根 spawn task，由根任务 poll 多个 Workflow Future”。这仍是运行时实现而不是领域模型定理。它必须满足结构化并发：Service 停止接收请求后，先传播取消并等待子调用稳定收敛；超时才强制终止根执行单元，且任何遗留不一致由 Reconcile 处理。
 
-### 14.4 Router 契约
+### 14.4 Service Client 与领域 facade 契约
 
-Router 负责：
+每个 `ServiceClient<R>` 指向创建它的那一个 Service 实例，负责：
 
-- 根据 ServiceKind 或类型化 Client 定位目标服务；
 - 封装业务通道和 oneshot；
 - 继承 OperationId、Trace、取消作用域和因果边；
 - 在调用方取消时通知下游，并等待下游返回稳定结果；
 - 为未来进程拆分保留相同的 `call/submit/query` 语义。
 
-Router 不负责判断业务冲突，也不拥有 Task。Task 只是 Runtime 对一次 Future 执行的内部记录。
+`ServiceRequest` 不携带 `ServiceId`，不存在“把任意请求交给全局 Router 自动选择目标”的隐式行为。领域模块用 `MemberDiskService`、`VirtualDiskService` 等 facade 提供命名方法，并把命令/响应枚举留在模块内部。
+
+Service Client 不负责判断业务冲突，也不拥有 Task。Task 只是 Runtime 对一次 Future 执行的内部记录。
 
 ### 14.5 框架隐藏与领域显式
 
@@ -837,7 +835,7 @@ Router 不负责判断业务冲突，也不拥有 Task。Task 只是 Runtime 对
 8. 哪些非稳态领域事实需要持久化，以及如何由 Reconcile 接管；
 9. Operation Context/CausalGraph 的观测记录、保留与查询模型；
 10. MemberDisk 可逆排空、局部提交点和下游稳定结果协议；
-11. Service Runtime、Router、Admission Registry 的最小可用原型；
+11. Service Runtime、显式 Service Client/facade、Admission Registry 的生产化；
 12. 首阶段串行运行时及安全并行演进；
 13. 使用状态空间探索或 TLA+ 验证关键安全不变量的可行性。
 

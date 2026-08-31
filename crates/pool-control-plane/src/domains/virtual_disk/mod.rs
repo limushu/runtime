@@ -1,4 +1,5 @@
-pub(crate) mod protocol;
+mod protocol;
 mod service;
 
-pub(crate) use service::VirtualDiskService;
+pub use protocol::{EvacuationResult, VirtualDiskStats};
+pub use service::VirtualDiskService;

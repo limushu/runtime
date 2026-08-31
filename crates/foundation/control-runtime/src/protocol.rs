@@ -63,14 +63,13 @@ sequence_id!(OperationId, NEXT_OPERATION_ID);
 sequence_id!(CallId, NEXT_CALL_ID);
 sequence_id!(TaskAttemptId, NEXT_TASK_ATTEMPT_ID);
 
-/// A typed request routed to exactly one service protocol.
+/// One typed request accepted by a service endpoint.
 ///
-/// Domain API crates implement this trait for their request enum. The trait
-/// deliberately says nothing about Tokio, channels, RPC, or service storage.
+/// A request deliberately carries no routing identity. Callers choose an
+/// explicit `ServiceClient`; domain facades normally hide the command enum
+/// altogether and expose named methods instead.
 pub trait ServiceRequest: Send + 'static {
     type Response: Clone + Send + Sync + 'static;
-
-    fn service_id() -> ServiceId;
 }
 
 #[cfg(test)]

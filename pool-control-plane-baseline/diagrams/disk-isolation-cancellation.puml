@@ -13,12 +13,10 @@ state "REMOVED" as Removed
 UA --> DA : DiskDown
 DA --> UA : DiskUp
 DA --> DI : BeginDrain
-DI --> UI : DiskUp\n请求停止后续排空
+DI --> UI : DiskMap = Up\nObjectSlot请求替换
 UI --> DI : DiskDown
-UI --> UA : 下游稳定收敛\nDrainStopped
-DI --> DA : 下游稳定收敛\nDrainStopped且仍DOWN
+UI --> UA : 旧Offline稳定退出\n新Online完成
 DI --> Removed : DrainCompleted
-UI --> Removed : DrainCompleted
 
 note right of DI
 DA -> DI 可逆
@@ -29,6 +27,7 @@ note bottom of UI
 已提交BG remap保持不变
 在途BG到安全点后返回
 未调度BG不再启动
+旧Future退出后才启动Online
 end note
 
 note bottom of Removed

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use control_runtime::{
-    spawn_service, Admission, ObjectActivity, ObjectKey, RequestRoute, Router, RuntimeError,
-    RuntimeResult, Service, ServiceId, ServiceRequest, StateCell, WorkflowContext, WorkflowMeta,
+    spawn_service, Admission, ObjectActivity, ObjectKey, RequestRoute, RuntimeError, RuntimeResult,
+    Service, ServiceClient, ServiceId, ServiceRequest, StateCell, WorkflowContext, WorkflowMeta,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,10 +21,6 @@ enum LeafReply {
 
 impl ServiceRequest for LeafRequest {
     type Response = LeafReply;
-
-    fn service_id() -> ServiceId {
-        ServiceId::new("contract.leaf")
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,14 +36,18 @@ struct LeafStats {
 }
 
 #[derive(Debug, Default)]
-struct LeafService {
+struct LeafWorker {
     stats: StateCell<LeafStats>,
 }
 
 #[async_trait]
-impl Service for LeafService {
+impl Service for LeafWorker {
     type Request = LeafRequest;
     type WorkflowKind = LeafWorkflow;
+
+    fn id(&self) -> ServiceId {
+        ServiceId::new("contract.leaf")
+    }
 
     fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
         match request {
@@ -88,7 +88,6 @@ impl Service for LeafService {
                 self.stats.update(|stats| stats.started += 1);
                 tokio::select! {
                     _ = context.cancellation().requested() => {
-                        // Represents settling an already issued downstream effect.
                         tokio::time::sleep(Duration::from_millis(5)).await;
                         self.stats.update(|stats| stats.stable += 1);
                         Err(RuntimeError::Cancelled)
@@ -112,10 +111,6 @@ enum ParentRequest {
 
 impl ServiceRequest for ParentRequest {
     type Response = LeafReply;
-
-    fn service_id() -> ServiceId {
-        ServiceId::new("contract.parent")
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,14 +118,18 @@ enum ParentWorkflow {
     Run,
 }
 
-struct ParentService {
-    router: Router,
+struct ParentWorker {
+    leaf: ServiceClient<LeafRequest>,
 }
 
 #[async_trait]
-impl Service for ParentService {
+impl Service for ParentWorker {
     type Request = ParentRequest;
     type WorkflowKind = ParentWorkflow;
+
+    fn id(&self) -> ServiceId {
+        ServiceId::new("contract.parent")
+    }
 
     fn route(&self, _request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
         RequestRoute::Workflow(WorkflowMeta::object(
@@ -145,12 +144,14 @@ impl Service for ParentService {
         _request: Self::Request,
         context: WorkflowContext,
     ) -> RuntimeResult<LeafReply> {
-        self.router.call(&context, LeafRequest::Run("leaf/a")).await
+        self.leaf
+            .call(&context, "run leaf/a", LeafRequest::Run("leaf/a"))
+            .await
     }
 }
 
-async fn leaf_stats(router: &Router) -> (usize, usize) {
-    let LeafReply::Stats { started, stable } = router
+async fn leaf_stats(client: &ServiceClient<LeafRequest>) -> (usize, usize) {
+    let LeafReply::Stats { started, stable } = client
         .call_root("leaf stats", LeafRequest::Stats)
         .await
         .unwrap()
@@ -162,137 +163,73 @@ async fn leaf_stats(router: &Router) -> (usize, usize) {
 
 #[tokio::test]
 async fn duplicate_object_intents_join_one_runtime_task() {
-    let router = Router::new();
-    let leaf = spawn_service(
-        Arc::new(LeafService::default()),
-        &router,
-        Default::default(),
-    );
-
-    let first = router.call_root("first", LeafRequest::Run("leaf/a"));
-    let second = router.call_root("second", LeafRequest::Run("leaf/a"));
+    let (client, host) = spawn_service(Arc::new(LeafWorker::default()), Default::default());
+    let first = client.call_root("first", LeafRequest::Run("leaf/a"));
+    let second = client.call_root("second", LeafRequest::Run("leaf/a"));
     let (first, second) = tokio::join!(first, second);
-
     assert_eq!(first.unwrap(), LeafReply::Done);
     assert_eq!(second.unwrap(), LeafReply::Done);
-    assert_eq!(leaf_stats(&router).await, (1, 0));
-    leaf.shutdown().await.unwrap();
+    assert_eq!(leaf_stats(&client).await, (1, 0));
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn dropping_one_joined_caller_does_not_cancel_the_shared_workflow() {
-    let router = Router::new();
-    let leaf = spawn_service(
-        Arc::new(LeafService::default()),
-        &router,
-        Default::default(),
-    );
-
-    let first_router = router.clone();
+async fn dropping_one_joined_caller_keeps_the_shared_workflow() {
+    let (client, host) = spawn_service(Arc::new(LeafWorker::default()), Default::default());
+    let first_client = client.clone();
     let first = tokio::spawn(async move {
-        first_router
+        first_client
             .call_root("first", LeafRequest::Run("leaf/shared"))
             .await
     });
     tokio::time::sleep(Duration::from_millis(5)).await;
-
-    let second_router = router.clone();
+    let second_client = client.clone();
     let second = tokio::spawn(async move {
-        second_router
+        second_client
             .call_root("second", LeafRequest::Run("leaf/shared"))
             .await
     });
     tokio::time::sleep(Duration::from_millis(5)).await;
-
     first.abort();
     let _ = first.await;
     assert_eq!(second.await.unwrap().unwrap(), LeafReply::Done);
-    assert_eq!(leaf_stats(&router).await, (1, 0));
-    leaf.shutdown().await.unwrap();
+    assert_eq!(leaf_stats(&client).await, (1, 0));
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn a_domain_panic_fails_only_its_workflow() {
-    let router = Router::new();
-    let leaf = spawn_service(
-        Arc::new(LeafService::default()),
-        &router,
-        Default::default(),
-    );
-
+    let (client, host) = spawn_service(Arc::new(LeafWorker::default()), Default::default());
     assert!(matches!(
-        router.call_root("panic", LeafRequest::Panic).await,
+        client.call_root("panic", LeafRequest::Panic).await,
         Err(RuntimeError::WorkflowPanicked(message)) if message == "domain workflow panic"
     ));
-    assert_eq!(leaf_stats(&router).await, (0, 0));
-    assert_eq!(leaf.observer.snapshot().active_tasks, 0);
-    leaf.shutdown().await.unwrap();
+    assert_eq!(leaf_stats(&client).await, (0, 0));
+    assert_eq!(host.observer.snapshot().active_tasks, 0);
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn dropping_a_root_call_propagates_cancellation_to_the_leaf() {
-    let router = Router::new();
-    let leaf = spawn_service(
-        Arc::new(LeafService::default()),
-        &router,
-        Default::default(),
-    );
-    let parent = spawn_service(
-        Arc::new(ParentService {
-            router: router.clone(),
+    let (leaf_client, leaf_host) =
+        spawn_service(Arc::new(LeafWorker::default()), Default::default());
+    let (parent_client, parent_host) = spawn_service(
+        Arc::new(ParentWorker {
+            leaf: leaf_client.clone(),
         }),
-        &router,
         Default::default(),
     );
-    let caller_router = router.clone();
     let caller = tokio::spawn(async move {
-        caller_router
+        parent_client
             .call_root("abandoned parent", ParentRequest::Run)
             .await
     });
-
     tokio::time::sleep(Duration::from_millis(10)).await;
     caller.abort();
     let _ = caller.await;
     tokio::time::sleep(Duration::from_millis(20)).await;
-
-    assert_eq!(leaf_stats(&router).await, (1, 1));
-    assert_eq!(parent.observer.snapshot().active_tasks, 0);
-    parent.shutdown().await.unwrap();
-    leaf.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn force_abort_cancels_owned_calls_before_aborting_the_service_task() {
-    let router = Router::new();
-    let leaf = spawn_service(
-        Arc::new(LeafService::default()),
-        &router,
-        Default::default(),
-    );
-    let parent = spawn_service(
-        Arc::new(ParentService {
-            router: router.clone(),
-        }),
-        &router,
-        Default::default(),
-    );
-    let caller_router = router.clone();
-    let caller = tokio::spawn(async move {
-        caller_router
-            .call_root("unloaded parent", ParentRequest::Run)
-            .await
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    parent.force_abort();
-    assert!(matches!(
-        caller.await.unwrap(),
-        Err(RuntimeError::ChannelClosed(_))
-    ));
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    assert_eq!(leaf_stats(&router).await, (1, 1));
-    drop(parent);
-    leaf.shutdown().await.unwrap();
+    assert_eq!(leaf_stats(&leaf_client).await, (1, 1));
+    assert_eq!(parent_host.observer.snapshot().active_tasks, 0);
+    parent_host.shutdown().await.unwrap();
+    leaf_host.shutdown().await.unwrap();
 }

@@ -1,5 +1,7 @@
+mod actor;
 mod machine;
-pub(crate) mod protocol;
+pub mod model;
+mod protocol;
 mod service;
 
-pub(crate) use service::MemberDiskService;
+pub use service::MemberDiskService;

@@ -33,7 +33,7 @@ impl Service for ExampleService {
 }
 ```
 
-`route` 决定请求是否进入对象准入；`admit` 声明业务冲突关系；`handle` 执行自然工作流。Task、Future 集合、channel、oneshot 和取消传播全部由 Runtime 管理。
+`route` 决定请求是否进入对象准入；`admit` 声明业务冲突关系；`handle` 执行自然工作流。Task、Future 集合、channel、oneshot 和取消传播全部由 Runtime 管理。`ServiceRequest` 不包含目标服务，调用者必须持有目标实例的显式 `ServiceClient<R>`；领域代码通常再用一个只有命名方法的 facade 隐藏命令枚举。
 
 ## 运行模型
 
@@ -43,7 +43,8 @@ impl Service for ExampleService {
 - `ObjectSlot` 原子维护同一对象的 active、replacement 和 queue；
 - 相同意图的多个调用者只是共享 Workflow 的订阅者；
 - 最后一个订阅者离开时，根据 `OrphanPolicy` 取消或继续；
-- `WorkflowContext::stable_boundary()` 只在下游效果已经稳定、准备提交下一次本地迁移时调用；
+- `ServiceClient::call` 等待下游进入稳定结果，并在返回父 Workflow 前统一传播取消；普通 Workflow 不逐步轮询取消；
+- 领域执行器只在真正的原子工作单元边界解释取消，例如完成当前 BG 后停止继续调度；
 - `StateCell` 不暴露锁 Guard，业务无法跨 `.await` 持锁；
 - 业务 panic 只失败当前请求，不会杀死整个 Service 根 task；
 - 活动 Workflow、Untracked Future 和内部等待队列都有显式上限。
@@ -53,8 +54,8 @@ impl Service for ExampleService {
 ```text
 src
 ├── protocol.rs       # ServiceId、ObjectKey、ServiceRequest 等通用原语
-├── context.rs        # 因果、结构化取消和稳定边界
-├── router.rs         # 类型化进程内调用
+├── context.rs        # 因果与结构化取消
+├── client.rs         # 指向一个明确 Service 实例的类型化调用
 ├── observation.rs    # Operation、Call、Task、Service 观测
 ├── state_cell.rs     # 不暴露锁 Guard 的私有状态容器
 └── service
@@ -63,3 +64,5 @@ src
     ├── service_loop.rs # 根 task、业务通道和统一 poll
     └── object_slot.rs  # 虚拟对象意图槽位
 ```
+
+`ObjectSlot` 只拥有执行意图的 `Idle/Pending/Running/Cancelling`、订阅者、替代请求和排队，不拥有领域状态。逻辑领域 Actor（例如 MemberDisk Actor）仍由业务模块实现，二者不可合并为第二套业务状态机。

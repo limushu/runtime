@@ -218,4 +218,6 @@ Monitor 切主、Task 失败或执行重试不能改变 Operation Context 的因
 - 所有订阅者都离开时，Runtime 按请求声明的 orphan policy 决定协作取消或继续收敛；
 - 新意图替换旧意图时，由 ObjectSlot 请求旧 Workflow 取消，并等待其稳定退出后再启动替代 Workflow。
 
-Workflow 在已发出的下游效果返回后、提交下一次本地状态迁移前调用 `stable_boundary()`。该检查只出现在业务稳定边界，不要求开发者在每一行轮询取消状态。
+普通 Workflow 不显式调用 `stable_boundary()`，也不在每一步轮询取消。显式 Service Client 必须等待下游返回稳定结果，并在控制权回到父 Workflow 前统一传播取消；领域执行器只在自身不可再细分的原子工作单元边界解释取消，例如完成当前 BG 后停止补充新 BG。
+
+若一个所属领域的决策已经成功写入 SDB，则内存必须接纳该结果，不能因同时到达的外部观测而拒绝提交并形成 `SDB != memory`。外部观测可以请求替换当前意图，但替代 Workflow 只能在旧意图稳定退出后继续前向收敛。

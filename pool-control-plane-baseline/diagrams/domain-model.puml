@@ -26,12 +26,20 @@ class Tier {
 }
 
 class MemberDisk {
-  uuid
+  member_disk_id
+  physical_disk_id
+  pool_id
+  tier_id
+  media_class
+  sharing: Exclusive | SharedCache
   capacity
-  state: UA | DA | DI | UI | REMOVED
-  /physical_projection
-  /allocation_projection
-  topology_path
+  failure_domain_path
+  allocation_state
+  membership_state
+  allocation_bitmap
+  revision
+  /physical_state: DiskMap observation
+  /operational_state: UA | DA | DI | UI | REMOVED
 }
 
 class Partition {
@@ -93,5 +101,12 @@ end note
 note right of NodeRecord
 connected只表示Monitor与user_dp网络畅通
 不能证明Pool已加载或可服务
+end note
+
+note right of MemberDisk
+核心Record属于MemberDisk领域
+物理状态来自DiskMap
+运行状态只是派生投影
+逻辑Actor不等于Tokio task
 end note
 @enduml

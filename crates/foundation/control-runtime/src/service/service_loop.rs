@@ -2,12 +2,12 @@ use super::container::{
     ControlHandle, ControlRequest, ManagedService, Reply, ResponseOf, RuntimeConfig,
 };
 use super::object_slot::{Intent, ObjectSlot, ReplaceOutcome, Subscriber, SubscriberGroup};
+use crate::client::BusinessEnvelope;
 use crate::context::CancellationScope;
 use crate::observation::{ObservationHub, TaskOutcome};
-use crate::router::{BusinessEnvelope, BusinessHandle};
 use crate::{
     Activity, Admission, CancelCause, ObjectActivity, ObjectKey, ObservationEvent, OrphanPolicy,
-    RequestRoute, Router, RuntimeError, RuntimeResult, Service, ServiceId, ServiceLifecycle,
+    RequestRoute, RuntimeError, RuntimeResult, Service, ServiceClient, ServiceId, ServiceLifecycle,
     ServiceSnapshot, TaskAttemptId, WorkflowContext,
 };
 use futures::future::BoxFuture;
@@ -57,23 +57,22 @@ pub(super) struct ServiceLoop<S: Service> {
 impl<S: Service> ServiceLoop<S> {
     pub(super) fn spawn(
         service: Arc<S>,
-        router: &Router,
         mut config: RuntimeConfig,
-    ) -> ManagedService {
+    ) -> (ServiceClient<S::Request>, ManagedService) {
         config.max_active_workflows = config.max_active_workflows.max(1);
         config.max_untracked_requests = config.max_untracked_requests.max(1);
         config.max_pending_requests = config.max_pending_requests.max(1);
         config.max_pending_per_object = config.max_pending_per_object.max(1);
 
         let service_id = service.id();
-        let (business_tx, business_rx) = mpsc::channel(config.business_capacity.max(1));
         let (control_tx, control_rx) = mpsc::channel(config.control_capacity.max(1));
         let (observation, observer) = ObservationHub::new(service_id.clone());
-        let cancellation = CancellationScope::root();
-        router.register(
-            BusinessHandle::new(service_id.clone(), business_tx),
+        let (client, business_rx) = ServiceClient::channel(
+            service_id.clone(),
+            config.business_capacity,
             observation.clone(),
         );
+        let cancellation = CancellationScope::root();
         let shutdown_timeout = config.shutdown_timeout;
         let runtime = Self {
             service,
@@ -95,13 +94,16 @@ impl<S: Service> ServiceLoop<S> {
         };
         let join = tokio::spawn(runtime.run());
 
-        ManagedService::new(
-            service_id.clone(),
-            ControlHandle::new(service_id, control_tx),
-            observer,
-            shutdown_timeout,
-            cancellation,
-            join,
+        (
+            client,
+            ManagedService::new(
+                service_id.clone(),
+                ControlHandle::new(service_id, control_tx),
+                observer,
+                shutdown_timeout,
+                cancellation,
+                join,
+            ),
         )
     }
 

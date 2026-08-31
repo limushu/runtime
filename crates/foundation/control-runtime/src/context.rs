@@ -214,19 +214,6 @@ impl WorkflowContext {
         &self.cancellation
     }
 
-    /// Validate a business-defined stable boundary.
-    ///
-    /// Workflows call this after an awaited side effect has settled and before
-    /// committing their next local transition. Cancellation stays out of the
-    /// happy-path steps while stale workflows are prevented from writing.
-    pub fn stable_boundary(&self) -> crate::RuntimeResult<()> {
-        if self.cancellation.is_requested() {
-            Err(crate::RuntimeError::Cancelled)
-        } else {
-            Ok(())
-        }
-    }
-
     pub fn milestone(&self, label: impl Into<Arc<str>>) {
         if let Some(observation) = &self.observation {
             observation.publish(ObservationEvent::Milestone {

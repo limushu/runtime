@@ -12,12 +12,12 @@ package "输入事实与命令" {
   component EffectResult
 }
 
-package "PoolRuntime" {
+package "Pool" {
   component PoolIngress
 
   package "领域状态与策略" {
     component PoolCore
-    component "MemberDisk FSM" as DiskFSM
+    component "MemberDisk Entity\n+ Logical Actor + FSM" as DiskFSM
     component "PoolNode FSM" as NodeFSM
     component "VD / BG FSM" as BgFSM
   }
@@ -29,9 +29,9 @@ package "PoolRuntime" {
 }
 
 package "执行机制" {
-  component "Admission Registry" as Admission
+  component "ObjectSlot / Admission" as Admission
   component "Service Runtime" as Runtime
-  component "Router\ncall / submit / query" as Router
+  component "Explicit Facade + ServiceClient" as Client
   component "Task / Future / Cancel / Trace" as Task
 }
 
@@ -58,10 +58,10 @@ NodeFSM --> Policy
 BgFSM --> Policy
 Policy --> Admission : Start / Join / Merge / Queue / Cancel / Reject
 Admission --> Workflow : 已准入请求
-Workflow --> Router : 跨领域能力
+Workflow --> Client : 命名跨领域能力
 Workflow --> Runtime : 业务Future
 Runtime --> Task
-Router --> Runtime : 目标服务请求
+Client --> Runtime : 明确目标服务请求
 Task --> SDB
 Task --> user_dp
 Task --> VNODE

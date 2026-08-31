@@ -1,50 +1,37 @@
-use crate::kernel::MemberDiskId;
-use control_runtime::{ServiceId, ServiceRequest};
-
-pub const SERVICE_ID: &str = "pool.member-disk";
-
-/// Compound MemberDisk state: physical IO availability × allocation service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberDiskState {
-    /// Up + Active: serves IO and accepts new BLK allocation.
-    Ua,
-    /// Down + Active: unavailable for IO; allocation shutdown has not settled.
-    Da,
-    /// Down + Inactive: unavailable and no longer accepts allocation.
-    Di,
-    /// Up + Inactive: media recovered while evacuation was being reversed.
-    Ui,
-    /// No longer a member of the Pool.
-    Removed,
-}
-
-impl MemberDiskState {
-    pub const fn io_available(self) -> bool {
-        matches!(self, Self::Ua | Self::Ui)
-    }
-
-    pub const fn allocation_active(self) -> bool {
-        matches!(self, Self::Ua | Self::Da)
-    }
-}
+use super::model::{MemberDiskPatch, MemberDiskSnapshot, MemberDiskSpec, PhysicalState};
+use crate::kernel::{BlkId, MemberDiskId};
+use control_runtime::ServiceRequest;
 
 #[derive(Debug, Clone)]
-pub enum MemberDiskRequest {
-    Offline(MemberDiskId),
-    Online(MemberDiskId),
+pub(crate) enum MemberDiskCommand {
+    Create(MemberDiskSpec),
+    Update {
+        disk: MemberDiskId,
+        patch: MemberDiskPatch,
+    },
+    Delete(MemberDiskId),
+    ApplyPhysical {
+        disk: MemberDiskId,
+        state: PhysicalState,
+    },
+    Allocate(MemberDiskId),
+    Release {
+        disk: MemberDiskId,
+        blk: BlkId,
+    },
     Get(MemberDiskId),
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskReply {
-    pub disk: MemberDiskId,
-    pub state: MemberDiskState,
+pub(crate) enum MemberDiskResponse {
+    Snapshot(MemberDiskSnapshot),
+    Snapshots(Vec<MemberDiskSnapshot>),
+    Allocated(BlkId),
+    Deleted,
+    Released,
 }
 
-impl ServiceRequest for MemberDiskRequest {
-    type Response = MemberDiskReply;
-
-    fn service_id() -> ServiceId {
-        ServiceId::new(SERVICE_ID)
-    }
+impl ServiceRequest for MemberDiskCommand {
+    type Response = MemberDiskResponse;
 }
