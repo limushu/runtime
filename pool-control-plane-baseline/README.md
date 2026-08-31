@@ -63,9 +63,9 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **已确认：** Monitor 全局层的 `PoolManager` 负责 Pool 生命周期和路由；每个 Pool 是独立业务对象、内存隔离与管控边界，通用 Runtime 只是各领域 Service 的内部执行机制。
 - **已确认：** 核心业务状态只属于领域对象；Operation Context 不建立第二套 `phase/status` 业务状态机。
 - **已确认：** Workflow 优先写成所属 Service 上的自然 `async fn`；跨服务通信通过明确目标实例的类型化 Service facade；请求不携带隐藏路由身份；Task/Future/取消传播由框架托管。
-- **已确认：** 冲突语义由领域声明，准入、在途索引、合并等待和结构化取消由框架统一执行。
-- **已确认：** 每个 Service 使用一个根执行单元，通过 `FuturesUnordered` 统一 poll 多个 Workflow Future；ObjectSlot 只是虚拟意图槽位，不为每个对象创建 Tokio task。
-- **已确认：** 每个 MemberDisk 是一个拥有完整实体和状态图决策的逻辑 Actor；Actor 与 ObjectSlot 分工，且不意味着每盘建立 task/mailbox。
+- **已确认：** 领域状态机声明对象下一状态与目标 Workflow；框架统一执行对象串行化、同类合并、异类协作替换和结构化取消。
+- **已确认：** 每个 Service 使用一个根执行单元，通过 `FuturesUnordered` 统一 poll 多个 Workflow Future；框架内部的 `ActorCell` 不为每个对象创建 Tokio task。
+- **已确认：** 每个 MemberDisk 是完整领域对象而不是 Actor API；开发者只写对象、纯状态机和自然工作流，对象串行化与工作流替换隐藏在 Runtime 中。
 - **已确认：** MemberDisk 核心元数据、DiskMap 物理观测、派生运行状态和在途意图是四种不同信息，不得用单一状态枚举替代完整实体。
 - **已确认：** Service 私有元数据通过不暴露 Guard 的 `StateCell` 访问，普通开发者无法把锁跨越 `.await`。
 - **已确认：** 生产 Workspace 只保留业务无关 `control-runtime` 与业务 `pool-control-plane` 两个核心 crate；每个 Pool Domain 是业务 crate 内的 Rust module。

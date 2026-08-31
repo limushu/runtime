@@ -15,7 +15,10 @@ rectangle "MemberDisk" as MD {
   database "MemberDiskRecord (SDB)\nidentity/tier/capacity/topology\nallocation/membership/bitmap/revision" as Record
   component "Physical Observation\nDiskMap: UP / DOWN" as PhysicalState
   component "Operational Projection\nUA / DA / DI / UI / REMOVED" as DiskState
-  component "ObjectActivity\nObjectSlot: intent only" as ObjectActivity
+}
+
+rectangle "Service Runtime (private)" as Runtime {
+  component "ActorCell Activity\nintent only" as ActorActivity
 }
 
 rectangle "PoolNode" as PN {
@@ -33,7 +36,7 @@ Entry --> Health : BG -> VD -> Pool派生
 MD --> MediaState : 物理状态输入
 Record --> DiskState : allocation + membership
 PhysicalState --> DiskState : observation
-ObjectActivity ..> DiskState : 只参与准入，不拥有状态
+ActorActivity ..> DiskState : 不参与状态机，仅管理执行
 Connectivity --> ServiceState : 必要但不充分
 
 note bottom of Pool
@@ -45,7 +48,7 @@ Connected(n) 不代表 PoolServing(p,n)
 end note
 
 note bottom of MD
-Record / Observation / Projection / Activity 四层分离
-逻辑Actor拥有前三层，ObjectSlot拥有Activity
+Record / Observation / Projection 与执行活动分离
+MemberDisk拥有前三层；Runtime私有ActorCell拥有Activity
 end note
 @enduml

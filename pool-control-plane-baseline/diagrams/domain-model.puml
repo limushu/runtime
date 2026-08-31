@@ -107,6 +107,6 @@ note right of MemberDisk
 核心Record属于MemberDisk领域
 物理状态来自DiskMap
 运行状态只是派生投影
-逻辑Actor不等于Tokio task
+Actor执行机制不进入领域对象
 end note
 @enduml

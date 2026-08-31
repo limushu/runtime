@@ -46,18 +46,25 @@ def verify_source_shape(violations: list[str]) -> None:
     runtime = ROOT / "crates" / "foundation" / "control-runtime" / "src"
     pool = ROOT / "crates" / "pool-control-plane" / "src"
 
-    forbidden_paths = [runtime / "router.rs", pool / "pool_runtime.rs"]
+    forbidden_paths = [
+        runtime / "router.rs",
+        runtime / "service" / "object_slot.rs",
+        pool / "pool_runtime.rs",
+        pool / "domains" / "member_disk" / "actor.rs",
+    ]
     for path in forbidden_paths:
         if path.exists():
             violations.append(f"obsolete architecture file must not exist: {path.relative_to(ROOT)}")
 
     required_paths = [
         runtime / "client.rs",
+        runtime / "state_machine.rs",
+        runtime / "service" / "actor_cell.rs",
         pool / "pool_manager.rs",
         pool / "pool" / "instance.rs",
         pool / "pool" / "model.rs",
         pool / "domains" / "member_disk" / "model.rs",
-        pool / "domains" / "member_disk" / "actor.rs",
+        pool / "domains" / "member_disk" / "machine.rs",
     ]
     for path in required_paths:
         if not path.is_file():
@@ -69,8 +76,13 @@ def verify_source_shape(violations: list[str]) -> None:
         violations.append("ServiceRequest must not carry hidden service routing identity")
 
     service_loop = (runtime / "service" / "service_loop.rs").read_text(encoding="utf-8")
-    if "HashMap<ObjectKey, ObjectSlot" not in service_loop:
-        violations.append("ServiceLoop must use ObjectSlot as its managed-intent index")
+    if "HashMap<ObjectKey, ActorCell" not in service_loop:
+        violations.append("ServiceLoop must hide per-object intent state in ActorCell")
+
+    contract = (runtime / "service" / "contract.rs").read_text(encoding="utf-8")
+    for leaked_type in ("ObjectActivity", "Admission", "RequestRoute"):
+        if leaked_type in contract:
+            violations.append(f"runtime contract leaks obsolete {leaked_type} API")
 
     foundation_terms = ("MemberDisk", "VirtualDisk", "PoolNode", "BlkId", "PhysicalDiskId")
     for source in runtime.rglob("*.rs"):

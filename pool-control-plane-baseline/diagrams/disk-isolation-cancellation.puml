@@ -13,7 +13,7 @@ state "REMOVED" as Removed
 UA --> DA : DiskDown
 DA --> UA : DiskUp
 DA --> DI : BeginDrain
-DI --> UI : DiskMap = Up\nObjectSlot请求替换
+DI --> UI : DiskMap = Up\n状态机ensure Online
 UI --> DI : DiskDown
 UI --> UA : 旧Offline稳定退出\n新Online完成
 DI --> Removed : DrainCompleted
@@ -28,6 +28,7 @@ note bottom of UI
 在途BG到安全点后返回
 未调度BG不再启动
 旧Future退出后才启动Online
+替换由Runtime ActorCell完成
 end note
 
 note bottom of Removed

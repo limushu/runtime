@@ -1,5 +1,5 @@
 use super::model::{MemberDiskState, PhysicalState};
-use control_runtime::{RuntimeError, RuntimeResult};
+use control_runtime::{RuntimeError, RuntimeResult, Transition, TransitionEffect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberDiskWorkflowKind {
@@ -20,12 +20,7 @@ pub enum MemberDiskInput {
     OnlineSettled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskEffect {
-    RunWorkflow(MemberDiskWorkflowKind),
-    AlreadySatisfied,
-    Reject(&'static str),
-}
+pub type MemberDiskEffect = TransitionEffect<MemberDiskWorkflowKind>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDiskTransition {
@@ -36,22 +31,18 @@ pub struct MemberDiskTransition {
 }
 
 impl MemberDiskTransition {
-    fn change(
+    fn from_decision(
         from: MemberDiskState,
         input: MemberDiskInput,
-        to: MemberDiskState,
-        effect: MemberDiskEffect,
+        decision: Transition<MemberDiskState, MemberDiskWorkflowKind>,
     ) -> Self {
+        let (to, effect) = decision.into_parts();
         Self {
             from,
             input,
             to,
             effect,
         }
-    }
-
-    fn same(state: MemberDiskState, input: MemberDiskInput, effect: MemberDiskEffect) -> Self {
-        Self::change(state, input, state, effect)
     }
 }
 
@@ -64,56 +55,30 @@ impl MemberDiskMachine {
         state: MemberDiskState,
         input: MemberDiskInput,
     ) -> RuntimeResult<MemberDiskTransition> {
-        use MemberDiskEffect::{AlreadySatisfied, Reject, RunWorkflow};
         use MemberDiskInput::{DrainCompleted, DrainStarted, OnlineSettled, Physical};
         use MemberDiskState::{Da, Di, Removed, Ua, Ui};
         use MemberDiskWorkflowKind::{Offline, Online};
         use PhysicalState::{Down, Up};
 
-        let transition = match (state, input) {
-            (Ua, Physical(Down)) => {
-                MemberDiskTransition::change(Ua, Physical(Down), Da, RunWorkflow(Offline))
-            }
-            (Da, Physical(Down)) => {
-                MemberDiskTransition::same(Da, Physical(Down), RunWorkflow(Offline))
-            }
-            (Di, Physical(Down)) => {
-                MemberDiskTransition::same(Di, Physical(Down), RunWorkflow(Offline))
-            }
-            (Ui, Physical(Down)) => {
-                MemberDiskTransition::change(Ui, Physical(Down), Di, RunWorkflow(Offline))
-            }
-            (Removed, Physical(Down)) => {
-                MemberDiskTransition::same(Removed, Physical(Down), AlreadySatisfied)
-            }
+        let decision = match (state, input) {
+            (Ua, Physical(Down)) => Transition::to(Da).ensure(Offline),
+            (Da, Physical(Down)) => Transition::to(Da).ensure(Offline),
+            (Di, Physical(Down)) => Transition::to(Di).ensure(Offline),
+            (Ui, Physical(Down)) => Transition::to(Di).ensure(Offline),
+            (Removed, Physical(Down)) => Transition::to(Removed),
 
-            (Ua, Physical(Up)) => MemberDiskTransition::same(Ua, Physical(Up), AlreadySatisfied),
-            (Da, Physical(Up)) => {
-                MemberDiskTransition::change(Da, Physical(Up), Ua, RunWorkflow(Online))
-            }
-            (Di, Physical(Up)) => {
-                MemberDiskTransition::change(Di, Physical(Up), Ui, RunWorkflow(Online))
-            }
-            (Ui, Physical(Up)) => MemberDiskTransition::same(Ui, Physical(Up), RunWorkflow(Online)),
-            (Removed, Physical(Up)) => MemberDiskTransition::same(
-                Removed,
-                Physical(Up),
-                Reject("removed member disk requires an explicit rejoin operation"),
-            ),
+            (Ua, Physical(Up)) => Transition::to(Ua),
+            (Da, Physical(Up)) => Transition::to(Ua).ensure(Online),
+            (Di, Physical(Up)) => Transition::to(Ui).ensure(Online),
+            (Ui, Physical(Up)) => Transition::to(Ui).ensure(Online),
+            (Removed, Physical(Up)) => Transition::to(Removed)
+                .reject("removed member disk requires an explicit rejoin operation"),
 
-            (Da, DrainStarted) => {
-                MemberDiskTransition::change(Da, DrainStarted, Di, RunWorkflow(Offline))
-            }
-            (Di, DrainStarted) => {
-                MemberDiskTransition::same(Di, DrainStarted, RunWorkflow(Offline))
-            }
-            (Di, DrainCompleted) => {
-                MemberDiskTransition::change(Di, DrainCompleted, Removed, AlreadySatisfied)
-            }
-            (Ui, OnlineSettled) => {
-                MemberDiskTransition::change(Ui, OnlineSettled, Ua, AlreadySatisfied)
-            }
-            (Ua, OnlineSettled) => MemberDiskTransition::same(Ua, OnlineSettled, AlreadySatisfied),
+            (Da, DrainStarted) => Transition::to(Di).ensure(Offline),
+            (Di, DrainStarted) => Transition::to(Di).ensure(Offline),
+            (Di, DrainCompleted) => Transition::to(Removed),
+            (Ui, OnlineSettled) => Transition::to(Ua),
+            (Ua, OnlineSettled) => Transition::to(Ua),
 
             _ => {
                 return Err(RuntimeError::InvalidState(format!(
@@ -121,7 +86,7 @@ impl MemberDiskMachine {
                 )))
             }
         };
-        Ok(transition)
+        Ok(MemberDiskTransition::from_decision(state, input, decision))
     }
 }
 
@@ -139,7 +104,7 @@ mod tests {
         assert_eq!(transition.to, MemberDiskState::Da);
         assert_eq!(
             transition.effect,
-            MemberDiskEffect::RunWorkflow(MemberDiskWorkflowKind::Offline)
+            MemberDiskEffect::Ensure(MemberDiskWorkflowKind::Offline)
         );
     }
 

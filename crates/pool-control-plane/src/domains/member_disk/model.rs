@@ -1,3 +1,4 @@
+use super::machine::{MemberDiskInput, MemberDiskMachine, MemberDiskTransition};
 use crate::kernel::{
     BlkId, ByteCount, FailureDomainId, MemberDiskId, PhysicalDiskId, PoolId, TierId,
 };
@@ -306,4 +307,225 @@ pub struct MemberDiskSnapshot {
     pub total_blocks: u64,
     pub allocated_blocks: u64,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedMemberDiskMutation {
+    expected_revision: u64,
+    record: MemberDiskRecord,
+    physical: PhysicalState,
+    transition: MemberDiskTransition,
+    persist_record: bool,
+}
+
+impl PlannedMemberDiskMutation {
+    pub(crate) fn record(&self) -> &MemberDiskRecord {
+        &self.record
+    }
+
+    pub(crate) fn requires_persistence(&self) -> bool {
+        self.persist_record
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedRecordUpdate {
+    expected_revision: u64,
+    record: MemberDiskRecord,
+}
+
+impl PlannedRecordUpdate {
+    pub(crate) fn record(&self) -> &MemberDiskRecord {
+        &self.record
+    }
+}
+
+/// The complete in-memory MemberDisk object used by its state machine.
+/// It is business state, not an actor runtime, task or mailbox.
+#[derive(Debug, Clone)]
+pub(crate) struct MemberDisk {
+    record: MemberDiskRecord,
+    physical: PhysicalState,
+}
+
+impl MemberDisk {
+    pub(crate) fn restore(record: MemberDiskRecord) -> Self {
+        Self {
+            record,
+            physical: PhysicalState::Down,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> MemberDiskSnapshot {
+        let block_size = BlkSize::for_capacity(self.record.spec().capacity);
+        MemberDiskSnapshot {
+            spec: self.record.spec().clone(),
+            physical_state: self.physical,
+            allocation_state: self.record.allocation_state(),
+            membership_state: self.record.membership_state(),
+            operational_state: self.state(),
+            block_size,
+            total_blocks: self.record.allocation().total_blocks(),
+            allocated_blocks: self.record.allocation().allocated_blocks(),
+            revision: self.record.revision(),
+        }
+    }
+
+    pub(crate) fn state(&self) -> MemberDiskState {
+        MemberDiskState::project(
+            self.physical,
+            self.record.allocation_state(),
+            self.record.membership_state(),
+        )
+    }
+
+    pub(crate) fn apply_physical(
+        &mut self,
+        physical: PhysicalState,
+    ) -> RuntimeResult<MemberDiskTransition> {
+        let mutation = self.plan(MemberDiskInput::Physical(physical))?;
+        self.commit(mutation)
+    }
+
+    pub(crate) fn plan_patch(&self, patch: MemberDiskPatch) -> PlannedRecordUpdate {
+        let mut record = self.record.clone();
+        record.apply_patch(patch);
+        PlannedRecordUpdate {
+            expected_revision: self.record.revision(),
+            record,
+        }
+    }
+
+    pub(crate) fn plan_allocate(&self) -> RuntimeResult<(PlannedRecordUpdate, BlkId)> {
+        if !matches!(self.record.allocation_state(), AllocationState::Active)
+            || !matches!(self.physical, PhysicalState::Up)
+            || !matches!(self.record.membership_state(), MembershipState::Member)
+        {
+            return Err(RuntimeError::Rejected(
+                "member disk is not currently allocatable".into(),
+            ));
+        }
+        let mut record = self.record.clone();
+        let blk = record.allocate_one()?;
+        Ok((
+            PlannedRecordUpdate {
+                expected_revision: self.record.revision(),
+                record,
+            },
+            blk,
+        ))
+    }
+
+    pub(crate) fn plan_release(&self, blk: &BlkId) -> RuntimeResult<PlannedRecordUpdate> {
+        let mut record = self.record.clone();
+        record.release(blk)?;
+        Ok(PlannedRecordUpdate {
+            expected_revision: self.record.revision(),
+            record,
+        })
+    }
+
+    pub(crate) fn commit_record(&mut self, update: PlannedRecordUpdate) -> RuntimeResult<()> {
+        if self.record.revision() != update.expected_revision {
+            return Err(RuntimeError::Cancelled);
+        }
+        self.record = update.record;
+        Ok(())
+    }
+
+    pub(crate) fn can_delete(&self) -> bool {
+        matches!(self.record.membership_state(), MembershipState::Removed)
+            && self.record.allocation().allocated_blocks() == 0
+    }
+
+    pub(crate) fn plan(&self, input: MemberDiskInput) -> RuntimeResult<PlannedMemberDiskMutation> {
+        let transition = MemberDiskMachine::transition(self.state(), input)?;
+        let mut record = self.record.clone();
+        let mut physical = self.physical;
+        let persist_record = match input {
+            MemberDiskInput::Physical(value) => {
+                physical = value;
+                false
+            }
+            MemberDiskInput::DrainStarted => {
+                record.set_allocation_state(AllocationState::Inactive);
+                true
+            }
+            MemberDiskInput::DrainCompleted => {
+                record.set_membership_state(MembershipState::Removed);
+                true
+            }
+            MemberDiskInput::OnlineSettled => {
+                record.set_allocation_state(AllocationState::Active);
+                true
+            }
+        };
+        let projected = MemberDiskState::project(
+            physical,
+            record.allocation_state(),
+            record.membership_state(),
+        );
+        if projected != transition.to {
+            return Err(RuntimeError::Internal(format!(
+                "statechart projected {:?}, entity mutation projected {projected:?}",
+                transition.to
+            )));
+        }
+        Ok(PlannedMemberDiskMutation {
+            expected_revision: self.record.revision(),
+            record,
+            physical,
+            transition,
+            persist_record,
+        })
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        mutation: PlannedMemberDiskMutation,
+    ) -> RuntimeResult<MemberDiskTransition> {
+        if self.record.revision() != mutation.expected_revision {
+            return Err(RuntimeError::Cancelled);
+        }
+        let from = self.state();
+        self.record = mutation.record;
+        if matches!(mutation.transition.input, MemberDiskInput::Physical(_)) {
+            self.physical = mutation.physical;
+        }
+        let mut transition = mutation.transition;
+        transition.from = from;
+        transition.to = self.state();
+        Ok(transition)
+    }
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+
+    fn disk() -> MemberDisk {
+        let spec = MemberDiskSpec::new(
+            MemberDiskId::new("md-1"),
+            PhysicalDiskId::new("pd-1"),
+            PoolId::new("pool-1"),
+            TierId::new("tier-1"),
+            MediaClass::new("ssd"),
+            ByteCount::new(1024 * 1024 * 1024),
+            Vec::new(),
+        );
+        MemberDisk::restore(MemberDiskRecord::new(spec))
+    }
+
+    #[test]
+    fn a_stable_record_commit_keeps_the_latest_physical_observation() {
+        let mut disk = disk();
+        disk.apply_physical(PhysicalState::Down).unwrap();
+        let drain_started = disk.plan(MemberDiskInput::DrainStarted).unwrap();
+        disk.apply_physical(PhysicalState::Up).unwrap();
+
+        let transition = disk.commit(drain_started).unwrap();
+        assert_eq!(transition.to, MemberDiskState::Ui);
+        assert_eq!(disk.snapshot().physical_state, PhysicalState::Up);
+        assert_eq!(disk.snapshot().allocation_state, AllocationState::Inactive);
+    }
 }

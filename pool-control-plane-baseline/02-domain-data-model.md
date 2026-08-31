@@ -61,13 +61,13 @@ struct MemberDiskRecord {          // SDB 决策，由 MemberDisk Domain 独占�
     revision: u64,
 }
 
-struct MemberDiskActor {           // Monitor 内存中的逻辑 Actor
+struct MemberDisk {                // Monitor 内存中的完整领域对象
     record: MemberDiskRecord,
     physical_state: Up | Down,     // DiskMap 当前观测，不写成 SDB 历史真相
 }
 ```
 
-`MemberDiskRecord` 才是核心对象元数据，不能用状态机枚举代替。`MemberDiskActor` 拥有完整 Record 和瞬时物理观测，并据此作出准入与状态迁移决策；它不等于一个 Tokio task。
+`MemberDiskRecord` 才是核心对象元数据，不能用状态机枚举代替。内存中的 `MemberDisk` 组合完整 Record 与瞬时物理观测，并把二者投影给纯状态机。Actor、mailbox 和在途工作流状态都不是业务对象的一部分。
 
 物理可访问性、空间分配能力和成员关系最终投影为：
 

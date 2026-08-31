@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use control_runtime::{
-    spawn_service, Admission, ObjectActivity, ObjectKey, RequestRoute, RuntimeError, RuntimeResult,
-    Service, ServiceClient, ServiceId, ServiceRequest, StateCell, WorkflowContext, WorkflowMeta,
+    spawn_service, ObjectKey, RequestPlan, RuntimeError, RuntimeResult, Service, ServiceClient,
+    ServiceId, ServiceRequest, StateCell, WorkflowContext, WorkflowMeta,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,32 +49,22 @@ impl Service for LeafWorker {
         ServiceId::new("contract.leaf")
     }
 
-    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
-        match request {
-            LeafRequest::Run(key) => RequestRoute::Workflow(WorkflowMeta::object(
+    fn plan(
+        &self,
+        request: &Self::Request,
+    ) -> RuntimeResult<RequestPlan<Self::WorkflowKind, LeafReply>> {
+        Ok(match request {
+            LeafRequest::Run(key) => RequestPlan::Ensure(WorkflowMeta::object(
                 ObjectKey::new(*key),
                 LeafWorkflow::Run,
                 format!("run {key}"),
             )),
-            LeafRequest::Panic => RequestRoute::Workflow(WorkflowMeta::object(
+            LeafRequest::Panic => RequestPlan::Ensure(WorkflowMeta::object(
                 ObjectKey::new("leaf/panic"),
                 LeafWorkflow::Panic,
                 "panic",
             )),
-            LeafRequest::Stats => RequestRoute::Untracked,
-        }
-    }
-
-    fn admit(
-        &self,
-        _context: &WorkflowContext,
-        _request: &Self::Request,
-        activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<Admission<LeafReply>> {
-        Ok(if activity.is_idle() {
-            Admission::Start
-        } else {
-            Admission::Join
+            LeafRequest::Stats => RequestPlan::Inline,
         })
     }
 
@@ -131,12 +121,15 @@ impl Service for ParentWorker {
         ServiceId::new("contract.parent")
     }
 
-    fn route(&self, _request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
-        RequestRoute::Workflow(WorkflowMeta::object(
+    fn plan(
+        &self,
+        _request: &Self::Request,
+    ) -> RuntimeResult<RequestPlan<Self::WorkflowKind, LeafReply>> {
+        Ok(RequestPlan::Ensure(WorkflowMeta::object(
             ObjectKey::new("parent/run"),
             ParentWorkflow::Run,
             "parent run",
-        ))
+        )))
     }
 
     async fn handle(

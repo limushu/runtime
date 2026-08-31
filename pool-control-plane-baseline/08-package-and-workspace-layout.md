@@ -47,12 +47,13 @@ kube-managed-future-runner/
 │   │           ├── client.rs
 │   │           ├── observation.rs
 │   │           ├── state_cell.rs
+│   │           ├── state_machine.rs
 │   │           └── service/
 │   │               ├── mod.rs
 │   │               ├── contract.rs
 │   │               ├── container.rs
 │   │               ├── service_loop.rs
-│   │               └── object_slot.rs
+│   │               └── actor_cell.rs
 │   │
 │   └── pool-control-plane/
 │       └── src/
@@ -72,7 +73,6 @@ kube-managed-future-runner/
 │           │   │   ├── protocol.rs
 │           │   │   ├── model.rs
 │           │   │   ├── machine.rs
-│           │   │   ├── actor.rs
 │           │   │   └── service.rs
 │           │   ├── virtual_disk/
 │           │   ├── pool_node/
@@ -93,7 +93,8 @@ kube-managed-future-runner/
 - 每个 Service 一个根 Tokio task；
 - 业务通道与控制通道；
 - `FuturesUnordered` 统一 poll Workflow Future；
-- ObjectSlot 的 `Idle/Pending/Running/Cancelling` 原子准入；
+- 私有 ActorCell 的 `Idle/Pending/Running/Cancelling` 执行状态；
+- `Transition::to(...).ensure(...)` 公共状态机原语；
 - 指向明确 Service 实例的类型化 `ServiceClient` 和 oneshot 调用；
 - Operation/Call/Task 因果上下文；
 - 结构化取消、Service 生命周期和观测；
@@ -129,7 +130,6 @@ domains/member_disk/
 ├── protocol.rs
 ├── model.rs
 ├── machine.rs
-├── actor.rs
 ├── service.rs
 └── workflows/          # 只有 service.rs 过大时再创建
 ```
@@ -151,19 +151,15 @@ domains/member_disk/
 
 只保存纯状态迁移：
 
-```text
-(当前业务状态, 外部/内部事件, 当前对象活动) -> (新状态, 调度效果)
+```rust
+(Ua, PhysicalDown) => Transition::to(Da).ensure(Offline)
 ```
 
-它不持有 Client、锁、Future 或 task。
+它不读取当前对象活动，也不持有 Actor、Client、锁、Future 或 task。
 
 ### `model.rs`
 
 保存该领域完整核心实体、不可变快照和值对象。MemberDisk 的容量、Tier、故障域、空间位图、分配状态和成员状态都在这里，不得被 `machine.rs` 中的状态枚举取代。
-
-### `actor.rs`
-
-保存每个领域对象的逻辑 Actor。Actor 拥有完整实体、外部观测和状态图准入决策，但不创建独立 task/mailbox。MemberDisk Service 的根执行单元统一驱动目录中的全部 Actor。
 
 ### `service.rs`
 
@@ -171,9 +167,11 @@ domains/member_disk/
 
 - 私有领域对象目录；
 - `impl Service`；
-- 准入决策到状态图的适配；
+- 状态机结果到 Runtime 请求计划的薄适配；
 - 自然 async Workflow；
 - 跨领域 facade 调用。
+
+领域目录不得出现 `actor.rs`。ActorCell 是 `control-runtime` 的私有实现，业务开发者不接触。
 
 ## 7. 可见性就是边界
 
@@ -237,14 +235,14 @@ Workflow Future
 ## 10. 当前实现状态
 
 - 已完成：`control-protocol` 合并进 `control-runtime::protocol`；
-- 已完成：`runtime.rs` 重组为 `service/contract + container + service_loop + object_slot`；
+- 已完成：`runtime.rs` 重组为 `service/contract + container + service_loop + actor_cell`；
 - 已完成：Pool Kernel 合并为 `pool-control-plane::kernel`；
 - 已完成：MemberDisk、VirtualDisk、PoolNode 合并为 Domain modules；
 - 已完成：`PoolManager -> Pool -> Domain Service` 多 Pool 装配和场景测试；
 - 已完成：Pool 元数据 CRUD、SDB Port 与冷恢复纵切面；
-- 已完成：MemberDisk 完整实体、BLK 位图、逻辑 Actor 和状态图；
+- 已完成：MemberDisk 完整实体、BLK 位图和声明式状态图；
 - 已完成：显式 Service facade，移除请求自带目标和全局自动路由；
-- 已完成：ObjectSlot 实际执行对象意图的 Join/Queue/Replace/Settle；
+- 已完成：私有 ActorCell 实际执行对象意图的 Join/Queue/Replace/Settle；
 - 已完成：生产 Workspace 收敛为两个 crate；
 - 待实现：Tier/Partition、完整 VD/BG/PoolNode、真实 SDB Adapter 与 reconcile。
 

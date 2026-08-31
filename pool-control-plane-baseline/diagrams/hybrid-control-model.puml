@@ -17,19 +17,19 @@ package "Pool" {
 
   package "领域状态与策略" {
     component PoolCore
-    component "MemberDisk Entity\n+ Logical Actor + FSM" as DiskFSM
+    component "MemberDisk Object\nRecord + Observation" as DiskObject
+    component "MemberDisk StateMachine\n(state,event) -> Transition" as DiskFSM
     component "PoolNode FSM" as NodeFSM
     component "VD / BG FSM" as BgFSM
   }
 
-  component "Domain Policy\n对象键 / 冲突决定" as Policy
   component "Domain Workflows\nService上的async fn" as Workflow
   component "Reconcile\n状态收敛" as Reconcile
   component PoolView
 }
 
 package "执行机制" {
-  component "ObjectSlot / Admission" as Admission
+  component "ActorCell (private)\nStart / Join / Replace / Queue" as ActorCell
   component "Service Runtime" as Runtime
   component "Explicit Facade + ServiceClient" as Client
   component "Task / Future / Cancel / Trace" as Task
@@ -48,16 +48,15 @@ Timer --> PoolIngress
 EffectResult --> PoolIngress
 
 PoolIngress --> PoolCore
-PoolIngress --> DiskFSM
+PoolIngress --> DiskObject
+DiskObject --> DiskFSM : state + event
 PoolIngress --> NodeFSM
 PoolIngress --> BgFSM
 
-PoolCore --> Policy
-DiskFSM --> Policy
-NodeFSM --> Policy
-BgFSM --> Policy
-Policy --> Admission : Start / Join / Merge / Queue / Cancel / Reject
-Admission --> Workflow : 已准入请求
+DiskFSM --> ActorCell : ensure desired workflow
+NodeFSM --> ActorCell : ensure desired workflow
+BgFSM --> ActorCell : ensure desired workflow
+ActorCell --> Workflow : start / join / replace
 Workflow --> Client : 命名跨领域能力
 Workflow --> Runtime : 业务Future
 Runtime --> Task
@@ -70,24 +69,25 @@ user_dp --> EffectResult
 VNODE --> EffectResult
 
 Reconcile --> PoolCore
-Reconcile --> DiskFSM
+Reconcile --> DiskObject
 Reconcile --> NodeFSM
 Reconcile --> BgFSM
 SDB --> Reconcile : 已提交决策
 user_dp --> Reconcile : 实际状态
 
 PoolCore --> PoolView
-DiskFSM --> PoolView
+DiskObject --> PoolView
 NodeFSM --> PoolView
 BgFSM --> PoolView
 
-note right of Policy
-领域声明语义
-框架原子执行机制
+note right of DiskFSM
+开发者只声明下一状态和目标Workflow
+不读取Actor活动
 end note
 
 note right of Runtime
 只负责执行，不拥有业务真相
 Operation Context不是状态机
+ActorCell不进入领域API
 end note
 @enduml

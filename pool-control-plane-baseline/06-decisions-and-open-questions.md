@@ -72,7 +72,7 @@ SDB 不提供覆盖 Tier 位图与 VD/BGMap 的统一事务或业务 WAL。系�
 
 ### D-018 策略显式、机制统一
 
-领域声明对象键、影响集合以及 Start、Join、Merge、Queue、CancelThenStart、Reject 等冲突语义；Runtime 的 Admission Registry 原子执行准入、在途索引、等待者、取消传播和并发配额。框架不猜测业务语义，普通业务代码不重复实现机制。
+领域状态机声明对象下一状态与目标 Workflow；Runtime 的私有 ActorCell 对 `ensure` 原子执行启动、同类合并、异类协作替换，并维护在途索引、等待者、取消传播和并发配额。框架不猜测状态迁移，普通业务代码不重复实现并发机制。
 
 ### D-019 跨服务通信属于显式 Service 能力
 
@@ -86,9 +86,9 @@ Operation 的开始、里程碑、完成和结果可以追加记录并用于 TUI
 
 Monitor 的 `PoolManager` 维护 `PoolId -> Arc<Pool>`。`Pool` 拥有 Pool 元数据 CRUD、领域 Service facade 和根执行单元的生命周期；不再使用 `PoolRuntime` 混淆业务对象与通用执行机制。
 
-### D-022 MemberDisk Actor 与 ObjectSlot 分工
+### D-022 Actor 是隐藏执行机制
 
-每个 MemberDisk 是一个逻辑 Actor，拥有完整 MemberDisk 实体、最新物理观测和状态图决策，但不创建独立 Tokio task/mailbox。Runtime 的 `ObjectSlot` 只管理该对象的执行意图、订阅者、替代和排队。Actor 决定策略，ObjectSlot 原子执行机制。
+MemberDisk 是完整领域对象，不暴露 Actor API。Runtime 的私有 `ActorCell` 只管理对象的执行意图、订阅者、替代和排队，不拥有业务元数据，也不创建独立 Tokio task/mailbox。开发者只写对象、状态机和自然工作流。
 
 ### D-023 取消在调用边界自动传播
 
@@ -163,7 +163,7 @@ MemberDisk 的 SDB 决策记录、DiskMap 物理观测、由二者派生的 UA/D
 ### Q-009 执行与并发模型
 
 - 业务请求和控制请求的具体通道类型与优先级；
-- Service Runtime、Admission Registry、Task Registry 的最小职责；
+- Service Runtime、隐藏 ActorCell、Task Registry 的最小职责；
 - 如何在不递归 spawn 的前提下支持并发、取消和观测；
 - Service 私有元数据如何从机制上禁止可变访问跨越 `.await`；
 - 如何从 Tier 全串行演进到安全并行。

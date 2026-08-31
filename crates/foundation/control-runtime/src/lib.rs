@@ -7,6 +7,7 @@ pub mod observation;
 pub mod protocol;
 pub mod service;
 pub mod state_cell;
+pub mod state_machine;
 
 pub use client::ServiceClient;
 pub use context::{CancelCause, CancellationScope, WorkflowContext};
@@ -17,7 +18,8 @@ pub use observation::{
 };
 pub use protocol::{CallId, ObjectKey, OperationId, ServiceId, ServiceRequest, TaskAttemptId};
 pub use service::{
-    spawn_service, Admission, ControlHandle, ManagedService, ObjectActivity, OrphanPolicy,
-    RequestRoute, RuntimeConfig, Service, WorkflowMeta,
+    spawn_service, ControlHandle, ManagedService, OrphanPolicy, RequestPlan, RuntimeConfig,
+    Service, WorkflowMeta,
 };
 pub use state_cell::StateCell;
+pub use state_machine::{Transition, TransitionEffect};

@@ -2,7 +2,7 @@ use super::protocol::{MemberDiskIoAvailability, PoolNodeCommand, PoolNodeRespons
 use crate::kernel::{MemberDiskId, PoolId};
 use async_trait::async_trait;
 use control_runtime::{
-    spawn_service, ManagedService, RequestRoute, RuntimeConfig, RuntimeError, RuntimeResult,
+    spawn_service, ManagedService, RequestPlan, RuntimeConfig, RuntimeError, RuntimeResult,
     Service, ServiceClient, ServiceId, StateCell, WorkflowContext,
 };
 use std::convert::Infallible;
@@ -88,8 +88,11 @@ impl Service for PoolNodeWorker {
         self.id.clone()
     }
 
-    fn route(&self, _request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
-        RequestRoute::Untracked
+    fn plan(
+        &self,
+        _request: &Self::Request,
+    ) -> RuntimeResult<RequestPlan<Self::WorkflowKind, PoolNodeResponse>> {
+        Ok(RequestPlan::Inline)
     }
 
     async fn handle(

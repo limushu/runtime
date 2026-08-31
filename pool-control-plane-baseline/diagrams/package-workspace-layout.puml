@@ -10,10 +10,11 @@ package "Cargo Workspace" {
     component Context
     component ServiceClient
     component Observation
+    component "StateMachine Primitives\nTransition::ensure" as StateMachine
     package "service module" {
       component Contract
       component ServiceContainer
-      component ObjectSlot
+      component "ActorCell (private)" as ActorCell
     }
   }
 
@@ -23,7 +24,7 @@ package "Cargo Workspace" {
     component "Pool\nmetadata + assembly" as PoolInstance
     component Ports
     package "domains module" {
-      component "MemberDisk\nmodel + actor + machine" as MemberDisk
+      component "MemberDisk\nmodel + machine + service" as MemberDisk
       component VirtualDisk
       component PoolNode
       component Tier
@@ -43,7 +44,8 @@ MemberDisk ..> PoolNode : explicit facade
 VirtualDisk ..> Tier : future explicit facade
 
 ServiceContainer --> Contract
-ServiceContainer --> ObjectSlot
+ServiceContainer --> ActorCell
+MemberDisk ..> StateMachine
 ServiceClient --> Context
 Observation .. ServiceContainer
 

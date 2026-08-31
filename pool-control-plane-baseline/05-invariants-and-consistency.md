@@ -206,9 +206,11 @@ Monitor 切主、Task 失败或执行重试不能改变 Operation Context 的因
 
 ## 业务策略声明、框架原子执行
 
-对象键、冲突集合和 `Start / Join / Merge / Queue / CancelThenStart / Reject` 的选择属于领域策略。Admission Registry 必须原子执行该决定并维护在途索引、等待者和并发配额。
+领域状态机声明对象下一状态与目标 Workflow。Runtime 依据同一对象的当前目标原子推导 `Start / Join / CancelThenStart`，并维护在途索引、等待者和并发配额；普通对象写操作可以显式选择顺序排队。
 
-框架不能猜测业务冲突，业务代码也不能绕过 Admission Registry 直接启动受管 Workflow；否则同一对象的互斥、合并和取消保证无法成立。
+框架不猜测业务状态转移，但可以统一执行固定的 `ensure` 语义：同 Workflow 合并、不同 Workflow 协作替换。业务代码不能绕过 Service Runtime 直接启动受管 Workflow；否则同一对象的互斥、合并和取消保证无法成立。
+
+`(ObjectKey, WorkflowKind)` 必须完整标识一个可共享的收敛目标。若两个请求虽然 Kind 相同，但参数或预期结果不可共享，它们必须使用不同的 Kind/Key 或选择顺序 `Enqueue`，不得被错误合并。
 
 ## 共享意图的生命期
 
@@ -216,7 +218,7 @@ Monitor 切主、Task 失败或执行重试不能改变 Operation Context 的因
 
 - 任一订阅者离开不能取消仍被其他订阅者等待的 Workflow；
 - 所有订阅者都离开时，Runtime 按请求声明的 orphan policy 决定协作取消或继续收敛；
-- 新意图替换旧意图时，由 ObjectSlot 请求旧 Workflow 取消，并等待其稳定退出后再启动替代 Workflow。
+- 新意图替换旧意图时，由隐藏 ActorCell 请求旧 Workflow 取消，并等待其稳定退出后再启动替代 Workflow。
 
 普通 Workflow 不显式调用 `stable_boundary()`，也不在每一步轮询取消。显式 Service Client 必须等待下游返回稳定结果，并在控制权回到父 Workflow 前统一传播取消；领域执行器只在自身不可再细分的原子工作单元边界解释取消，例如完成当前 BG 后停止补充新 BG。
 

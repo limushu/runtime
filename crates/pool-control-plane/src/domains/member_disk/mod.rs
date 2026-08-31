@@ -1,4 +1,3 @@
-mod actor;
 mod machine;
 pub mod model;
 mod protocol;

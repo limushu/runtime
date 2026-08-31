@@ -1,8 +1,8 @@
 use super::container::{Reply, ResponseOf};
 use crate::client::BusinessEnvelope;
 use crate::{
-    CancelCause, CancellationScope, ObjectActivity, ObjectKey, OperationId, RuntimeError, Service,
-    TaskAttemptId, WorkflowContext, WorkflowMeta,
+    CancelCause, CancellationScope, ObjectKey, OperationId, RuntimeError, Service, TaskAttemptId,
+    WorkflowContext, WorkflowMeta,
 };
 use futures::future::join_all;
 use std::collections::VecDeque;
@@ -108,11 +108,6 @@ impl SubscriberGroup {
     }
 }
 
-pub(crate) struct PendingIntent<S: Service> {
-    pub(crate) intent: Intent<S>,
-    pub(crate) reconsider: bool,
-}
-
 struct ActiveIntent<S: Service> {
     meta: WorkflowMeta<S::WorkflowKind>,
     task_attempt_id: TaskAttemptId,
@@ -121,9 +116,9 @@ struct ActiveIntent<S: Service> {
     subscriber_group: SubscriberGroup,
 }
 
-enum SlotPhase<S: Service> {
+enum ActorPhase<S: Service> {
     Idle,
-    Pending(Box<PendingIntent<S>>),
+    Pending(Box<Intent<S>>),
     Running(Box<ActiveIntent<S>>),
     Cancelling {
         active: Box<ActiveIntent<S>>,
@@ -131,11 +126,15 @@ enum SlotPhase<S: Service> {
     },
 }
 
-/// A virtual per-object intent slot. It owns no Tokio task or mailbox.
-pub(crate) struct ObjectSlot<S: Service> {
+/// Hidden runtime state for one logical domain object.
+///
+/// Domain code only declares the desired workflow. This cell serializes the
+/// object, joins equal workflows, settles replacements and owns subscribers.
+/// It is driven by the service root task and creates no per-object Tokio task.
+pub(crate) struct ActorCell<S: Service> {
     key: ObjectKey,
-    phase: SlotPhase<S>,
-    queued: VecDeque<PendingIntent<S>>,
+    phase: ActorPhase<S>,
+    queued: VecDeque<Intent<S>>,
 }
 
 pub(crate) struct CancelNotice {
@@ -158,38 +157,26 @@ pub(crate) struct Settled<R> {
     pub(crate) ready: bool,
 }
 
-impl<S: Service> ObjectSlot<S> {
+impl<S: Service> ActorCell<S> {
     pub(crate) fn new(key: ObjectKey) -> Self {
         Self {
             key,
-            phase: SlotPhase::Idle,
+            phase: ActorPhase::Idle,
             queued: VecDeque::new(),
         }
     }
 
-    pub(crate) fn activity(&self) -> ObjectActivity<S::WorkflowKind> {
+    pub(crate) fn targets(&self, kind: &S::WorkflowKind) -> bool {
         match &self.phase {
-            SlotPhase::Idle => ObjectActivity::Idle,
-            SlotPhase::Pending(pending) => ObjectActivity::Busy {
-                current_kind: pending.intent.meta.kind.clone(),
-                replacement_kind: None,
-            },
-            SlotPhase::Running(active) => ObjectActivity::Busy {
-                current_kind: active.meta.kind.clone(),
-                replacement_kind: None,
-            },
-            SlotPhase::Cancelling {
-                active,
-                replacement,
-            } => ObjectActivity::Busy {
-                current_kind: active.meta.kind.clone(),
-                replacement_kind: Some(replacement.meta.kind.clone()),
-            },
+            ActorPhase::Idle => false,
+            ActorPhase::Pending(pending) => &pending.meta.kind == kind,
+            ActorPhase::Running(active) => &active.meta.kind == kind,
+            ActorPhase::Cancelling { replacement, .. } => &replacement.meta.kind == kind,
         }
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        matches!(self.phase, SlotPhase::Idle)
+        matches!(self.phase, ActorPhase::Idle)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -199,7 +186,7 @@ impl<S: Service> ObjectSlot<S> {
     pub(crate) fn is_active(&self) -> bool {
         matches!(
             self.phase,
-            SlotPhase::Running(_) | SlotPhase::Cancelling { .. }
+            ActorPhase::Running(_) | ActorPhase::Cancelling { .. }
         )
     }
 
@@ -207,26 +194,25 @@ impl<S: Service> ObjectSlot<S> {
         self.queued.len()
             + usize::from(matches!(
                 self.phase,
-                SlotPhase::Pending(_) | SlotPhase::Cancelling { .. }
+                ActorPhase::Pending(_) | ActorPhase::Cancelling { .. }
             ))
     }
 
     /// Queue an intent and report whether it is ready to be launched now.
-    pub(crate) fn queue(&mut self, intent: Intent<S>, reconsider: bool) -> bool {
-        let pending = PendingIntent { intent, reconsider };
+    pub(crate) fn queue(&mut self, intent: Intent<S>) -> bool {
         if self.is_idle() {
-            self.phase = SlotPhase::Pending(Box::new(pending));
+            self.phase = ActorPhase::Pending(Box::new(intent));
             true
         } else {
-            self.queued.push_back(pending);
+            self.queued.push_back(intent);
             false
         }
     }
 
-    pub(crate) fn take_ready(&mut self) -> Option<PendingIntent<S>> {
-        let phase = std::mem::replace(&mut self.phase, SlotPhase::Idle);
+    pub(crate) fn take_ready(&mut self) -> Option<Intent<S>> {
+        let phase = std::mem::replace(&mut self.phase, ActorPhase::Idle);
         match phase {
-            SlotPhase::Pending(intent) => Some(*intent),
+            ActorPhase::Pending(intent) => Some(*intent),
             other => {
                 self.phase = other;
                 None
@@ -243,12 +229,12 @@ impl<S: Service> ObjectSlot<S> {
     ) -> Result<SubscriberGroup, RuntimeError> {
         if !self.is_idle() {
             return Err(RuntimeError::Internal(format!(
-                "object slot {} was activated while busy",
+                "actor cell {} was activated while busy",
                 self.key
             )));
         }
         let subscriber_group = SubscriberGroup::new(&subscribers);
-        self.phase = SlotPhase::Running(Box::new(ActiveIntent {
+        self.phase = ActorPhase::Running(Box::new(ActiveIntent {
             meta,
             task_attempt_id,
             context,
@@ -266,25 +252,25 @@ impl<S: Service> ObjectSlot<S> {
             .collect();
 
         let active_operation_id = match &mut self.phase {
-            SlotPhase::Pending(pending) if pending.intent.meta.kind == intent.meta.kind => {
-                pending.intent.subscribers.append(&mut intent.subscribers);
-                pending.intent.operation_id()
+            ActorPhase::Pending(pending) if pending.meta.kind == intent.meta.kind => {
+                pending.subscribers.append(&mut intent.subscribers);
+                pending.operation_id()
             }
-            SlotPhase::Running(active) if active.meta.kind == intent.meta.kind => {
+            ActorPhase::Running(active) if active.meta.kind == intent.meta.kind => {
                 active.subscriber_group.add(&intent.subscribers);
                 active.subscribers.append(&mut intent.subscribers);
                 active.context.operation_id()
             }
-            SlotPhase::Cancelling { replacement, .. }
+            ActorPhase::Cancelling { replacement, .. }
                 if replacement.meta.kind == intent.meta.kind =>
             {
                 replacement.subscribers.append(&mut intent.subscribers);
                 replacement.operation_id()
             }
-            SlotPhase::Idle
-            | SlotPhase::Pending(_)
-            | SlotPhase::Running(_)
-            | SlotPhase::Cancelling { .. } => return Err(Box::new(intent)),
+            ActorPhase::Idle
+            | ActorPhase::Pending(_)
+            | ActorPhase::Running(_)
+            | ActorPhase::Cancelling { .. } => return Err(Box::new(intent)),
         };
 
         Ok(JoinNotice {
@@ -298,41 +284,38 @@ impl<S: Service> ObjectSlot<S> {
         intent: Intent<S>,
         cause: CancelCause,
     ) -> Result<ReplaceOutcome<ResponseOf<S>>, Box<Intent<S>>> {
-        let phase = std::mem::replace(&mut self.phase, SlotPhase::Idle);
+        let phase = std::mem::replace(&mut self.phase, ActorPhase::Idle);
         match phase {
-            SlotPhase::Running(active) => {
+            ActorPhase::Running(active) => {
                 active.context.cancellation().request(cause);
                 let notice = CancelNotice {
                     task_attempt_id: active.task_attempt_id,
                     operation_id: active.context.operation_id(),
                 };
-                self.phase = SlotPhase::Cancelling {
+                self.phase = ActorPhase::Cancelling {
                     active,
                     replacement: Box::new(intent),
                 };
                 Ok(ReplaceOutcome::CancelRequested(notice))
             }
-            SlotPhase::Cancelling {
+            ActorPhase::Cancelling {
                 active,
                 replacement,
             } => {
                 let superseded = replacement.subscribers;
-                self.phase = SlotPhase::Cancelling {
+                self.phase = ActorPhase::Cancelling {
                     active,
                     replacement: Box::new(intent),
                 };
                 Ok(ReplaceOutcome::ReplacementSuperseded(superseded))
             }
-            SlotPhase::Pending(pending) => {
-                let superseded = pending.intent.subscribers;
-                self.phase = SlotPhase::Pending(Box::new(PendingIntent {
-                    intent,
-                    reconsider: false,
-                }));
+            ActorPhase::Pending(pending) => {
+                let superseded = pending.subscribers;
+                self.phase = ActorPhase::Pending(Box::new(intent));
                 Ok(ReplaceOutcome::ReplacementSuperseded(superseded))
             }
-            SlotPhase::Idle => {
-                self.phase = SlotPhase::Idle;
+            ActorPhase::Idle => {
+                self.phase = ActorPhase::Idle;
                 Err(Box::new(intent))
             }
         }
@@ -342,23 +325,20 @@ impl<S: Service> ObjectSlot<S> {
         &mut self,
         task_attempt_id: TaskAttemptId,
     ) -> Option<Settled<ResponseOf<S>>> {
-        let phase = std::mem::replace(&mut self.phase, SlotPhase::Idle);
+        let phase = std::mem::replace(&mut self.phase, ActorPhase::Idle);
         match phase {
-            SlotPhase::Running(active) if active.task_attempt_id == task_attempt_id => {
+            ActorPhase::Running(active) if active.task_attempt_id == task_attempt_id => {
                 let ready = self.promote_queued();
                 Some(Settled {
                     subscribers: active.subscribers,
                     ready,
                 })
             }
-            SlotPhase::Cancelling {
+            ActorPhase::Cancelling {
                 active,
                 replacement,
             } if active.task_attempt_id == task_attempt_id => {
-                self.phase = SlotPhase::Pending(Box::new(PendingIntent {
-                    intent: *replacement,
-                    reconsider: false,
-                }));
+                self.phase = ActorPhase::Pending(replacement);
                 Some(Settled {
                     subscribers: active.subscribers,
                     ready: true,
@@ -373,8 +353,8 @@ impl<S: Service> ObjectSlot<S> {
 
     pub(crate) fn request_cancel(&self, cause: CancelCause) -> Option<CancelNotice> {
         let active = match &self.phase {
-            SlotPhase::Running(active) | SlotPhase::Cancelling { active, .. } => active,
-            SlotPhase::Idle | SlotPhase::Pending(_) => return None,
+            ActorPhase::Running(active) | ActorPhase::Cancelling { active, .. } => active,
+            ActorPhase::Idle | ActorPhase::Pending(_) => return None,
         };
         active.context.cancellation().request(cause);
         Some(CancelNotice {
@@ -386,28 +366,28 @@ impl<S: Service> ObjectSlot<S> {
     pub(crate) fn reject_pending(&mut self) -> Vec<Subscriber<ResponseOf<S>>> {
         let mut subscribers = Vec::new();
         while let Some(intent) = self.queued.pop_front() {
-            subscribers.extend(intent.intent.subscribers);
+            subscribers.extend(intent.subscribers);
         }
-        let phase = std::mem::replace(&mut self.phase, SlotPhase::Idle);
+        let phase = std::mem::replace(&mut self.phase, ActorPhase::Idle);
         match phase {
-            SlotPhase::Pending(intent) => subscribers.extend(intent.intent.subscribers),
-            SlotPhase::Cancelling {
+            ActorPhase::Pending(intent) => subscribers.extend(intent.subscribers),
+            ActorPhase::Cancelling {
                 active,
                 replacement,
             } => {
                 subscribers.extend(replacement.subscribers);
-                self.phase = SlotPhase::Running(active);
+                self.phase = ActorPhase::Running(active);
             }
-            SlotPhase::Running(active) => self.phase = SlotPhase::Running(active),
-            SlotPhase::Idle => {}
+            ActorPhase::Running(active) => self.phase = ActorPhase::Running(active),
+            ActorPhase::Idle => {}
         }
         subscribers
     }
 
     fn promote_queued(&mut self) -> bool {
         self.phase = match self.queued.pop_front() {
-            Some(intent) => SlotPhase::Pending(Box::new(intent)),
-            None => SlotPhase::Idle,
+            Some(intent) => ActorPhase::Pending(Box::new(intent)),
+            None => ActorPhase::Idle,
         };
         !self.is_idle()
     }

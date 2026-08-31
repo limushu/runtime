@@ -1,9 +1,9 @@
-use super::actor::{
-    MemberDiskActivity, MemberDiskActor, MemberDiskActorDecision, PlannedRecordUpdate,
+use super::machine::{
+    MemberDiskEffect, MemberDiskInput, MemberDiskTransition, MemberDiskWorkflowKind,
 };
-use super::machine::{MemberDiskInput, MemberDiskTransition, MemberDiskWorkflowKind};
 use super::model::{
-    MemberDiskPatch, MemberDiskRecord, MemberDiskSnapshot, MemberDiskSpec, PhysicalState,
+    MemberDisk, MemberDiskPatch, MemberDiskRecord, MemberDiskSnapshot, MemberDiskSpec,
+    PhysicalState, PlannedRecordUpdate,
 };
 use super::protocol::{MemberDiskCommand, MemberDiskResponse};
 use crate::domains::pool_node::{MemberDiskIoAvailability, PoolNodeService};
@@ -12,9 +12,8 @@ use crate::kernel::{BlkId, MemberDiskId, PoolId};
 use crate::ports::ControlPlaneStore;
 use async_trait::async_trait;
 use control_runtime::{
-    spawn_service, Admission, CancelCause, ManagedService, ObjectActivity, ObjectKey, RequestRoute,
-    RuntimeConfig, RuntimeError, RuntimeResult, Service, ServiceClient, ServiceId, StateCell,
-    WorkflowContext, WorkflowMeta,
+    spawn_service, ManagedService, ObjectKey, RequestPlan, RuntimeConfig, RuntimeError,
+    RuntimeResult, Service, ServiceClient, ServiceId, StateCell, WorkflowContext, WorkflowMeta,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -165,27 +164,27 @@ fn unexpected(operation: &str, response: MemberDiskResponse) -> RuntimeError {
 
 #[derive(Debug, Default)]
 struct MemberDiskDirectory {
-    actors: HashMap<MemberDiskId, MemberDiskActor>,
+    disks: HashMap<MemberDiskId, MemberDisk>,
 }
 
 impl MemberDiskDirectory {
     fn restore(records: Vec<MemberDiskRecord>) -> Self {
         Self {
-            actors: records
+            disks: records
                 .into_iter()
-                .map(|record| (record.id().clone(), MemberDiskActor::restore(record)))
+                .map(|record| (record.id().clone(), MemberDisk::restore(record)))
                 .collect(),
         }
     }
 
-    fn actor(&self, disk: &MemberDiskId) -> RuntimeResult<&MemberDiskActor> {
-        self.actors
+    fn disk(&self, disk: &MemberDiskId) -> RuntimeResult<&MemberDisk> {
+        self.disks
             .get(disk)
             .ok_or_else(|| RuntimeError::InvalidState(format!("unknown member disk {disk}")))
     }
 
-    fn actor_mut(&mut self, disk: &MemberDiskId) -> RuntimeResult<&mut MemberDiskActor> {
-        self.actors
+    fn disk_mut(&mut self, disk: &MemberDiskId) -> RuntimeResult<&mut MemberDisk> {
+        self.disks
             .get_mut(disk)
             .ok_or_else(|| RuntimeError::InvalidState(format!("unknown member disk {disk}")))
     }
@@ -194,7 +193,7 @@ impl MemberDiskDirectory {
 struct MemberDiskWorker {
     id: ServiceId,
     pool: PoolId,
-    actors: StateCell<MemberDiskDirectory>,
+    disks: StateCell<MemberDiskDirectory>,
     store: Arc<dyn ControlPlaneStore>,
     node: PoolNodeService,
     virtual_disk: VirtualDiskService,
@@ -211,7 +210,7 @@ impl MemberDiskWorker {
         Self {
             id: ServiceId::new(format!("pool/{pool}/member-disk")),
             pool,
-            actors: StateCell::new(MemberDiskDirectory::restore(records)),
+            disks: StateCell::new(MemberDiskDirectory::restore(records)),
             store,
             node,
             virtual_disk,
@@ -223,46 +222,31 @@ impl MemberDiskWorker {
     }
 
     fn snapshot(&self, disk: &MemberDiskId) -> RuntimeResult<MemberDiskSnapshot> {
-        self.actors
-            .read(|actors| actors.actor(disk).map(MemberDiskActor::snapshot))
+        self.disks
+            .read(|disks| disks.disk(disk).map(MemberDisk::snapshot))
     }
 
-    fn activity(activity: &ObjectActivity<MemberDiskWorkflowKind>) -> MemberDiskActivity {
-        match activity {
-            ObjectActivity::Idle => MemberDiskActivity::Idle,
-            ObjectActivity::Busy {
-                current_kind,
-                replacement_kind,
-            } => MemberDiskActivity::Busy {
-                current: *current_kind,
-                replacement: *replacement_kind,
-            },
-        }
-    }
-
-    fn admit_physical(
+    fn plan_physical(
         &self,
         disk: &MemberDiskId,
         state: PhysicalState,
-        activity: &ObjectActivity<MemberDiskWorkflowKind>,
-    ) -> RuntimeResult<Admission<MemberDiskResponse>> {
-        let decision = self.actors.update(|actors| {
-            actors
-                .actor_mut(disk)?
-                .admit_physical(state, Self::activity(activity))
-        })?;
-        Ok(match decision {
-            MemberDiskActorDecision::Start => Admission::Start,
-            MemberDiskActorDecision::Join => Admission::Join,
-            MemberDiskActorDecision::Replace { cause } => Admission::Replace {
-                cause: CancelCause::new(cause),
-            },
-            MemberDiskActorDecision::Complete(snapshot) => {
-                Admission::Complete(MemberDiskResponse::Snapshot(snapshot))
+    ) -> RuntimeResult<RequestPlan<MemberDiskWorkflowKind, MemberDiskResponse>> {
+        let transition = self
+            .disks
+            .update(|disks| disks.disk_mut(disk)?.apply_physical(state))?;
+        Ok(match transition.effect {
+            MemberDiskEffect::Ensure(kind) => RequestPlan::Ensure(
+                WorkflowMeta::object(
+                    Self::object_key(disk),
+                    kind,
+                    format!("apply {state:?} fact for {disk}"),
+                )
+                .continue_when_orphaned(),
+            ),
+            MemberDiskEffect::None => {
+                RequestPlan::Complete(MemberDiskResponse::Snapshot(self.snapshot(disk)?))
             }
-            MemberDiskActorDecision::Reject(reason) => Admission::Reject {
-                reason: reason.into(),
-            },
+            MemberDiskEffect::Reject(reason) => RequestPlan::Reject { reason },
         })
     }
 
@@ -272,15 +256,15 @@ impl MemberDiskWorker {
         disk: &MemberDiskId,
         input: MemberDiskInput,
     ) -> RuntimeResult<MemberDiskTransition> {
-        let mutation = self.actors.read(|actors| actors.actor(disk)?.plan(input))?;
+        let mutation = self.disks.read(|disks| disks.disk(disk)?.plan(input))?;
         if mutation.requires_persistence() {
             self.store
                 .save_member_disk(mutation.record().clone())
                 .await?;
         }
         let transition = self
-            .actors
-            .update(|actors| actors.actor_mut(disk)?.commit(mutation))?;
+            .disks
+            .update(|disks| disks.disk_mut(disk)?.commit(mutation))?;
         self.observe_transition(context, disk, &transition);
         // Persistence is already stable and the in-memory projection mirrors
         // it. Stop here instead of letting a stale workflow begin another step.
@@ -349,10 +333,7 @@ impl MemberDiskWorker {
                 spec.id, spec.pool, self.pool
             )));
         }
-        if self
-            .actors
-            .read(|actors| actors.actors.contains_key(&spec.id))
-        {
+        if self.disks.read(|disks| disks.disks.contains_key(&spec.id)) {
             return Err(RuntimeError::Rejected(format!(
                 "member disk {} already exists",
                 spec.id
@@ -360,10 +341,10 @@ impl MemberDiskWorker {
         }
         let record = MemberDiskRecord::new(spec);
         self.store.save_member_disk(record.clone()).await?;
-        let snapshot = self.actors.update(|actors| {
-            let actor = MemberDiskActor::restore(record);
-            let snapshot = actor.snapshot();
-            actors.actors.insert(snapshot.spec.id.clone(), actor);
+        let snapshot = self.disks.update(|disks| {
+            let disk = MemberDisk::restore(record);
+            let snapshot = disk.snapshot();
+            disks.disks.insert(snapshot.spec.id.clone(), disk);
             snapshot
         });
         Ok(MemberDiskResponse::Snapshot(snapshot))
@@ -375,24 +356,24 @@ impl MemberDiskWorker {
         patch: MemberDiskPatch,
     ) -> RuntimeResult<MemberDiskResponse> {
         let update = self
-            .actors
-            .read(|actors| actors.actor(&disk).map(|actor| actor.plan_patch(patch)))?;
+            .disks
+            .read(|disks| disks.disk(&disk).map(|disk| disk.plan_patch(patch)))?;
         self.commit_record_update(&disk, update).await?;
         Ok(MemberDiskResponse::Snapshot(self.snapshot(&disk)?))
     }
 
     async fn allocate(&self, disk: MemberDiskId) -> RuntimeResult<MemberDiskResponse> {
         let (update, blk) = self
-            .actors
-            .read(|actors| actors.actor(&disk)?.plan_allocate())?;
+            .disks
+            .read(|disks| disks.disk(&disk)?.plan_allocate())?;
         self.commit_record_update(&disk, update).await?;
         Ok(MemberDiskResponse::Allocated(blk))
     }
 
     async fn release(&self, disk: MemberDiskId, blk: BlkId) -> RuntimeResult<MemberDiskResponse> {
         let update = self
-            .actors
-            .read(|actors| actors.actor(&disk)?.plan_release(&blk))?;
+            .disks
+            .read(|disks| disks.disk(&disk)?.plan_release(&blk))?;
         self.commit_record_update(&disk, update).await?;
         Ok(MemberDiskResponse::Released)
     }
@@ -403,15 +384,15 @@ impl MemberDiskWorker {
         update: PlannedRecordUpdate,
     ) -> RuntimeResult<()> {
         self.store.save_member_disk(update.record().clone()).await?;
-        self.actors
-            .update(|actors| actors.actor_mut(disk)?.commit_record(update))
+        self.disks
+            .update(|disks| disks.disk_mut(disk)?.commit_record(update))
     }
 
     async fn delete(&self, disk: MemberDiskId) -> RuntimeResult<MemberDiskResponse> {
-        if !self.actors.read(|actors| {
-            actors
-                .actor(&disk)
-                .map(MemberDiskActor::can_delete)
+        if !self.disks.read(|disks| {
+            disks
+                .disk(&disk)
+                .map(MemberDisk::can_delete)
                 .unwrap_or(false)
         }) {
             return Err(RuntimeError::Rejected(
@@ -419,8 +400,8 @@ impl MemberDiskWorker {
             ));
         }
         self.store.delete_member_disk(&self.pool, &disk).await?;
-        self.actors.update(|actors| {
-            actors.actors.remove(&disk);
+        self.disks.update(|disks| {
+            disks.disks.remove(&disk);
         });
         Ok(MemberDiskResponse::Deleted)
     }
@@ -435,75 +416,34 @@ impl Service for MemberDiskWorker {
         self.id.clone()
     }
 
-    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
-        let workflow = |disk: &MemberDiskId, kind, label: String| {
-            RequestRoute::Workflow(WorkflowMeta::object(Self::object_key(disk), kind, label))
-        };
-        match request {
-            MemberDiskCommand::Get(_) | MemberDiskCommand::List => RequestRoute::Untracked,
-            MemberDiskCommand::ApplyPhysical { disk, state } => {
-                let kind = match state {
-                    PhysicalState::Down => MemberDiskWorkflowKind::Offline,
-                    PhysicalState::Up => MemberDiskWorkflowKind::Online,
-                };
-                match workflow(disk, kind, format!("apply {state:?} fact for {disk}")) {
-                    RequestRoute::Workflow(meta) => {
-                        RequestRoute::Workflow(meta.continue_when_orphaned())
-                    }
-                    RequestRoute::Untracked => unreachable!(),
-                }
-            }
-            MemberDiskCommand::Create(spec) => workflow(
-                &spec.id,
-                MemberDiskWorkflowKind::Metadata,
-                format!("create member disk {}", spec.id),
-            ),
-            MemberDiskCommand::Update { disk, .. } => workflow(
-                disk,
-                MemberDiskWorkflowKind::Metadata,
-                format!("update member disk {disk}"),
-            ),
-            MemberDiskCommand::Delete(disk) => workflow(
-                disk,
-                MemberDiskWorkflowKind::Metadata,
-                format!("delete member disk {disk}"),
-            ),
-            MemberDiskCommand::Allocate(disk) => workflow(
-                disk,
-                MemberDiskWorkflowKind::Metadata,
-                format!("allocate a BLK from {disk}"),
-            ),
-            MemberDiskCommand::Release { disk, blk } => workflow(
-                disk,
-                MemberDiskWorkflowKind::Metadata,
-                format!("release BLK {blk} from {disk}"),
-            ),
-        }
-    }
-
-    fn admit(
+    fn plan(
         &self,
-        _context: &WorkflowContext,
         request: &Self::Request,
-        activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<Admission<MemberDiskResponse>> {
-        match request {
-            MemberDiskCommand::ApplyPhysical { disk, state } => {
-                self.admit_physical(disk, *state, activity)
+    ) -> RuntimeResult<RequestPlan<Self::WorkflowKind, MemberDiskResponse>> {
+        let metadata = |disk: &MemberDiskId, label: String| {
+            RequestPlan::Enqueue(WorkflowMeta::object(
+                Self::object_key(disk),
+                MemberDiskWorkflowKind::Metadata,
+                label,
+            ))
+        };
+        Ok(match request {
+            MemberDiskCommand::Get(_) | MemberDiskCommand::List => RequestPlan::Inline,
+            MemberDiskCommand::ApplyPhysical { disk, state } => self.plan_physical(disk, *state)?,
+            MemberDiskCommand::Create(spec) => {
+                metadata(&spec.id, format!("create member disk {}", spec.id))
             }
-            MemberDiskCommand::Create(_)
-            | MemberDiskCommand::Update { .. }
-            | MemberDiskCommand::Delete(_)
-            | MemberDiskCommand::Allocate(_)
-            | MemberDiskCommand::Release { .. } => Ok(if activity.is_idle() {
-                Admission::Start
-            } else {
-                Admission::Queue
-            }),
-            MemberDiskCommand::Get(_) | MemberDiskCommand::List => Err(RuntimeError::Internal(
-                "untracked MemberDisk query reached admission".into(),
-            )),
-        }
+            MemberDiskCommand::Update { disk, .. } => {
+                metadata(disk, format!("update member disk {disk}"))
+            }
+            MemberDiskCommand::Delete(disk) => metadata(disk, format!("delete member disk {disk}")),
+            MemberDiskCommand::Allocate(disk) => {
+                metadata(disk, format!("allocate a BLK from {disk}"))
+            }
+            MemberDiskCommand::Release { disk, blk } => {
+                metadata(disk, format!("release BLK {blk} from {disk}"))
+            }
+        })
     }
 
     async fn handle(
@@ -527,12 +467,8 @@ impl Service for MemberDiskWorker {
             MemberDiskCommand::Release { disk, blk } => self.release(disk, blk).await,
             MemberDiskCommand::Get(disk) => Ok(MemberDiskResponse::Snapshot(self.snapshot(&disk)?)),
             MemberDiskCommand::List => {
-                Ok(MemberDiskResponse::Snapshots(self.actors.read(|actors| {
-                    actors
-                        .actors
-                        .values()
-                        .map(MemberDiskActor::snapshot)
-                        .collect()
+                Ok(MemberDiskResponse::Snapshots(self.disks.read(|disks| {
+                    disks.disks.values().map(MemberDisk::snapshot).collect()
                 })))
             }
         }

@@ -157,7 +157,7 @@ async fn member_disk_keeps_core_metadata_and_allocation_bitmap() {
 }
 
 #[tokio::test]
-async fn disk_actor_replaces_offline_only_after_it_settles() {
+async fn conflicting_disk_intent_waits_for_offline_to_settle() {
     let store = Arc::new(InMemoryControlPlaneStore::default());
     let manager = manager(store);
     let pool_id = PoolId::new("pool-a");

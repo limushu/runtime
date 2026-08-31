@@ -1,4 +1,4 @@
-use crate::{CancelCause, ObjectKey, RuntimeResult, ServiceId, ServiceRequest, WorkflowContext};
+use crate::{ObjectKey, RuntimeResult, ServiceId, ServiceRequest, WorkflowContext};
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -37,45 +37,16 @@ impl<K> WorkflowMeta<K> {
     }
 }
 
+/// The complete request plan returned by domain code.
+///
+/// For `Ensure`, the hidden actor cell starts an idle workflow, joins the same
+/// workflow, or cooperatively replaces a different workflow. Domain code only
+/// states the desired workflow and never inspects runtime activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestRoute<K> {
-    /// A normal Future without object admission or managed-task bookkeeping.
-    Untracked,
-    Workflow(WorkflowMeta<K>),
-}
-
-/// The small, business-facing projection of one object's intent slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObjectActivity<K> {
-    Idle,
-    Busy {
-        current_kind: K,
-        replacement_kind: Option<K>,
-    },
-}
-
-impl<K> ObjectActivity<K> {
-    pub fn is_idle(&self) -> bool {
-        matches!(self, Self::Idle)
-    }
-
-    pub fn target_kind(&self) -> Option<&K> {
-        match self {
-            Self::Idle => None,
-            Self::Busy {
-                current_kind,
-                replacement_kind,
-            } => replacement_kind.as_ref().or(Some(current_kind)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Admission<R> {
-    Start,
-    Join,
-    Queue,
-    Replace { cause: CancelCause },
+pub enum RequestPlan<K, R> {
+    Inline,
+    Ensure(WorkflowMeta<K>),
+    Enqueue(WorkflowMeta<K>),
     Complete(R),
     Reject { reason: Arc<str> },
 }
@@ -87,19 +58,10 @@ pub trait Service: Send + Sync + 'static {
 
     fn id(&self) -> ServiceId;
 
-    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind>;
-
-    fn admit(
+    fn plan(
         &self,
-        _context: &WorkflowContext,
-        _request: &Self::Request,
-        activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<Admission<<Self::Request as ServiceRequest>::Response>> {
-        Ok(match activity {
-            ObjectActivity::Idle => Admission::Start,
-            ObjectActivity::Busy { .. } => Admission::Queue,
-        })
-    }
+        request: &Self::Request,
+    ) -> RuntimeResult<RequestPlan<Self::WorkflowKind, <Self::Request as ServiceRequest>::Response>>;
 
     async fn handle(
         &self,

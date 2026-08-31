@@ -79,7 +79,7 @@ Harel 将持续响应外部和内部刺激的系统称为 reactive system，并�
 
 Actor 模型强调封装状态、通过消息交互以及并发实体之间的隔离。[Hewitt、Bishop 和 Steiger 的原始 Actor 论文](https://www.ijcai.org/Proceedings/73/Papers/027B.pdf)为“服务拥有自己的核心状态、外部通过显式通信句柄访问”提供理论支撑。
 
-本文采用 Actor 的状态所有权思想，但把“逻辑 Actor”和“执行 task”明确分开。当前 MemberDisk 纵切面为每个盘建立一个逻辑 Actor，由它拥有完整实体、最新 DiskMap 观测和状态图决策；全部 Actor 由 MemberDisk Service 的一个根执行单元驱动，不为每盘创建 Tokio task 或 mailbox。对象粒度来自业务并发边界，task 粒度来自运行时机制，二者不是一一对应关系。
+本文采用 Actor 的隔离与串行消息思想，但不把 Actor 作为领域编程接口。MemberDisk 只是拥有完整 Record 与最新 DiskMap 观测的领域对象；状态机只是纯函数。对象级串行化、订阅者和在途 Workflow 由 Runtime 私有 `ActorCell` 管理，全部 ActorCell 由 MemberDisk Service 的一个根执行单元驱动，不为每盘创建 Tokio task 或 mailbox。对象粒度来自业务并发边界，task 粒度来自运行时机制，二者不是一一对应关系。
 
 ### 3.3 Saga、Process Manager 与自然工作流
 
@@ -199,10 +199,10 @@ MemberDiskRecord(SDB decision)
   + allocation state + membership + BLK bitmap + revision
 PhysicalState(DiskMap observation)
 MemberDiskState = project(record, physical observation)
-ObjectActivity = Runtime execution intent
+ActorCell activity = private Runtime execution intent
 ```
 
-核心元数据只有 MemberDisk 领域可以修改；物理状态来自 DiskMap；UA/DA/DI/UI/Removed 是派生的运行投影；ObjectActivity 只表示 Future 的在途状态。四者不能混成一份状态。物理可访问性、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
+核心元数据只有 MemberDisk 领域可以修改；物理状态来自 DiskMap；UA/DA/DI/UI/Removed 是派生的运行投影；ActorCell activity 只表示 Runtime 私有的 Future 在途状态。四者不能混成一份状态，而且状态机不能读取 ActorCell activity。物理可访问性、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
 
 ```rust
 enum MemberDiskState {
@@ -220,7 +220,7 @@ enum MemberDiskState {
 Allocatable(m)=PhysicalUp(m)\land AllocationActive(m)
 \]
 
-因此 `DA` 保留的是“恢复后可直接重新服务”的策略含义，而不是允许向一块 DOWN 盘实际分配空间。`MemberDiskActor` 对外部物理事实与当前 `ObjectActivity` 作出 `Start/Join/Replace/Complete/Reject` 决定；Runtime 的 `ObjectSlot` 原子执行决定。状态图不持有 channel、Future、task 或锁。
+因此 `DA` 保留的是“恢复后可直接重新服务”的策略含义，而不是允许向一块 DOWN 盘实际分配空间。MemberDisk 状态机只对外部事实作出 `Transition::to(next).ensure(workflow)` 决定；Runtime 根据对象当前目标自动推导启动、同类合并或异类协作替换。状态图不持有 Actor、channel、Future、task 或锁。
 
 ### 5.3 PoolNode
 
@@ -487,12 +487,14 @@ Footprint(o_1)\cap Footprint(o_2)\neq\varnothing
 
 由此得到分工：
 
-- 领域策略声明对象键、影响集合以及合并、替换、排队或拒绝语义；
-- Runtime 的 Admission Registry 原子地执行这些决定，维护在途索引、等待者和并发配额；
-- 不相交或可交换的操作可以并行；
-- 非单调的释放、复用和替换必须有明确协调边界。
+- 领域状态机声明对象键、下一状态和目标 Workflow；
+- Runtime 的私有 ActorCell 对同一对象固定执行“空闲则启动、同类则合并、异类则协作替换”，并维护等待者和并发配额；
+- 普通串行写操作显式选择排队；不相交对象可以并行；
+- 多对象影响集合、可交换合并等高级策略必须由专门协调领域建模，不能塞进普通开发者的状态机接口。
 
-框架可以固化 `Start / Join / Merge / Queue / CancelThenStart / Reject` 等机制，但不能猜测哪一种适用于当前对象。这避免把业务冲突规则硬编码进通用任务框架，也避免让普通工作流开发者手写并发容器。
+这个固定的 `ensure` 语义刻意减少策略 API。框架不猜测状态迁移，领域也不手写 `Start/Join/Replace` 或并发容器。若未来出现无法表达的真实反例，再为该协调领域增加受限扩展点，而不是预先暴露通用 Admission DSL。
+
+固定语义成立的前提是 `(ObjectKey, WorkflowKind)` 完整表示一个可共享的收敛目标。相同 Kind 的参数若不可互换，就必须细化 Kind/Key 或使用顺序 `Enqueue`，否则自动 Join 会把不同业务错误地视为同一意图。
 
 ## 9. 业务取消与不可逆点
 
@@ -686,7 +688,18 @@ Reconcile(P^{mem},P^{real})
 
 ### 14.1 普通开发者的编程表面
 
-普通开发者主要编写定义在领域 Service 上的自然 `async fn`：
+普通开发者首先编写纯状态机：
+
+```rust
+match (state, event) {
+    (Ua, PhysicalDown) => Transition::to(Da).ensure(Offline),
+    (Di, PhysicalUp) => Transition::to(Ui).ensure(Online),
+    (Ua, PhysicalUp) => Transition::to(Ua),
+    (Removed, PhysicalUp) => Transition::to(Removed).reject("explicit rejoin required"),
+}
+```
+
+然后编写定义在领域 Service 上的自然 `async fn`：
 
 ```rust
 impl MemberDiskWorker {
@@ -720,23 +733,21 @@ impl MemberDiskWorker {
 5. Operation Context 作为附加上下文传播因果、取消和 Trace，不成为执行主体；
 6. 元数据访问使用不暴露 Guard 的同步闭包，不能把可变借用或锁守卫带过 `.await`；
 7. 普通 Workflow 不显式检查取消。Service Client 在下游稳定返回后统一传播取消，领域执行器只在自己的最小原子工作单元边界解释取消。
+8. 普通开发者不读取 Actor 活动，也不选择 Start、Join 或 Replace。
 
 ### 14.2 策略声明与机制执行
 
-业务策略必须显式，但其执行机制必须统一。领域为请求声明对象键、影响集合和冲突决策：
+业务状态迁移必须显式，但可推导的并发机制不应暴露给普通开发者。状态机只声明目标：
 
 ```rust
-enum Admission {
-    Start,
-    Join,
-    Queue,
-    Replace,
-    Complete,
-    Reject,
+match (state, event) {
+    (Ua, PhysicalDown) => Transition::to(Da).ensure(Offline),
+    (Di, PhysicalUp) => Transition::to(Ui).ensure(Online),
+    (Ua, PhysicalUp) => Transition::to(Ua),
 }
 ```
 
-框架负责原子准入、在途索引、订阅者、并发配额、协作取消和完成通知。领域只回答“两个业务意图是什么关系”，不区分 Join 的目标当前处于 Pending、Running 还是 Replacement，也不管理 `HashMap<TaskKey, JoinHandle>`。复杂模块可以提供自定义策略函数；简单模块只使用预置策略。
+框架负责原子准入、在途索引、订阅者、并发配额、协作取消和完成通知：对象空闲时启动，目标 Workflow 相同时合并，目标不同时协作替换。领域既不读取 Pending/Running/Replacement，也不管理 `HashMap<TaskKey, JoinHandle>`。普通对象写操作选择 `Enqueue`；真正的多对象协调由一个明确的协调领域实现。
 
 ### 14.3 Service Runtime 契约
 
@@ -746,7 +757,7 @@ enum Admission {
 Service Runtime
 ├── Control Channel：Pause / Resume / Drain / Stop
 ├── Business Channel：Query / Call / Submit
-├── Admission Registry：互斥、合并、替换、排队、限流
+├── ActorCell Registry（私有）：互斥、合并、协作替换、排队、限流
 ├── Workflow Set：被统一 poll 的业务 Future
 ├── Task Registry：运行时执行尝试与父子关系
 ├── Domain State：仅本 Service 可修改
@@ -775,14 +786,15 @@ Service Client 不负责判断业务冲突，也不拥有 Task。Task 只是 Run
 - channel 和 oneshot 样板；
 - 请求到方法的分发表和 Future 集合轮询；
 - Task 创建、父子关系、取消传播与生命周期；
-- 在途索引、等待者和并发配额；
+- ActorCell、在途索引、等待者和并发配额；
+- Start/Join/CancelThenStart 的机械选择；
 - Trace、打点和服务观测；
 - 服务停止时的 Future 清理。
 
 框架不应隐藏：
 
 - 业务提交顺序；
-- 对象冲突关系；
+- 对象键、目标 Workflow 和高级多对象冲突关系；
 - 数据安全不变量；
 - 失败是否可补偿；
 - 局部不可逆提交点；
@@ -835,7 +847,7 @@ Service Client 不负责判断业务冲突，也不拥有 Task。Task 只是 Run
 8. 哪些非稳态领域事实需要持久化，以及如何由 Reconcile 接管；
 9. Operation Context/CausalGraph 的观测记录、保留与查询模型；
 10. MemberDisk 可逆排空、局部提交点和下游稳定结果协议；
-11. Service Runtime、显式 Service Client/facade、Admission Registry 的生产化；
+11. Service Runtime、显式 Service Client/facade、隐藏 ActorCell 的生产化；
 12. 首阶段串行运行时及安全并行演进；
 13. 使用状态空间探索或 TLA+ 验证关键安全不变量的可行性。
 
@@ -846,8 +858,8 @@ Pool 管控面首先是一个持续接收事实、维护决策并驱动现实收
 本文建议采用以下统一判断：
 
 ```text
-对象状态机回答：现在是什么、允许做什么
-领域策略回答：是否合并、互斥、替换、拒绝
+对象状态机回答：现在是什么、下一状态是什么、需要哪个Workflow
+Runtime ActorCell回答：目标Workflow如何启动、合并或协作替换
 领域Workflow回答：跨领域长过程按什么顺序完成
 Reconcile回答：失败或切主后如何重新收敛
 Operation Context回答：这次影响为何发生、属于谁、如何关联
@@ -855,7 +867,7 @@ Task Attempt回答：本次由什么执行实例驱动Future
 Runtime回答：Future如何被并发驱动、强制清理和观测
 ```
 
-因此，Scheduler 和 Task 不应成为业务模型的中心；它们是承载业务模型的执行基础。Pool 是隔离边界，领域对象是事实载体，状态机是唯一业务决策核心，定义在 Service 上的自然工作流是过程表达，Operation Context 是稳定因果身份，CausalGraph 是可解释性基础，Reconcile 是恢复保障。框架的价值不是统一所有业务，而是统一通信、准入、结构化并发、取消传播和观测这些重复机制，使开发者把主要精力放在业务步骤与不变量上。
+因此，Scheduler、Actor 和 Task 不应成为业务模型的中心；它们是承载业务模型的执行基础。Pool 是隔离边界，领域对象是事实载体，状态机是唯一业务决策核心，定义在 Service 上的自然工作流是过程表达，Operation Context 是稳定因果身份，CausalGraph 是可解释性基础，Reconcile 是恢复保障。框架的价值不是统一所有业务，而是隐藏通信、对象串行化、结构化并发、取消传播和观测这些重复机制，使开发者把主要精力放在状态迁移、业务步骤与不变量上。
 
 ## 参考资料
 

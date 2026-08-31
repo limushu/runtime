@@ -77,7 +77,7 @@ Pool
 └── Reconcile
 ```
 
-`Pool` 不叫 `PoolRuntime`：前者是业务概念，后者只是可复用的执行机制。当前每个领域 Service 一个根 task；逻辑对象 Actor 和 ObjectSlot 都不额外创建 task。
+`Pool` 不叫 `PoolRuntime`：前者是业务概念，后者只是可复用的执行机制。当前每个领域 Service 一个根 task；Runtime 内部的虚拟 ActorCell 不额外创建 task。
 
 ### PoolCore
 
@@ -132,7 +132,7 @@ Workflow 优先实现为所属 Service 上的自然 `async fn`。Operation Conte
 
 - 独立的控制通道与业务通道；
 - 请求到 Service 方法的静态分发；
-- 对象级 Admission Registry，执行互斥、合并、替换、排队和限流；
+- 私有 ActorCell，根据状态机声明的目标 Workflow 执行互斥、合并、协作替换、排队和限流；
 - 统一 poll Workflow Future，并维护 Task Attempt 父子关系；
 - Service 的 Pause、Resume、Drain、Stop 生命周期；
 - Idle/Busy、队列、阻塞、进度和 Trace 观测；
@@ -149,14 +149,13 @@ self.virtual_disks.evacuate_member_disk(&context, disk).await?;
 
 命令枚举、响应枚举、channel 和 oneshot 对领域外部不可见。业务代码不通过 Task 发起跨服务通信，也不直接管理 `JoinHandle`。
 
-### MemberDisk 逻辑 Actor 与 ObjectSlot
+### MemberDisk 对象与隐藏 ActorCell
 
-两者解决不同问题：
-
-- `MemberDiskActor` 是领域对象：拥有完整 `MemberDiskRecord`、最新 DiskMap 观测和状态图决策；
-- `ObjectSlot` 是 Runtime 执行槽：拥有当前意图、订阅者、替代意图和等待队列；
-- Runtime 调用 Actor 的准入决策，再由 ObjectSlot 原子执行 `Start/Join/Queue/Replace`；
-- 一个盘一个逻辑 Actor，但不是一个盘一个 Tokio task/mailbox。
+- `MemberDisk` 是领域对象：拥有完整 `MemberDiskRecord` 与最新 DiskMap 观测；
+- 纯状态机只根据对象投影和事件返回 `Transition::to(...).ensure(Workflow)`；
+- `ActorCell` 是 Runtime 私有执行状态，拥有当前意图、订阅者、替代意图和等待队列；
+- 相同目标 Workflow 自动合并，不同目标 Workflow 自动协作替换；
+- 普通领域代码不感知 ActorCell，也不为每盘创建 Tokio task/mailbox。
 
 ### PoolView
 
@@ -236,7 +235,7 @@ Types -> Config -> Repository/Ports -> Domain Service -> Runtime -> Interface
 - `PoolManager -> Pool -> Domain Service` 的多 Pool 装配与路由；
 - 每 Service 一个根 task，并使用 `FuturesUnordered` poll 多个 Workflow Future；
 - `StateCell` 只允许同步闭包访问，无法把锁 Guard 跨过 `.await`；
-- MemberDisk 逻辑 Actor 与 Runtime ObjectSlot 的职责分离；
+- MemberDisk 对象/状态机与 Runtime 私有 ActorCell 的职责分离；
 - 自然 `async fn` Workflow、显式领域 facade，以及替代意图等待旧 Future 稳定退出。
 
 仍待验证的是 Tier/Partition 并行化、完整 VD/BG 恢复语义和真实 SDB 条件写适配器，而不是重新引入隐藏路由或每对象 task。

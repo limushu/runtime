@@ -1,14 +1,14 @@
+use super::actor_cell::{ActorCell, Intent, ReplaceOutcome, Subscriber, SubscriberGroup};
 use super::container::{
     ControlHandle, ControlRequest, ManagedService, Reply, ResponseOf, RuntimeConfig,
 };
-use super::object_slot::{Intent, ObjectSlot, ReplaceOutcome, Subscriber, SubscriberGroup};
 use crate::client::BusinessEnvelope;
 use crate::context::CancellationScope;
 use crate::observation::{ObservationHub, TaskOutcome};
 use crate::{
-    Activity, Admission, CancelCause, ObjectActivity, ObjectKey, ObservationEvent, OrphanPolicy,
-    RequestRoute, RuntimeError, RuntimeResult, Service, ServiceClient, ServiceId, ServiceLifecycle,
-    ServiceSnapshot, TaskAttemptId, WorkflowContext,
+    Activity, CancelCause, ObjectKey, ObservationEvent, OrphanPolicy, RequestPlan, RuntimeError,
+    RuntimeResult, Service, ServiceClient, ServiceId, ServiceLifecycle, ServiceSnapshot,
+    TaskAttemptId, WorkflowContext,
 };
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -43,7 +43,7 @@ pub(super) struct ServiceLoop<S: Service> {
     business_rx: mpsc::Receiver<BusinessEnvelope<S::Request>>,
     control_rx: mpsc::Receiver<ControlRequest>,
     running: FuturesUnordered<BoxFuture<'static, Completion<ResponseOf<S>>>>,
-    slots: HashMap<ObjectKey, ObjectSlot<S>>,
+    actors: HashMap<ObjectKey, ActorCell<S>>,
     ready: VecDeque<ObjectKey>,
     ready_set: HashSet<ObjectKey>,
     untracked_in_flight: usize,
@@ -82,7 +82,7 @@ impl<S: Service> ServiceLoop<S> {
             business_rx,
             control_rx,
             running: FuturesUnordered::new(),
-            slots: HashMap::new(),
+            actors: HashMap::new(),
             ready: VecDeque::new(),
             ready_set: HashSet::new(),
             untracked_in_flight: 0,
@@ -165,74 +165,63 @@ impl<S: Service> ServiceLoop<S> {
             }
         }
 
-        let route = catch_unwind(AssertUnwindSafe(|| self.service.route(&envelope.request)));
-        match route {
-            Ok(RequestRoute::Untracked) => self.launch_untracked(envelope),
-            Ok(RequestRoute::Workflow(meta)) => self.admit_intent(Intent::new(envelope, meta)),
+        let plan = catch_unwind(AssertUnwindSafe(|| self.service.plan(&envelope.request)));
+        match plan {
+            Ok(Ok(RequestPlan::Inline)) => self.launch_untracked(envelope),
+            Ok(Ok(RequestPlan::Ensure(meta))) => self.ensure_intent(Intent::new(envelope, meta)),
+            Ok(Ok(RequestPlan::Enqueue(meta))) => self.enqueue_intent(Intent::new(envelope, meta)),
+            Ok(Ok(RequestPlan::Complete(response))) => {
+                let _ = envelope.reply.send(Ok(response));
+            }
+            Ok(Ok(RequestPlan::Reject { reason })) => {
+                let _ = envelope
+                    .reply
+                    .send(Err(RuntimeError::Rejected(reason.to_string())));
+            }
+            Ok(Err(error)) => {
+                let _ = envelope.reply.send(Err(error));
+            }
             Err(panic) => {
                 let _ = envelope.reply.send(Err(panic_error(panic)));
             }
         }
     }
 
-    fn admit_intent(&mut self, intent: Intent<S>) {
-        let activity = self
-            .slots
-            .get(&intent.meta.key)
-            .map(ObjectSlot::activity)
-            .unwrap_or(ObjectActivity::Idle);
-        let decision = catch_unwind(AssertUnwindSafe(|| {
-            self.service
-                .admit(&intent.origin, &intent.request, &activity)
-        }));
-        match decision {
-            Ok(Ok(decision)) => self.apply_admission(intent, decision),
-            Ok(Err(error)) => Self::reply_intent(intent, Err(error)),
-            Err(panic) => Self::reply_intent(intent, Err(panic_error(panic))),
+    fn ensure_intent(&mut self, intent: Intent<S>) {
+        let key = intent.meta.key.clone();
+        let Some(actor) = self.actors.get(&key) else {
+            self.start_or_queue(intent);
+            return;
+        };
+        if actor.is_idle() {
+            self.start_or_queue(intent);
+        } else if actor.targets(&intent.meta.kind) {
+            self.join_intent(intent);
+        } else {
+            let cause = CancelCause::new(format!(
+                "object {} now requires workflow {:?}",
+                key, intent.meta.kind
+            ));
+            self.replace_intent(intent, cause);
         }
     }
 
-    fn apply_admission(&mut self, intent: Intent<S>, decision: Admission<ResponseOf<S>>) {
-        let key = intent.meta.key.clone();
-        match decision {
-            Admission::Start => {
-                let busy = self.slots.get(&key).is_some_and(|slot| !slot.is_idle());
-                if busy {
-                    Self::reply_intent(
-                        intent,
-                        Err(RuntimeError::Rejected(
-                            "domain returned Start for a busy object slot".into(),
-                        )),
-                    );
-                } else {
-                    self.start_or_queue(intent);
-                }
-            }
-            Admission::Join => self.join_intent(intent),
-            Admission::Queue => {
-                if self.slots.get(&key).is_none_or(ObjectSlot::is_idle) {
-                    Self::reply_intent(
-                        intent,
-                        Err(RuntimeError::Rejected(
-                            "domain returned Queue for an idle object slot".into(),
-                        )),
-                    );
-                } else {
-                    self.queue_intent(intent, true);
-                }
-            }
-            Admission::Replace { cause } => self.replace_intent(intent, cause),
-            Admission::Complete(response) => Self::reply_intent(intent, Ok(response)),
-            Admission::Reject { reason } => {
-                Self::reply_intent(intent, Err(RuntimeError::Rejected(reason.to_string())))
-            }
+    fn enqueue_intent(&mut self, intent: Intent<S>) {
+        let busy = self
+            .actors
+            .get(&intent.meta.key)
+            .is_some_and(|actor| !actor.is_idle());
+        if busy {
+            self.queue_intent(intent);
+        } else {
+            self.start_or_queue(intent);
         }
     }
 
     fn join_intent(&mut self, intent: Intent<S>) {
         let key = intent.meta.key.clone();
-        let joined = match self.slots.get_mut(&key) {
-            Some(slot) => slot.join(intent),
+        let joined = match self.actors.get_mut(&key) {
+            Some(actor) => actor.join(intent),
             None => Err(Box::new(intent)),
         };
         match joined {
@@ -249,7 +238,7 @@ impl<S: Service> ServiceLoop<S> {
             Err(intent) => Self::reply_intent(
                 *intent,
                 Err(RuntimeError::Internal(
-                    "domain selected Join but no matching intent exists".into(),
+                    "runtime inferred a join without a matching workflow".into(),
                 )),
             ),
         }
@@ -258,11 +247,11 @@ impl<S: Service> ServiceLoop<S> {
     fn replace_intent(&mut self, intent: Intent<S>, cause: CancelCause) {
         let operation_id = intent.operation_id();
         let object = intent.meta.key.clone();
-        let Some(slot) = self.slots.get_mut(&object) else {
+        let Some(actor) = self.actors.get_mut(&object) else {
             self.start_or_queue(intent);
             return;
         };
-        match slot.replace(intent, cause.clone()) {
+        match actor.replace(intent, cause.clone()) {
             Ok(ReplaceOutcome::CancelRequested(notice)) => {
                 self.publish_queued(operation_id, object);
                 self.observation
@@ -295,16 +284,16 @@ impl<S: Service> ServiceLoop<S> {
         if self.active_count() < self.config.max_active_workflows {
             self.launch_managed(intent);
         } else {
-            self.queue_intent(intent, false);
+            self.queue_intent(intent);
         }
     }
 
-    fn queue_intent(&mut self, intent: Intent<S>, reconsider: bool) {
+    fn queue_intent(&mut self, intent: Intent<S>) {
         let key = intent.meta.key.clone();
         let object_pending = self
-            .slots
+            .actors
             .get(&key)
-            .map(ObjectSlot::pending_count)
+            .map(ActorCell::pending_count)
             .unwrap_or_default();
         if self.pending_count() >= self.config.max_pending_requests
             || object_pending >= self.config.max_pending_per_object
@@ -318,10 +307,10 @@ impl<S: Service> ServiceLoop<S> {
 
         let operation_id = intent.operation_id();
         let ready = self
-            .slots
+            .actors
             .entry(key.clone())
-            .or_insert_with(|| ObjectSlot::new(key.clone()))
-            .queue(intent, reconsider);
+            .or_insert_with(|| ActorCell::new(key.clone()))
+            .queue(intent);
         self.publish_queued(operation_id, key.clone());
         if ready {
             self.mark_ready(key);
@@ -379,11 +368,11 @@ impl<S: Service> ServiceLoop<S> {
         let call_id = context.call_id();
         let orphan_policy = meta.orphan_policy;
         let subscriber_group = self
-            .slots
+            .actors
             .entry(key.clone())
-            .or_insert_with(|| ObjectSlot::new(key.clone()))
+            .or_insert_with(|| ActorCell::new(key.clone()))
             .activate(meta.clone(), task_attempt_id, context.clone(), subscribers)
-            .expect("admission launches only an idle object slot");
+            .expect("the runtime launches only an idle actor cell");
 
         self.observation.publish(ObservationEvent::TaskStarted {
             service_id: self.service_id.clone(),
@@ -420,9 +409,10 @@ impl<S: Service> ServiceLoop<S> {
                 task_attempt_id,
                 context,
             } => {
-                let Some((settled, empty)) = self.slots.get_mut(&key).and_then(|slot| {
-                    slot.settle(task_attempt_id)
-                        .map(|settled| (settled, slot.is_empty()))
+                let Some((settled, empty)) = self.actors.get_mut(&key).and_then(|actor| {
+                    actor
+                        .settle(task_attempt_id)
+                        .map(|settled| (settled, actor.is_empty()))
                 }) else {
                     return;
                 };
@@ -431,7 +421,7 @@ impl<S: Service> ServiceLoop<S> {
                     self.mark_ready(key.clone());
                 }
                 if empty {
-                    self.slots.remove(&key);
+                    self.actors.remove(&key);
                 }
 
                 let outcome = match &completion.result {
@@ -467,15 +457,10 @@ impl<S: Service> ServiceLoop<S> {
                 break;
             };
             self.ready_set.remove(&key);
-            let Some(pending) = self.slots.get_mut(&key).and_then(ObjectSlot::take_ready) else {
+            let Some(pending) = self.actors.get_mut(&key).and_then(ActorCell::take_ready) else {
                 continue;
             };
-
-            if pending.reconsider {
-                self.admit_intent(pending.intent);
-            } else {
-                self.launch_managed(pending.intent);
-            }
+            self.launch_managed(pending);
         }
     }
 
@@ -522,8 +507,8 @@ impl<S: Service> ServiceLoop<S> {
     }
 
     fn cancel_active(&self, cause: CancelCause) {
-        for slot in self.slots.values() {
-            if let Some(notice) = slot.request_cancel(cause.clone()) {
+        for actor in self.actors.values() {
+            if let Some(notice) = actor.request_cancel(cause.clone()) {
                 self.observation
                     .publish(ObservationEvent::TaskCancelRequested {
                         service_id: self.service_id.clone(),
@@ -536,20 +521,23 @@ impl<S: Service> ServiceLoop<S> {
     }
 
     fn reject_pending(&mut self, error: RuntimeError) {
-        for slot in self.slots.values_mut() {
-            Self::reply_all(slot.reject_pending(), Err(error.clone()));
+        for actor in self.actors.values_mut() {
+            Self::reply_all(actor.reject_pending(), Err(error.clone()));
         }
         self.ready.clear();
         self.ready_set.clear();
-        self.slots.retain(|_, slot| !slot.is_empty());
+        self.actors.retain(|_, actor| !actor.is_empty());
     }
 
     fn active_count(&self) -> usize {
-        self.slots.values().filter(|slot| slot.is_active()).count()
+        self.actors
+            .values()
+            .filter(|actor| actor.is_active())
+            .count()
     }
 
     fn pending_count(&self) -> usize {
-        self.slots.values().map(ObjectSlot::pending_count).sum()
+        self.actors.values().map(ActorCell::pending_count).sum()
     }
 
     fn finish_lifecycle_if_ready(&mut self) {

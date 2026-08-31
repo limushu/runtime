@@ -4,9 +4,8 @@ use super::protocol::{
 use crate::kernel::{MemberDiskId, PoolId};
 use async_trait::async_trait;
 use control_runtime::{
-    spawn_service, Admission, ManagedService, ObjectActivity, ObjectKey, RequestRoute,
-    RuntimeConfig, RuntimeError, RuntimeResult, Service, ServiceClient, ServiceId, StateCell,
-    WorkflowContext, WorkflowMeta,
+    spawn_service, ManagedService, ObjectKey, RequestPlan, RuntimeConfig, RuntimeError,
+    RuntimeResult, Service, ServiceClient, ServiceId, StateCell, WorkflowContext, WorkflowMeta,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,29 +122,19 @@ impl Service for VirtualDiskWorker {
         self.id.clone()
     }
 
-    fn route(&self, request: &Self::Request) -> RequestRoute<Self::WorkflowKind> {
-        match request {
-            VirtualDiskCommand::Stats => RequestRoute::Untracked,
+    fn plan(
+        &self,
+        request: &Self::Request,
+    ) -> RuntimeResult<RequestPlan<Self::WorkflowKind, VirtualDiskResponse>> {
+        Ok(match request {
+            VirtualDiskCommand::Stats => RequestPlan::Inline,
             VirtualDiskCommand::EvacuateMemberDisk(disk) => {
-                RequestRoute::Workflow(WorkflowMeta::object(
+                RequestPlan::Ensure(WorkflowMeta::object(
                     ObjectKey::new(format!("member-disk/{disk}")),
                     VirtualDiskWorkflowKind::EvacuateMemberDisk,
                     format!("evacuate all BGs on {disk}"),
                 ))
             }
-        }
-    }
-
-    fn admit(
-        &self,
-        _context: &WorkflowContext,
-        _request: &Self::Request,
-        activity: &ObjectActivity<Self::WorkflowKind>,
-    ) -> RuntimeResult<Admission<VirtualDiskResponse>> {
-        Ok(if activity.is_idle() {
-            Admission::Start
-        } else {
-            Admission::Join
         })
     }
 

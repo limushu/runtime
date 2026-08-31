@@ -16,12 +16,12 @@ package "Monitor 全局层" {
 package "Pool[PoolId]" {
   component "PoolMetadata\nCRUD + lifecycle" as PoolMetadata
   component PoolCore
-  component "MemberDisk Domain\nEntity + Logical Actor" as MemberDiskDomain
+  component "MemberDisk Domain\nObject + StateMachine" as MemberDiskDomain
   component "Tier Domain" as TierDomain
   component "VirtualDisk Domain" as VdDomain
   component "PoolNode Domain" as NodeDomain
   component "Domain Workflows\n位于所属Service" as Workflow
-  component "Service Runtime\n每Service一个根task" as ServiceRuntime
+  component "Service Runtime\n隐藏ActorCell / 每Service一个根task" as ServiceRuntime
   component PoolView
   component "Explicit Service Facades\n明确目标实例" as Facades
 }
