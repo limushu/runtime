@@ -101,10 +101,10 @@ Operation 观测记录不能保存决定流程走向的独立 `phase/status` 真
 | --- | --- | --- |
 | Pool UUID、名称、配置、阈值 | SDB | 加载并提供决策上下文 |
 | 普通盘所属 Pool | SDB 中的业务决策；物理资源由 Monitor/DiskMap 管理 | 校验并构造 MemberDisk |
-| MemberDisk 身份映射、Pool/Tier、介质、容量、故障域 | SDB 中的 `MemberDiskRecord`；物理盘基础事实由 DiskMap 校验 | `MemberDisk` 持有的领域实体 |
+| MemberDisk 身份映射、Pool/Tier、介质、容量、故障域 | SDB 中持久化的 `MemberDisk` 决策字段；物理盘基础事实由 DiskMap 校验 | `MemberDisk` 持有的领域实体 |
 | MemberDisk 空间位图 | SDB | 分配决策的内存工作集 |
 | MemberDisk 物理 UP/DOWN | DiskMap 当前观测 | `MemberDisk` 中的瞬时事实，不覆盖 SDB 决策 |
-| MemberDisk Allocation/Membership | SDB 中的 `MemberDiskRecord` | `MemberDisk` 中的决策投影 |
+| MemberDisk Allocation/Membership | SDB 中持久化的 `MemberDisk` 决策字段 | `MemberDisk` 中的决策字段 |
 | MemberDisk UA/DA/DI/UI/Removed | 由物理观测、Allocation、Membership 派生 | 只读运行投影，不是第二份核心元数据 |
 | MemberDisk 在途工作流 | Service Runtime 私有 `ActorCell` | 临时执行信息，不进入状态机或 SDB 业务真相 |
 | VD 类型、冗余、ChunkSize | SDB | VD 决策上下文 |

@@ -1,4 +1,4 @@
-use super::machine::{MemberDiskInput, MemberDiskMachine, MemberDiskTransition};
+use super::machine::{MemberDiskChange, MemberDiskEvent, MemberDiskMachine, MemberDiskTransition};
 use crate::kernel::{
     BlkId, ByteCount, FailureDomainId, MemberDiskId, PhysicalDiskId, PoolId, TierId,
 };
@@ -69,8 +69,8 @@ pub enum DiskSharing {
     SharedCache,
 }
 
-/// Operational projection used by the statechart. It is not the MemberDisk
-/// entity and is never the only persisted metadata.
+/// Operational projection computed from the MemberDisk object. It is never
+/// stored as a second source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberDiskState {
     Ua,
@@ -107,52 +107,6 @@ impl MemberDiskState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskSpec {
-    pub id: MemberDiskId,
-    pub physical_disk: PhysicalDiskId,
-    pub pool: PoolId,
-    pub tier: TierId,
-    pub media_class: MediaClass,
-    pub capacity: ByteCount,
-    pub failure_domains: Vec<FailureDomainId>,
-    pub sharing: DiskSharing,
-}
-
-impl MemberDiskSpec {
-    pub fn new(
-        id: MemberDiskId,
-        physical_disk: PhysicalDiskId,
-        pool: PoolId,
-        tier: TierId,
-        media_class: MediaClass,
-        capacity: ByteCount,
-        failure_domains: Vec<FailureDomainId>,
-    ) -> Self {
-        Self {
-            id,
-            physical_disk,
-            pool,
-            tier,
-            media_class,
-            capacity,
-            failure_domains,
-            sharing: DiskSharing::Exclusive,
-        }
-    }
-
-    pub fn shared_cache(mut self) -> Self {
-        self.sharing = DiskSharing::SharedCache;
-        self
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MemberDiskPatch {
-    pub tier: Option<TierId>,
-    pub failure_domains: Option<Vec<FailureDomainId>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationBitmap {
     total_blocks: u64,
     words: Vec<u64>,
@@ -174,7 +128,7 @@ impl AllocationBitmap {
         self.words.iter().map(|word| word.count_ones() as u64).sum()
     }
 
-    pub(crate) fn allocate_one(&mut self) -> RuntimeResult<BlkId> {
+    fn allocate_one(&mut self) -> RuntimeResult<BlkId> {
         for index in 0..self.total_blocks {
             let word = (index / 64) as usize;
             let bit = index % 64;
@@ -186,7 +140,7 @@ impl AllocationBitmap {
         Err(RuntimeError::Rejected("member disk has no free BLK".into()))
     }
 
-    pub(crate) fn release(&mut self, blk: &BlkId) -> RuntimeResult<()> {
+    fn release(&mut self, blk: &BlkId) -> RuntimeResult<()> {
         let index = blk
             .as_str()
             .parse::<u64>()
@@ -208,39 +162,96 @@ impl AllocationBitmap {
     }
 }
 
-/// Persisted decision record owned exclusively by the MemberDisk domain.
+/// The one authoritative in-memory business object for a member disk.
+///
+/// Persisted decisions and the latest DiskMap observation live together here.
+/// `state()` is derived; neither the state machine nor the hidden ActorCell
+/// keeps a second copy of this business state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskRecord {
-    spec: MemberDiskSpec,
+pub struct MemberDisk {
+    id: MemberDiskId,
+    physical_disk: PhysicalDiskId,
+    pool: PoolId,
+    tier: TierId,
+    media_class: MediaClass,
+    capacity: ByteCount,
+    failure_domains: Vec<FailureDomainId>,
+    sharing: DiskSharing,
+    physical: PhysicalState,
     allocation_state: AllocationState,
     membership_state: MembershipState,
     allocation: AllocationBitmap,
     revision: u64,
 }
 
-impl MemberDiskRecord {
-    pub fn new(spec: MemberDiskSpec) -> Self {
-        let block_size = BlkSize::for_capacity(spec.capacity).bytes().get();
-        let total_blocks = spec.capacity.get() / block_size;
+impl MemberDisk {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: MemberDiskId,
+        physical_disk: PhysicalDiskId,
+        pool: PoolId,
+        tier: TierId,
+        media_class: MediaClass,
+        capacity: ByteCount,
+        failure_domains: Vec<FailureDomainId>,
+    ) -> Self {
+        let block_size = BlkSize::for_capacity(capacity).bytes().get();
         Self {
-            spec,
+            id,
+            physical_disk,
+            pool,
+            tier,
+            media_class,
+            capacity,
+            failure_domains,
+            sharing: DiskSharing::Exclusive,
+            physical: PhysicalState::Down,
             allocation_state: AllocationState::Active,
             membership_state: MembershipState::Member,
-            allocation: AllocationBitmap::new(total_blocks),
+            allocation: AllocationBitmap::new(capacity.get() / block_size),
             revision: 1,
         }
     }
 
+    pub fn shared_cache(mut self) -> Self {
+        self.sharing = DiskSharing::SharedCache;
+        self
+    }
+
     pub fn id(&self) -> &MemberDiskId {
-        &self.spec.id
+        &self.id
+    }
+
+    pub fn physical_disk(&self) -> &PhysicalDiskId {
+        &self.physical_disk
     }
 
     pub fn pool(&self) -> &PoolId {
-        &self.spec.pool
+        &self.pool
     }
 
-    pub fn spec(&self) -> &MemberDiskSpec {
-        &self.spec
+    pub fn tier(&self) -> &TierId {
+        &self.tier
+    }
+
+    pub fn media_class(&self) -> &MediaClass {
+        &self.media_class
+    }
+
+    pub fn capacity(&self) -> ByteCount {
+        self.capacity
+    }
+
+    pub fn failure_domains(&self) -> &[FailureDomainId] {
+        &self.failure_domains
+    }
+
+    pub fn sharing(&self) -> DiskSharing {
+        self.sharing
+    }
+
+    pub fn physical_state(&self) -> PhysicalState {
+        self.physical
     }
 
     pub fn allocation_state(&self) -> AllocationState {
@@ -251,39 +262,74 @@ impl MemberDiskRecord {
         self.membership_state
     }
 
-    pub fn allocation(&self) -> &AllocationBitmap {
-        &self.allocation
+    pub fn state(&self) -> MemberDiskState {
+        MemberDiskState::project(self.physical, self.allocation_state, self.membership_state)
+    }
+
+    pub fn block_size(&self) -> BlkSize {
+        BlkSize::for_capacity(self.capacity)
+    }
+
+    pub fn total_blocks(&self) -> u64 {
+        self.allocation.total_blocks()
+    }
+
+    pub fn allocated_blocks(&self) -> u64 {
+        self.allocation.allocated_blocks()
     }
 
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub(crate) fn apply_patch(&mut self, patch: MemberDiskPatch) {
-        if let Some(tier) = patch.tier {
-            self.spec.tier = tier;
+    pub(crate) fn apply_event(
+        &mut self,
+        event: MemberDiskEvent,
+    ) -> RuntimeResult<MemberDiskTransition> {
+        let from = self.state();
+        let decision = MemberDiskMachine::transition(from, event)?;
+        let (expected, effect, change) = decision.into_parts();
+        if let Some(change) = change {
+            self.apply_change(change);
         }
-        if let Some(failure_domains) = patch.failure_domains {
-            self.spec.failure_domains = failure_domains;
+        let to = self.state();
+        if to != expected {
+            return Err(RuntimeError::Internal(format!(
+                "state machine expected {expected:?}, MemberDisk projected {to:?}"
+            )));
         }
-        self.revision += 1;
+        Ok(MemberDiskTransition {
+            from,
+            event,
+            to,
+            effect,
+        })
     }
 
-    pub(crate) fn set_allocation_state(&mut self, state: AllocationState) {
-        if self.allocation_state != state {
-            self.allocation_state = state;
-            self.revision += 1;
-        }
-    }
-
-    pub(crate) fn set_membership_state(&mut self, state: MembershipState) {
-        if self.membership_state != state {
-            self.membership_state = state;
-            self.revision += 1;
+    fn apply_change(&mut self, change: MemberDiskChange) {
+        match change {
+            MemberDiskChange::ObservePhysical(state) => self.physical = state,
+            MemberDiskChange::SetAllocation(state) if self.allocation_state != state => {
+                self.allocation_state = state;
+                self.revision += 1;
+            }
+            MemberDiskChange::SetMembership(state) if self.membership_state != state => {
+                self.membership_state = state;
+                self.revision += 1;
+            }
+            MemberDiskChange::SetAllocation(_) | MemberDiskChange::SetMembership(_) => {}
         }
     }
 
     pub(crate) fn allocate_one(&mut self) -> RuntimeResult<BlkId> {
+        if !matches!(self.allocation_state, AllocationState::Active)
+            || !matches!(self.physical, PhysicalState::Up)
+            || !matches!(self.membership_state, MembershipState::Member)
+        {
+            return Err(RuntimeError::Rejected(
+                "member disk is not currently allocatable".into(),
+            ));
+        }
         let blk = self.allocation.allocate_one()?;
         self.revision += 1;
         Ok(blk)
@@ -294,238 +340,66 @@ impl MemberDiskRecord {
         self.revision += 1;
         Ok(())
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskSnapshot {
-    pub spec: MemberDiskSpec,
-    pub physical_state: PhysicalState,
-    pub allocation_state: AllocationState,
-    pub membership_state: MembershipState,
-    pub operational_state: MemberDiskState,
-    pub block_size: BlkSize,
-    pub total_blocks: u64,
-    pub allocated_blocks: u64,
-    pub revision: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PlannedMemberDiskMutation {
-    expected_revision: u64,
-    record: MemberDiskRecord,
-    physical: PhysicalState,
-    transition: MemberDiskTransition,
-    persist_record: bool,
-}
-
-impl PlannedMemberDiskMutation {
-    pub(crate) fn record(&self) -> &MemberDiskRecord {
-        &self.record
-    }
-
-    pub(crate) fn requires_persistence(&self) -> bool {
-        self.persist_record
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PlannedRecordUpdate {
-    expected_revision: u64,
-    record: MemberDiskRecord,
-}
-
-impl PlannedRecordUpdate {
-    pub(crate) fn record(&self) -> &MemberDiskRecord {
-        &self.record
-    }
-}
-
-/// The complete in-memory MemberDisk object used by its state machine.
-/// It is business state, not an actor runtime, task or mailbox.
-#[derive(Debug, Clone)]
-pub(crate) struct MemberDisk {
-    record: MemberDiskRecord,
-    physical: PhysicalState,
-}
-
-impl MemberDisk {
-    pub(crate) fn restore(record: MemberDiskRecord) -> Self {
-        Self {
-            record,
-            physical: PhysicalState::Down,
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> MemberDiskSnapshot {
-        let block_size = BlkSize::for_capacity(self.record.spec().capacity);
-        MemberDiskSnapshot {
-            spec: self.record.spec().clone(),
-            physical_state: self.physical,
-            allocation_state: self.record.allocation_state(),
-            membership_state: self.record.membership_state(),
-            operational_state: self.state(),
-            block_size,
-            total_blocks: self.record.allocation().total_blocks(),
-            allocated_blocks: self.record.allocation().allocated_blocks(),
-            revision: self.record.revision(),
-        }
-    }
-
-    pub(crate) fn state(&self) -> MemberDiskState {
-        MemberDiskState::project(
-            self.physical,
-            self.record.allocation_state(),
-            self.record.membership_state(),
-        )
-    }
-
-    pub(crate) fn apply_physical(
+    pub(crate) fn commit_persisted(
         &mut self,
-        physical: PhysicalState,
-    ) -> RuntimeResult<MemberDiskTransition> {
-        let mutation = self.plan(MemberDiskInput::Physical(physical))?;
-        self.commit(mutation)
-    }
-
-    pub(crate) fn plan_patch(&self, patch: MemberDiskPatch) -> PlannedRecordUpdate {
-        let mut record = self.record.clone();
-        record.apply_patch(patch);
-        PlannedRecordUpdate {
-            expected_revision: self.record.revision(),
-            record,
-        }
-    }
-
-    pub(crate) fn plan_allocate(&self) -> RuntimeResult<(PlannedRecordUpdate, BlkId)> {
-        if !matches!(self.record.allocation_state(), AllocationState::Active)
-            || !matches!(self.physical, PhysicalState::Up)
-            || !matches!(self.record.membership_state(), MembershipState::Member)
-        {
-            return Err(RuntimeError::Rejected(
-                "member disk is not currently allocatable".into(),
-            ));
-        }
-        let mut record = self.record.clone();
-        let blk = record.allocate_one()?;
-        Ok((
-            PlannedRecordUpdate {
-                expected_revision: self.record.revision(),
-                record,
-            },
-            blk,
-        ))
-    }
-
-    pub(crate) fn plan_release(&self, blk: &BlkId) -> RuntimeResult<PlannedRecordUpdate> {
-        let mut record = self.record.clone();
-        record.release(blk)?;
-        Ok(PlannedRecordUpdate {
-            expected_revision: self.record.revision(),
-            record,
-        })
-    }
-
-    pub(crate) fn commit_record(&mut self, update: PlannedRecordUpdate) -> RuntimeResult<()> {
-        if self.record.revision() != update.expected_revision {
+        expected_revision: u64,
+        mut next: MemberDisk,
+    ) -> RuntimeResult<()> {
+        if self.revision != expected_revision {
             return Err(RuntimeError::Cancelled);
         }
-        self.record = update.record;
+        // DiskMap may have updated the observation while SDB was awaited.
+        // Accept the persisted decision without overwriting that newer fact.
+        next.physical = self.physical;
+        *self = next;
         Ok(())
     }
 
     pub(crate) fn can_delete(&self) -> bool {
-        matches!(self.record.membership_state(), MembershipState::Removed)
-            && self.record.allocation().allocated_blocks() == 0
+        matches!(self.membership_state, MembershipState::Removed)
+            && self.allocation.allocated_blocks() == 0
     }
 
-    pub(crate) fn plan(&self, input: MemberDiskInput) -> RuntimeResult<PlannedMemberDiskMutation> {
-        let transition = MemberDiskMachine::transition(self.state(), input)?;
-        let mut record = self.record.clone();
-        let mut physical = self.physical;
-        let persist_record = match input {
-            MemberDiskInput::Physical(value) => {
-                physical = value;
-                false
-            }
-            MemberDiskInput::DrainStarted => {
-                record.set_allocation_state(AllocationState::Inactive);
-                true
-            }
-            MemberDiskInput::DrainCompleted => {
-                record.set_membership_state(MembershipState::Removed);
-                true
-            }
-            MemberDiskInput::OnlineSettled => {
-                record.set_allocation_state(AllocationState::Active);
-                true
-            }
-        };
-        let projected = MemberDiskState::project(
-            physical,
-            record.allocation_state(),
-            record.membership_state(),
-        );
-        if projected != transition.to {
-            return Err(RuntimeError::Internal(format!(
-                "statechart projected {:?}, entity mutation projected {projected:?}",
-                transition.to
-            )));
-        }
-        Ok(PlannedMemberDiskMutation {
-            expected_revision: self.record.revision(),
-            record,
-            physical,
-            transition,
-            persist_record,
-        })
-    }
-
-    pub(crate) fn commit(
-        &mut self,
-        mutation: PlannedMemberDiskMutation,
-    ) -> RuntimeResult<MemberDiskTransition> {
-        if self.record.revision() != mutation.expected_revision {
-            return Err(RuntimeError::Cancelled);
-        }
-        let from = self.state();
-        self.record = mutation.record;
-        if matches!(mutation.transition.input, MemberDiskInput::Physical(_)) {
-            self.physical = mutation.physical;
-        }
-        let mut transition = mutation.transition;
-        transition.from = from;
-        transition.to = self.state();
-        Ok(transition)
+    /// Strip the external observation before a persistence adapter stores the
+    /// object. DiskMap will supply a fresh observation after cold restore.
+    pub(crate) fn without_physical_observation(mut self) -> Self {
+        self.physical = PhysicalState::Down;
+        self
     }
 }
 
 #[cfg(test)]
-mod object_tests {
+mod tests {
     use super::*;
 
     fn disk() -> MemberDisk {
-        let spec = MemberDiskSpec::new(
+        MemberDisk::new(
             MemberDiskId::new("md-1"),
             PhysicalDiskId::new("pd-1"),
             PoolId::new("pool-1"),
             TierId::new("tier-1"),
             MediaClass::new("ssd"),
-            ByteCount::new(1024 * 1024 * 1024),
+            ByteCount::new(ONE_GIB),
             Vec::new(),
-        );
-        MemberDisk::restore(MemberDiskRecord::new(spec))
+        )
     }
 
     #[test]
-    fn a_stable_record_commit_keeps_the_latest_physical_observation() {
+    fn persisted_commit_keeps_the_latest_physical_observation() {
         let mut disk = disk();
-        disk.apply_physical(PhysicalState::Down).unwrap();
-        let drain_started = disk.plan(MemberDiskInput::DrainStarted).unwrap();
-        disk.apply_physical(PhysicalState::Up).unwrap();
+        disk.apply_event(MemberDiskEvent::Physical(PhysicalState::Down))
+            .unwrap();
+        let expected_revision = disk.revision();
+        let mut draining = disk.clone();
+        draining.apply_event(MemberDiskEvent::DrainStarted).unwrap();
 
-        let transition = disk.commit(drain_started).unwrap();
-        assert_eq!(transition.to, MemberDiskState::Ui);
-        assert_eq!(disk.snapshot().physical_state, PhysicalState::Up);
-        assert_eq!(disk.snapshot().allocation_state, AllocationState::Inactive);
+        disk.apply_event(MemberDiskEvent::Physical(PhysicalState::Up))
+            .unwrap();
+        disk.commit_persisted(expected_revision, draining).unwrap();
+
+        assert_eq!(disk.state(), MemberDiskState::Ui);
+        assert_eq!(disk.physical_state(), PhysicalState::Up);
+        assert_eq!(disk.allocation_state(), AllocationState::Inactive);
     }
 }

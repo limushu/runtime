@@ -151,11 +151,13 @@ self.virtual_disks.evacuate_member_disk(&context, disk).await?;
 
 ### MemberDisk 对象与隐藏 ActorCell
 
-- `MemberDisk` 是领域对象：拥有完整 `MemberDiskRecord` 与最新 DiskMap 观测；
-- 纯状态机只根据对象投影和事件返回 `Transition::to(...).ensure(Workflow)`；
+- `MemberDisk` 是唯一领域对象：直接拥有持久化决策字段与最新 DiskMap 观测，不再拆出 Record/Snapshot；
+- 纯状态机只根据对象投影和事件返回 `Transition::to(...).change(...).ensure(Workflow)`；对象负责应用 `change` 并校验最终投影；
 - `ActorCell` 是 Runtime 私有执行状态，拥有当前意图、订阅者、替代意图和等待队列；
 - 相同目标 Workflow 自动合并，不同目标 Workflow 自动协作替换；
 - 普通领域代码不感知 ActorCell，也不为每盘创建 Tokio task/mailbox。
+
+因此逻辑上的 MemberDisk Actor 是 `MemberDisk` 与同一 `ObjectKey` 下私有 `ActorCell` 的组合。前者是长期业务真相，后者是按需出现、空闲即消失的动态执行载体；二者没有重复状态。
 
 ### PoolView
 

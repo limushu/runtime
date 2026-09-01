@@ -84,6 +84,22 @@ def verify_source_shape(violations: list[str]) -> None:
         if leaked_type in contract:
             violations.append(f"runtime contract leaks obsolete {leaked_type} API")
 
+    member_disk_model = (
+        pool / "domains" / "member_disk" / "model.rs"
+    ).read_text(encoding="utf-8")
+    for duplicate_model in (
+        "MemberDiskSpec",
+        "MemberDiskRecord",
+        "MemberDiskSnapshot",
+        "MemberDiskPatch",
+        "PlannedMemberDiskMutation",
+        "PlannedRecordUpdate",
+    ):
+        if duplicate_model in member_disk_model:
+            violations.append(
+                f"MemberDisk must remain the single business object; found {duplicate_model}"
+            )
+
     foundation_terms = ("MemberDisk", "VirtualDisk", "PoolNode", "BlkId", "PhysicalDiskId")
     for source in runtime.rglob("*.rs"):
         text = source.read_text(encoding="utf-8")

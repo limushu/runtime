@@ -1,5 +1,5 @@
 use super::model::{PoolLifecycle, PoolMetadata, PoolPatch, PoolSnapshot, PoolSpec};
-use crate::domains::member_disk::model::{MemberDiskRecord, MemberDiskSpec};
+use crate::domains::member_disk::model::MemberDisk;
 use crate::domains::member_disk::MemberDiskService;
 use crate::domains::pool_node::PoolNodeService;
 use crate::domains::virtual_disk::VirtualDiskService;
@@ -45,39 +45,38 @@ pub struct Pool {
 impl Pool {
     pub(crate) async fn create(
         spec: PoolSpec,
-        disks: Vec<MemberDiskSpec>,
+        disks: Vec<MemberDisk>,
         store: Arc<dyn ControlPlaneStore>,
         config: RuntimeConfig,
     ) -> RuntimeResult<Arc<Self>> {
-        if disks.iter().any(|disk| disk.pool != spec.id) {
+        if disks.iter().any(|disk| disk.pool() != &spec.id) {
             return Err(RuntimeError::Rejected(
                 "all initial MemberDisks must belong to the created Pool".into(),
             ));
         }
         let mut metadata = PoolMetadata::creating(spec);
         store.save_pool(metadata.clone()).await?;
-        let records: Vec<_> = disks.into_iter().map(MemberDiskRecord::new).collect();
-        for record in &records {
-            store.save_member_disk(record.clone()).await?;
+        for disk in &disks {
+            store.save_member_disk(disk.clone()).await?;
         }
         metadata.lifecycle = PoolLifecycle::Active;
         metadata.revision += 1;
         store.save_pool(metadata.clone()).await?;
-        Ok(Self::assemble(metadata, records, store, config))
+        Ok(Self::assemble(metadata, disks, store, config))
     }
 
     pub(crate) fn restore(
         metadata: PoolMetadata,
-        records: Vec<MemberDiskRecord>,
+        disks: Vec<MemberDisk>,
         store: Arc<dyn ControlPlaneStore>,
         config: RuntimeConfig,
     ) -> Arc<Self> {
-        Self::assemble(metadata, records, store, config)
+        Self::assemble(metadata, disks, store, config)
     }
 
     fn assemble(
         metadata: PoolMetadata,
-        records: Vec<MemberDiskRecord>,
+        disks: Vec<MemberDisk>,
         store: Arc<dyn ControlPlaneStore>,
         config: RuntimeConfig,
     ) -> Arc<Self> {
@@ -87,7 +86,7 @@ impl Pool {
             VirtualDiskService::spawn(&pool_id, config.clone());
         let (member_disks, member_disk_host) = MemberDiskService::spawn(
             pool_id,
-            records,
+            disks,
             store.clone(),
             pool_nodes.clone(),
             virtual_disks.clone(),

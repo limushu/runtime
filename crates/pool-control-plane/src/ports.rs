@@ -1,4 +1,4 @@
-use crate::domains::member_disk::model::MemberDiskRecord;
+use crate::domains::member_disk::model::MemberDisk;
 use crate::kernel::{MemberDiskId, PoolId};
 use crate::pool::model::PoolMetadata;
 use async_trait::async_trait;
@@ -17,15 +17,15 @@ pub trait ControlPlaneStore: Send + Sync + 'static {
     async fn save_pool(&self, metadata: PoolMetadata) -> RuntimeResult<()>;
     async fn delete_pool(&self, pool: &PoolId) -> RuntimeResult<()>;
 
-    async fn load_member_disks(&self, pool: &PoolId) -> RuntimeResult<Vec<MemberDiskRecord>>;
-    async fn save_member_disk(&self, record: MemberDiskRecord) -> RuntimeResult<()>;
+    async fn load_member_disks(&self, pool: &PoolId) -> RuntimeResult<Vec<MemberDisk>>;
+    async fn save_member_disk(&self, disk: MemberDisk) -> RuntimeResult<()>;
     async fn delete_member_disk(&self, pool: &PoolId, disk: &MemberDiskId) -> RuntimeResult<()>;
 }
 
 #[derive(Debug, Default)]
 struct MemoryState {
     pools: HashMap<PoolId, PoolMetadata>,
-    member_disks: HashMap<(PoolId, MemberDiskId), MemberDiskRecord>,
+    member_disks: HashMap<(PoolId, MemberDiskId), MemberDisk>,
 }
 
 /// Deterministic in-memory adapter used by the executable model and tests.
@@ -76,7 +76,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         Ok(())
     }
 
-    async fn load_member_disks(&self, pool: &PoolId) -> RuntimeResult<Vec<MemberDiskRecord>> {
+    async fn load_member_disks(&self, pool: &PoolId) -> RuntimeResult<Vec<MemberDisk>> {
         Ok(self
             .state
             .read()
@@ -88,13 +88,13 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .collect())
     }
 
-    async fn save_member_disk(&self, record: MemberDiskRecord) -> RuntimeResult<()> {
-        let key = (record.pool().clone(), record.id().clone());
+    async fn save_member_disk(&self, disk: MemberDisk) -> RuntimeResult<()> {
+        let key = (disk.pool().clone(), disk.id().clone());
         self.state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .member_disks
-            .insert(key, record);
+            .insert(key, disk.without_physical_observation());
         Ok(())
     }
 

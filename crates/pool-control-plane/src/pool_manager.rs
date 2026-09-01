@@ -1,6 +1,4 @@
-use crate::domains::member_disk::model::{
-    DiskSharing, MemberDiskSnapshot, MemberDiskSpec, PhysicalState,
-};
+use crate::domains::member_disk::model::{DiskSharing, MemberDisk, PhysicalState};
 use crate::kernel::{MemberDiskId, PhysicalDiskId, PoolId};
 use crate::pool::{Pool, PoolMetadata, PoolPatch, PoolSnapshot, PoolSpec};
 use crate::ports::ControlPlaneStore;
@@ -13,7 +11,7 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskFactResult {
     pub pool: PoolId,
-    pub result: RuntimeResult<MemberDiskSnapshot>,
+    pub result: RuntimeResult<MemberDisk>,
 }
 
 #[derive(Clone)]
@@ -46,7 +44,7 @@ impl PoolManager {
     pub async fn create_pool(
         &self,
         spec: PoolSpec,
-        disks: Vec<MemberDiskSpec>,
+        disks: Vec<MemberDisk>,
     ) -> RuntimeResult<Arc<Pool>> {
         let _guard = self.lifecycle_gate.lock().await;
         if self
@@ -89,16 +87,20 @@ impl PoolManager {
                 .load_pool(&pool_id)
                 .await?
                 .ok_or_else(|| RuntimeError::InvalidState(format!("missing pool {pool_id}")))?;
-            let records = self.store.load_member_disks(&pool_id).await?;
-            let specs: Vec<_> = records.iter().map(|record| record.spec().clone()).collect();
-            let pool = Pool::restore(metadata, records, self.store.clone(), self.config.clone());
-            self.install(pool, &specs)?;
+            let disks = self.store.load_member_disks(&pool_id).await?;
+            let pool = Pool::restore(
+                metadata,
+                disks.clone(),
+                self.store.clone(),
+                self.config.clone(),
+            );
+            self.install(pool, &disks)?;
             restored.push(pool_id);
         }
         Ok(restored)
     }
 
-    fn install(&self, pool: Arc<Pool>, disks: &[MemberDiskSpec]) -> RuntimeResult<()> {
+    fn install(&self, pool: Arc<Pool>, disks: &[MemberDisk]) -> RuntimeResult<()> {
         let pool_id = pool.id();
         let mut pools = self
             .pools
@@ -117,18 +119,18 @@ impl PoolManager {
         pools.insert(pool_id.clone(), pool);
         for disk in disks {
             owners
-                .entry(disk.physical_disk.clone())
+                .entry(disk.physical_disk().clone())
                 .or_default()
                 .push(DiskOwner {
                     pool: pool_id.clone(),
-                    member_disk: disk.id.clone(),
-                    sharing: disk.sharing,
+                    member_disk: disk.id().clone(),
+                    sharing: disk.sharing(),
                 });
         }
         Ok(())
     }
 
-    fn validate_disk_owners(&self, disks: &[MemberDiskSpec]) -> RuntimeResult<()> {
+    fn validate_disk_owners(&self, disks: &[MemberDisk]) -> RuntimeResult<()> {
         let owners = self
             .disk_owners
             .read()
@@ -138,21 +140,23 @@ impl PoolManager {
 
     fn validate_against(
         current: &HashMap<PhysicalDiskId, Vec<DiskOwner>>,
-        disks: &[MemberDiskSpec],
+        disks: &[MemberDisk],
     ) -> RuntimeResult<()> {
         let mut proposed = current.clone();
         for disk in disks {
-            let owners = proposed.entry(disk.physical_disk.clone()).or_default();
+            let owners = proposed.entry(disk.physical_disk().clone()).or_default();
             if owners
                 .iter()
-                .any(|owner| owner.pool == disk.pool && owner.member_disk == disk.id)
+                .any(|owner| owner.pool == *disk.pool() && owner.member_disk == *disk.id())
             {
                 return Err(RuntimeError::Rejected(format!(
                     "physical disk {} is already registered as {} in pool {}",
-                    disk.physical_disk, disk.id, disk.pool
+                    disk.physical_disk(),
+                    disk.id(),
+                    disk.pool()
                 )));
             }
-            let compatible = match disk.sharing {
+            let compatible = match disk.sharing() {
                 DiskSharing::Exclusive => owners.is_empty(),
                 DiskSharing::SharedCache => owners
                     .iter()
@@ -161,13 +165,13 @@ impl PoolManager {
             if !compatible {
                 return Err(RuntimeError::Rejected(format!(
                     "physical disk {} cannot mix exclusive and shared-cache ownership",
-                    disk.physical_disk
+                    disk.physical_disk()
                 )));
             }
             owners.push(DiskOwner {
-                pool: disk.pool.clone(),
-                member_disk: disk.id.clone(),
-                sharing: disk.sharing,
+                pool: disk.pool().clone(),
+                member_disk: disk.id().clone(),
+                sharing: disk.sharing(),
             });
         }
         Ok(())
@@ -193,32 +197,33 @@ impl PoolManager {
     pub async fn create_member_disk(
         &self,
         pool_id: &PoolId,
-        spec: MemberDiskSpec,
-    ) -> RuntimeResult<MemberDiskSnapshot> {
+        disk: MemberDisk,
+    ) -> RuntimeResult<MemberDisk> {
         let _guard = self.lifecycle_gate.lock().await;
-        if &spec.pool != pool_id {
+        if disk.pool() != pool_id {
             return Err(RuntimeError::Rejected(format!(
                 "member disk {} belongs to pool {}, not {pool_id}",
-                spec.id, spec.pool
+                disk.id(),
+                disk.pool()
             )));
         }
-        self.validate_disk_owners(std::slice::from_ref(&spec))?;
-        let snapshot = self
+        self.validate_disk_owners(std::slice::from_ref(&disk))?;
+        let created = self
             .pool(pool_id)?
             .member_disks()
-            .create(spec.clone())
+            .create(disk.clone())
             .await?;
         self.disk_owners
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(spec.physical_disk.clone())
+            .entry(disk.physical_disk().clone())
             .or_default()
             .push(DiskOwner {
-                pool: spec.pool,
-                member_disk: spec.id,
-                sharing: spec.sharing,
+                pool: disk.pool().clone(),
+                member_disk: disk.id().clone(),
+                sharing: disk.sharing(),
             });
-        Ok(snapshot)
+        Ok(created)
     }
 
     pub async fn delete_member_disk(
@@ -228,9 +233,9 @@ impl PoolManager {
     ) -> RuntimeResult<()> {
         let _guard = self.lifecycle_gate.lock().await;
         let pool = self.pool(pool_id)?;
-        let snapshot = pool.member_disks().get(disk.clone()).await?;
+        let current = pool.member_disks().get(disk.clone()).await?;
         pool.member_disks().delete(disk.clone()).await?;
-        let physical = snapshot.spec.physical_disk;
+        let physical = current.physical_disk().clone();
         let mut index = self
             .disk_owners
             .write()

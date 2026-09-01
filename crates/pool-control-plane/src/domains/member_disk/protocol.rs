@@ -1,14 +1,10 @@
-use super::model::{MemberDiskPatch, MemberDiskSnapshot, MemberDiskSpec, PhysicalState};
+use super::model::{MemberDisk, PhysicalState};
 use crate::kernel::{BlkId, MemberDiskId};
 use control_runtime::ServiceRequest;
 
 #[derive(Debug, Clone)]
 pub(crate) enum MemberDiskCommand {
-    Create(MemberDiskSpec),
-    Update {
-        disk: MemberDiskId,
-        patch: MemberDiskPatch,
-    },
+    Create(MemberDisk),
     Delete(MemberDiskId),
     ApplyPhysical {
         disk: MemberDiskId,
@@ -25,8 +21,8 @@ pub(crate) enum MemberDiskCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MemberDiskResponse {
-    Snapshot(MemberDiskSnapshot),
-    Snapshots(Vec<MemberDiskSnapshot>),
+    Disk(MemberDisk),
+    Disks(Vec<MemberDisk>),
     Allocated(BlkId),
     Deleted,
     Released,

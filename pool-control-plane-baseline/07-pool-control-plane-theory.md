@@ -191,18 +191,19 @@ PoolState=Lifecycle\times Health\times Activity
 
 ### 5.2 MemberDisk
 
-MemberDisk 不能被下面的状态枚举替代。它至少由四层信息组成：
+MemberDisk 不能被下面的状态枚举替代。实现只保留一个业务对象，但必须区分对象字段的权威来源与 Runtime 的执行状态：
 
 ```text
-MemberDiskRecord(SDB decision)
-  = identity + pool/tier + media/capacity + failure domains
-  + allocation state + membership + BLK bitmap + revision
-PhysicalState(DiskMap observation)
-MemberDiskState = project(record, physical observation)
+MemberDisk
+  = persisted decision fields
+    (identity + pool/tier + media/capacity + failure domains
+     + allocation state + membership + BLK bitmap + revision)
+  + PhysicalState(DiskMap observation)
+MemberDiskState = project(MemberDisk fields)
 ActorCell activity = private Runtime execution intent
 ```
 
-核心元数据只有 MemberDisk 领域可以修改；物理状态来自 DiskMap；UA/DA/DI/UI/Removed 是派生的运行投影；ActorCell activity 只表示 Runtime 私有的 Future 在途状态。四者不能混成一份状态，而且状态机不能读取 ActorCell activity。物理可访问性、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
+核心元数据只有 MemberDisk 领域可以修改；物理状态来自 DiskMap；UA/DA/DI/UI/Removed 是派生的运行投影；ActorCell activity 只表示 Runtime 私有的 Future 在途状态。代码中不需要为这些分析维度分别建立 Record、Snapshot 或业务 Actor 类型，而且状态机不能读取 ActorCell activity。物理可访问性、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
 
 ```rust
 enum MemberDiskState {
@@ -692,9 +693,13 @@ Reconcile(P^{mem},P^{real})
 
 ```rust
 match (state, event) {
-    (Ua, PhysicalDown) => Transition::to(Da).ensure(Offline),
-    (Di, PhysicalUp) => Transition::to(Ui).ensure(Online),
-    (Ua, PhysicalUp) => Transition::to(Ua),
+    (Ua, Physical(Down)) => Transition::to(Da)
+        .change(ObservePhysical(Down))
+        .ensure(Offline),
+    (Di, Physical(Up)) => Transition::to(Ui)
+        .change(ObservePhysical(Up))
+        .ensure(Online),
+    (Ua, Physical(Up)) => Transition::to(Ua).change(ObservePhysical(Up)),
     (Removed, PhysicalUp) => Transition::to(Removed).reject("explicit rejoin required"),
 }
 ```
@@ -707,19 +712,19 @@ impl MemberDiskWorker {
         &self,
         disk: MemberDiskId,
         context: WorkflowContext,
-    ) -> RuntimeResult<MemberDiskSnapshot> {
+    ) -> RuntimeResult<MemberDiskResponse> {
         self.pool_nodes
             .publish_member_disk(&context, disk.clone(), Down)
             .await?;
 
-        self.commit_progress(&context, &disk, DrainStarted).await?;
+        self.begin_drain(&context, &disk).await?;
 
         self.virtual_disks
             .evacuate_member_disk(&context, disk.clone())
             .await?;
 
-        self.commit_progress(&context, &disk, DrainCompleted).await?;
-        self.snapshot(&disk)
+        self.finish_drain(&context, &disk).await?;
+        Ok(MemberDiskResponse::Disk(self.disk(&disk)?))
     }
 }
 ```
@@ -741,9 +746,13 @@ impl MemberDiskWorker {
 
 ```rust
 match (state, event) {
-    (Ua, PhysicalDown) => Transition::to(Da).ensure(Offline),
-    (Di, PhysicalUp) => Transition::to(Ui).ensure(Online),
-    (Ua, PhysicalUp) => Transition::to(Ua),
+    (Ua, Physical(Down)) => Transition::to(Da)
+        .change(ObservePhysical(Down))
+        .ensure(Offline),
+    (Di, Physical(Up)) => Transition::to(Ui)
+        .change(ObservePhysical(Up))
+        .ensure(Online),
+    (Ua, Physical(Up)) => Transition::to(Ua).change(ObservePhysical(Up)),
 }
 ```
 
@@ -858,7 +867,7 @@ Pool 管控面首先是一个持续接收事实、维护决策并驱动现实收
 本文建议采用以下统一判断：
 
 ```text
-对象状态机回答：现在是什么、下一状态是什么、需要哪个Workflow
+对象状态机回答：下一投影是什么、对象要改什么、需要哪个Workflow
 Runtime ActorCell回答：目标Workflow如何启动、合并或协作替换
 领域Workflow回答：跨领域长过程按什么顺序完成
 Reconcile回答：失败或切主后如何重新收敛

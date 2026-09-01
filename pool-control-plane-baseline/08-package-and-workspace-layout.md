@@ -159,7 +159,7 @@ domains/member_disk/
 
 ### `model.rs`
 
-保存该领域完整核心实体、不可变快照和值对象。MemberDisk 的容量、Tier、故障域、空间位图、分配状态和成员状态都在这里，不得被 `machine.rs` 中的状态枚举取代。
+保存该领域完整核心实体和值对象。MemberDisk 的容量、Tier、故障域、物理观测、空间位图、分配状态和成员状态都在同一个 `MemberDisk` 中，不再为读取或持久化另建 Snapshot/Record 业务模型，也不得被 `machine.rs` 中的状态枚举取代。
 
 ### `service.rs`
 
@@ -183,7 +183,7 @@ pub struct MemberDiskService {
 }
 
 struct MemberDiskWorker {
-    actors: StateCell<MemberDiskDirectory>,
+    disks: StateCell<HashMap<MemberDiskId, MemberDisk>>,
     virtual_disks: VirtualDiskService,
 }
 ```

@@ -1,14 +1,14 @@
 use control_runtime::{RuntimeConfig, RuntimeError};
 use pool_control_plane::{
-    ByteCount, FailureDomainId, InMemoryControlPlaneStore, MediaClass, MemberDiskId,
-    MemberDiskSpec, MemberDiskState, PhysicalDiskId, PhysicalState, PoolId, PoolManager, PoolPatch,
-    PoolSpec, TierId,
+    ByteCount, FailureDomainId, InMemoryControlPlaneStore, MediaClass, MemberDisk, MemberDiskId,
+    MemberDiskState, PhysicalDiskId, PhysicalState, PoolId, PoolManager, PoolPatch, PoolSpec,
+    TierId,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-fn member_disk(pool: &PoolId, id: &str, physical: &str) -> MemberDiskSpec {
-    MemberDiskSpec::new(
+fn member_disk(pool: &PoolId, id: &str, physical: &str) -> MemberDisk {
+    MemberDisk::new(
         MemberDiskId::new(id),
         PhysicalDiskId::new(physical),
         pool.clone(),
@@ -54,7 +54,7 @@ async fn pool_manager_routes_one_disk_fact_to_its_pool() {
             .get(MemberDiskId::new("md-a"))
             .await
             .unwrap()
-            .operational_state,
+            .state(),
         MemberDiskState::Ua
     );
     assert_eq!(
@@ -65,7 +65,7 @@ async fn pool_manager_routes_one_disk_fact_to_its_pool() {
             .get(MemberDiskId::new("md-b"))
             .await
             .unwrap()
-            .operational_state,
+            .state(),
         MemberDiskState::Da
     );
 }
@@ -136,11 +136,11 @@ async fn member_disk_keeps_core_metadata_and_allocation_bitmap() {
         .get(MemberDiskId::new("md-a"))
         .await
         .unwrap();
-    assert_eq!(allocated.spec.physical_disk, PhysicalDiskId::new("pd-a"));
-    assert_eq!(allocated.spec.tier, TierId::new("capacity"));
-    assert_eq!(allocated.spec.media_class.as_str(), "hdd");
-    assert_eq!(allocated.total_blocks, 4);
-    assert_eq!(allocated.allocated_blocks, 1);
+    assert_eq!(allocated.physical_disk(), &PhysicalDiskId::new("pd-a"));
+    assert_eq!(allocated.tier(), &TierId::new("capacity"));
+    assert_eq!(allocated.media_class().as_str(), "hdd");
+    assert_eq!(allocated.total_blocks(), 4);
+    assert_eq!(allocated.allocated_blocks(), 1);
 
     pool.member_disks()
         .release(MemberDiskId::new("md-a"), blk)
@@ -151,7 +151,7 @@ async fn member_disk_keeps_core_metadata_and_allocation_bitmap() {
             .get(MemberDiskId::new("md-a"))
             .await
             .unwrap()
-            .allocated_blocks,
+            .allocated_blocks(),
         0
     );
 }
@@ -190,7 +190,7 @@ async fn conflicting_disk_intent_waits_for_offline_to_settle() {
         offline.await.unwrap(),
         Err(RuntimeError::Cancelled)
     ));
-    assert_eq!(online.operational_state, MemberDiskState::Ua);
+    assert_eq!(online.state(), MemberDiskState::Ua);
     let stats = pool.virtual_disks().stats().await.unwrap();
     assert_eq!(stats.cancelled, 1);
     assert_eq!(stats.stable_stops, 1);
@@ -233,7 +233,7 @@ async fn pool_metadata_crud_and_cold_restore_use_the_store() {
             .get(MemberDiskId::new("md-a"))
             .await
             .unwrap()
-            .operational_state,
+            .state(),
         MemberDiskState::Da
     );
 }

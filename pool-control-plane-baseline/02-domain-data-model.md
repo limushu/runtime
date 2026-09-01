@@ -44,30 +44,25 @@ Pool 状态是派生结果，不应被建模成一个可以脱离 VD 状态随�
 MemberDisk 是 Monitor 全局 DiskMap 中的物理盘在 Pool 内的逻辑化表示：
 
 ```rust
-struct MemberDiskRecord {          // SDB 决策，由 MemberDisk Domain 独占修改
-    spec: MemberDiskSpec {
-        id: MemberDiskId,
-        physical_disk_id: PhysicalDiskId,
-        pool_id: PoolId,
-        tier_id: TierId,
-        media_class: MediaClass,
-        capacity: Bytes,
-        failure_domains: FailureDomainPath,
-        sharing: Exclusive | SharedCache,
-    },
+struct MemberDisk {                // 唯一业务对象，由 MemberDisk Domain 独占修改
+    id: MemberDiskId,
+    physical_disk_id: PhysicalDiskId,
+    pool_id: PoolId,
+    tier_id: TierId,
+    media_class: MediaClass,
+    capacity: Bytes,
+    failure_domains: FailureDomainPath,
+    sharing: Exclusive | SharedCache,
+
+    physical_state: Up | Down,     // DiskMap 当前观测，不写成 SDB 历史真相
     allocation_state: Active | Inactive,
     membership_state: Member | Removed,
     allocation_bitmap: AllocationBitmap,
     revision: u64,
 }
-
-struct MemberDisk {                // Monitor 内存中的完整领域对象
-    record: MemberDiskRecord,
-    physical_state: Up | Down,     // DiskMap 当前观测，不写成 SDB 历史真相
-}
 ```
 
-`MemberDiskRecord` 才是核心对象元数据，不能用状态机枚举代替。内存中的 `MemberDisk` 组合完整 Record 与瞬时物理观测，并把二者投影给纯状态机。Actor、mailbox 和在途工作流状态都不是业务对象的一部分。
+`MemberDisk` 本身就是核心对象，不能用状态机枚举代替，也不再拆成 `Spec + Record + Snapshot`。生产 SDB Adapter 只序列化其中的身份、分配、成员关系、位图和 revision；`physical_state` 在冷恢复后由 DiskMap 重新提供。状态机只读取对象的派生投影并返回明确的字段变更，不保存副本。Actor、mailbox 和在途工作流状态都不是业务对象的一部分。
 
 物理可访问性、空间分配能力和成员关系最终投影为：
 

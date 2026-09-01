@@ -104,7 +104,8 @@ connected只表示Monitor与user_dp网络畅通
 end note
 
 note right of MemberDisk
-核心Record属于MemberDisk领域
+MemberDisk是唯一业务对象
+SDB只保存其中的决策字段
 物理状态来自DiskMap
 运行状态只是派生投影
 Actor执行机制不进入领域对象

@@ -9,7 +9,7 @@ actor "业务开发者" as Developer
 
 package "Domain Service" {
   component "Domain Object\n完整业务元数据" as Object
-  component "State Machine\nTransition::to(...).ensure(...)" as Machine
+  component "State Machine\nTransition::to(...).change(...).ensure(...)" as Machine
   component "Query async fn\n不强制创建Task" as Query
   component "Workflow async fn\n自然业务编排" as Workflow
   database "Private Domain State" as State
@@ -63,5 +63,6 @@ end note
 note bottom of ActorCell
 完全隐藏在Runtime
 一个对象不是一个Tokio task
+不保存业务状态副本
 end note
 @enduml

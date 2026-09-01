@@ -7,8 +7,8 @@ pub mod pool_manager;
 pub mod ports;
 
 pub use domains::member_disk::model::{
-    AllocationState, BlkSize, DiskSharing, MediaClass, MemberDiskPatch, MemberDiskRecord,
-    MemberDiskSnapshot, MemberDiskSpec, MemberDiskState, MembershipState, PhysicalState,
+    AllocationState, BlkSize, DiskSharing, MediaClass, MemberDisk, MemberDiskState,
+    MembershipState, PhysicalState,
 };
 pub use domains::member_disk::MemberDiskService;
 pub use domains::pool_node::{MemberDiskIoAvailability, PoolNodeService};
