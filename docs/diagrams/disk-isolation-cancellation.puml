@@ -1,0 +1,43 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+
+state "UA\nUP + ACTIVE" as UA
+state "DA\nDOWN + ACTIVE\n恢复窗口" as DA
+state "DI\nDOWN + INACTIVE\n排空中" as DI
+state "UI\nUP + INACTIVE\n计划缩容中" as UI
+state "REMOVED" as Removed
+
+[*] --> UA
+UA --> DA : Offline: ObserveDown提交SDB\nSetDiskState::Down（同时停IO）
+DA --> DI : 恢复窗口结束\nDisableAllocation提交SDB
+DI --> Removed : VDm evacuate完成\nRemove提交SDB
+
+DA --> UA : Online替换Offline\nOpenDisk -> SetDiskState::Up -> CompleteOnline
+DI --> UA : Online等待Offline稳定退出后执行\nOpenDisk -> SetDiskState::Up -> CompleteOnline
+
+UA --> UI : Shrink\nDisableAllocation提交SDB
+UI --> Removed : VDm evacuate -> SetDiskState::Down\nRemove提交SDB
+UI --> DI : Shrink期间观察到物理DOWN\n执行set_disk_down，继续原Shrink排空
+Removed --> UA : Physical UP\nOpenDisk -> SetDiskState::Up -> Rejoin
+
+note right of DA
+DOWN事实可以被重放：
+ObserveDown元数据更新可幂等跳过，
+但SetDiskState::Down必须再次发送，
+防止主切换发生在SDB提交与user_dp应用之间。
+end note
+
+note bottom of DI
+取消不回滚已经提交的领域效果。
+事件先更新MemberDisk事实或意图；当前step收到协作取消，
+等待下游稳定返回后，从最新对象重新选择下一步。
+end note
+
+note bottom of Removed
+这是保留身份的稳定状态，不删除MemberDisk对象。
+UP触发Rejoin后可回到UA。
+状态由MemberDisk字段投影，不存在第二份运行时状态机副本。
+end note
+@enduml

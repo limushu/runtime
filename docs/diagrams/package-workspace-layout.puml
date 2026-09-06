@@ -1,0 +1,58 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
+
+package "pool-control-plane crate（当前）" {
+  component "lib.rs" as Lib
+
+  package "member_disk" {
+    component "model.rs\nentity + updates + invariants" as Model
+    component "allocation.rs\nBLK bitmap" as Allocation
+    component "event.rs\nexternal facts + intents" as Event
+    component "ports.rs\nexplicit domain capabilities" as Ports
+    package "service/" {
+      component "mod.rs\nservice + object store\nSDB-first update" as Service
+      component "client.rs\nclient + private messages" as Client
+      component "reconcile.rs\nobject coordination decisions" as Reconcile
+      component "operations.rs\nasync business operations" as Operations
+      component "runtime.rs\nclient + one root poll loop" as Runtime
+      component "error.rs\nservice errors" as Error
+    }
+    component "*_tests.rs" as Tests
+  }
+}
+
+component "Pool / PoolManager\nnot implemented yet" as Pool
+component "Future common runtime\nextract only after real duplication" as FutureRuntime
+
+Lib --> Model
+Model --> Allocation
+Event --> Model
+Ports --> Model
+Service --> Model
+Service --> Event
+Service --> Ports
+Reconcile --> Service
+Reconcile --> Operations
+Operations --> Service
+Runtime --> Service
+Runtime --> Reconcile
+Client --> Runtime
+Error --> Model
+Tests --> Service
+Pool ..> Service : future assembly through Client
+Service ..> FutureRuntime : no dependency today
+
+note bottom of Service
+这些文件共同实现一个MemberDiskService
+不产生第二个ServiceLoop或Reconciler对象
+end note
+
+note bottom of FutureRuntime
+不是当前crate，也不是既定框架
+第二个真实领域证明重复后再提炼
+end note
+@enduml

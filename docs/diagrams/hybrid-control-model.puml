@@ -1,0 +1,60 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "Monitor Input" {
+  component DiskMap
+  component NodeMap
+  component API
+}
+
+package "PoolManager" {
+  component "Pool Registry" as Registry
+  component "DiskUuid -> Pool" as Index
+}
+
+package "One Pool" {
+  component "MemberDiskClient" as Client
+  component "MemberDiskService::run\none root task" as Runtime
+  component "MemberDiskService" as Service
+  database "MemberDisk Objects" as Objects
+  component "MetadataService" as Metadata
+  component "PoolNodeService" as Node
+  component "VirtualDiskService" as VD
+}
+
+database SDB
+component user_dp
+
+DiskMap --> Index : physical fact by DiskUuid
+Index --> Registry : locate owning Pool
+Registry --> Client : explicit Pool target
+Client --> Runtime : private message + oneshot
+Runtime --> Service : apply event / run next step
+Runtime --> Runtime : DiskUuid -> active/pending event + CancellationToken
+Service --> Objects : query / committed update
+Service --> Metadata : field-level update
+Metadata --> SDB
+Service --> Node
+Service --> VD
+Node --> user_dp
+VD --> user_dp
+
+NodeMap --> Registry
+API --> Registry
+
+note right of Runtime
+同盘冲突在MemberDisk领域内处理
+对象变化时旧reconciliation稳定退出后重新计算
+不同盘Future由一个根task并发poll
+当前不提炼公共Actor/状态机框架
+end note
+
+note right of Objects
+当前主节点的已提交内存视图
+查询从这里读取
+运行槽位不保存业务状态副本
+end note
+@enduml

@@ -1,0 +1,90 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "Monitor 全局层（目标架构）" {
+  component MonitorKernel
+  component PoolManager
+  component PoolRegistry
+  component "DiskMap\n全局硬盘视图" as DiskMap
+  component "NodeMap\n网络连通性" as NodeMap
+  component "GlobalResourceDomain\n候选：共享缓存" as GlobalResource
+}
+
+package "Pool[PoolId]（目标架构）" {
+  component "PoolMetadata\nCRUD + lifecycle" as PoolMetadata
+  component PoolCore
+  component "MemberDisk Domain\nObject + Rules + Workflows" as MemberDiskDomain
+  component "Tier Domain" as TierDomain
+  component "VirtualDisk Domain" as VdDomain
+  component "PoolNode Domain" as NodeDomain
+  component "Domain Workflows\n位于所属Service" as Workflow
+  component "Private Execution Loop\nMemberDisk原型：一个根task" as ServiceRuntime
+  component PoolView
+  component "Explicit Service Facades\n明确目标实例" as Facades
+}
+
+package "外部端口" {
+  interface SdbGateway
+  interface HardwareGateway
+  interface UserDpGateway
+  interface VnodeGateway
+}
+
+MonitorKernel --> PoolManager
+MonitorKernel --> DiskMap
+MonitorKernel --> NodeMap
+PoolManager --> PoolRegistry
+PoolManager --> GlobalResource
+PoolRegistry --> PoolMetadata : 管理Pool实例
+DiskMap --> PoolManager : 标准化硬盘事实
+NodeMap --> PoolManager : 标准化节点事实
+PoolManager --> PoolRegistry : 定位受影响Pool
+PoolManager --> MemberDiskDomain : 投递标准化事实
+
+PoolMetadata --> PoolCore
+PoolCore --> Facades
+Facades --> MemberDiskDomain
+Facades --> TierDomain
+Facades --> VdDomain
+Facades --> NodeDomain
+Workflow ..> Facades : 命名领域能力
+ServiceRuntime --> Workflow : poll Future
+ServiceRuntime --> Facades : ServiceClient/上下文传播
+PoolCore --> PoolView
+TierDomain --> PoolView
+VdDomain --> PoolView
+NodeDomain --> PoolView
+
+PoolCore ..> SdbGateway
+TierDomain ..> SdbGateway
+VdDomain ..> SdbGateway
+NodeDomain ..> SdbGateway
+TierDomain ..> DiskMap : 查询物理盘视图
+NodeDomain ..> NodeMap : 查询网络连通性
+NodeDomain ..> UserDpGateway
+VdDomain ..> UserDpGateway
+PoolView ..> VnodeGateway
+DiskMap ..> HardwareGateway
+NodeMap ..> UserDpGateway : 连通性
+GlobalResource ..> DiskMap
+GlobalResource ..> SdbGateway
+
+note bottom of Workflow
+不预设万能WorkflowService
+Workflow属于最终结果的领域
+end note
+
+note bottom of Facades
+请求不携带隐藏目标
+提供命名call / submit / query
+Task不是通信能力所有者
+end note
+
+note bottom of ServiceRuntime
+当前代码只验证MemberDisk纵切面
+PoolManager、Pool装配和公共Runtime尚未实现
+end note
+@enduml

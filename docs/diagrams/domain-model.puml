@@ -1,0 +1,113 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+
+class PhysicalDisk <<Monitor::DiskMap>>
+class NodeRecord <<Monitor::NodeMap>> {
+  node_id
+  /connected
+}
+class SharedCacheResource <<global>>
+
+class PoolMeta {
+  id
+  uuid
+  name
+  config
+  thresholds
+  policies
+}
+
+class Tier {
+  media_type
+  failure_domain_policy
+}
+
+class MemberDisk {
+  member_disk_id
+  physical_disk_id
+  pool_id
+  tier_id
+  media_class
+  sharing: Exclusive | SharedCache
+  capacity
+  failure_domain_path
+  allocation_state
+  membership_state
+  allocation_bitmap
+  revision
+  io_state: committed capability
+  /operational_state: UA | DA | DI | UI | REMOVED
+}
+
+class Partition {
+  bitmap[1024][112]
+}
+
+class VD {
+  type
+  redundancy
+  chunk_size
+}
+
+class BG {
+  bg_id
+}
+
+class BGEntry {
+  member_disk_id
+  blk_id
+  data_state
+  /media_state
+}
+
+class PoolNodeState {
+  node_id
+  membership
+  /pool_loaded
+  /ready
+}
+
+class VNodeView {
+  service_nodes
+  pool_health
+}
+
+PhysicalDisk "1" --> "0..1" MemberDisk : 加入Pool后逻辑化\nUP/DOWN只作为事件输入
+PoolMeta "1" *-- "1..*" Tier
+PoolMeta "1" *-- "0..*" VD
+PoolMeta "1" *-- "0..*" PoolNodeState
+Tier "1" *-- "0..*" MemberDisk
+Tier "1" *-- "0..*" Partition : 空间位图
+VD "1" *-- "0..*" BG
+BG "1" *-- "1..*" BGEntry
+BGEntry "*" --> "1" MemberDisk : 引用BLK
+PoolMeta "1" --> "1" VNodeView : 派生
+SharedCacheResource "*" -- "*" PoolMeta : 跨Pool使用
+NodeRecord "1" --> "0..*" PoolNodeState : 全局连通性输入
+
+note right of BGEntry
+media_state由DiskMap物理观测派生
+data_state属于BGEntry数据事实
+end note
+
+note bottom of PoolMeta
+Pool状态 = 最差VD状态
+VD状态 = 最差BG状态
+end note
+
+note right of NodeRecord
+connected只表示Monitor与user_dp网络畅通
+不能证明Pool已加载或可服务
+end note
+
+note right of MemberDisk
+MemberDisk是唯一业务对象
+SDB只保存其中的决策字段
+物理事实来自DiskMap请求，不复制observed_state
+运行状态只是派生投影
+Actor执行机制不进入领域对象
+end note
+@enduml

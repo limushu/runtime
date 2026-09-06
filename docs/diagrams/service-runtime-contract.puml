@@ -1,0 +1,61 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
+
+actor "Pool / PoolManager" as Caller
+
+package "MemberDisk Domain（当前原型）" {
+  component "MemberDiskClient\nsubmit / get / wait_idle" as Client
+  component "Private ServiceMessage\nvariant + typed oneshot" as Message
+  component "MemberDiskService::run\none root Tokio task" as Runtime
+  component "Per-Disk Runtime Slot\nactive + pending event\nCancellationToken / IdleWaiters" as Slot
+  component "FuturesUnordered\nadmission / query / reconciliation" as Futures
+  component "MemberDiskService\nreconcile_once / business methods\ncommit_change" as Service
+  database "HashMap<DiskUuid, MemberDisk>\ncommitted in-memory view" as Objects
+}
+
+component "MetadataService" as Metadata
+database SDB
+component "PoolNodeService" as Node
+component "VirtualDiskService" as VD
+
+Caller --> Client : explicit Pool target
+Client --> Message : mpsc + oneshot
+Message --> Runtime
+Runtime --> Futures : poll all futures
+Futures --> Service : validate disk ownership
+Runtime --> Slot : admit / queue / cancel / repoll
+Slot --> Futures : start one reconciliation
+Futures --> Service : reconcile_once(object, active event)
+Service --> Objects : query / apply committed update
+Service --> Metadata : DiskUuid + MemberDiskUpdate
+Metadata --> SDB : serial durable commit
+Service --> Node : OpenDisk / SetDiskState
+Service --> VD : evacuate
+Futures --> Runtime : event / step finished
+Runtime --> Client : accepted / query / idle result
+Client ..> Runtime : all senders dropped = Drain
+Caller ..> Runtime : JoinHandle::abort = force stop
+
+note bottom of Runtime
+运行循环不解释业务状态分支
+事件槽和状态表属于MemberDiskService
+一个根task并发poll多个Future
+Drain等待Future收敛，业务不接收shutdown token
+end note
+
+note bottom of Slot
+同一硬盘最多一个reconciliation Future
+不同事件进入pending并触发CancellationToken
+这里只保存事件与执行态，不复制MemberDisk业务状态
+end note
+
+note bottom of Service
+状态表直接调用普通async/await方法
+DOWN通知和停IO是同一个SetDiskState::Down动作
+DOWN/UP保存在执行槽，Shrink意图持久化
+end note
+@enduml

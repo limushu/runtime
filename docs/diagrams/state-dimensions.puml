@@ -1,0 +1,56 @@
+@startuml
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
+
+rectangle "Pool" as Pool {
+  component Lifecycle
+  component Health
+  component "Activity Set" as Activity
+}
+
+rectangle "MemberDisk" as MD {
+  database "Persisted MemberDisk fields (SDB)\nidentity/tier/capacity/topology\nphysical/shrink intent/io/allocation/membership/bitmap" as Decision
+  component "Operational Projection\nUA / DA / DI / UI / REMOVED" as DiskState
+}
+
+component "DiskMap Event\nUP / DOWN" as PhysicalState
+
+rectangle "MemberDisk private execution loop" as Runtime {
+  component "Execution Activity\nactive reconciliation / cancel / idle waiters" as ReconcileActivity
+}
+
+rectangle "PoolNode" as PN {
+  component Membership
+  component "Connectivity\n来自NodeMap" as Connectivity
+  component "Pool ServiceState" as ServiceState
+}
+
+rectangle "BGEntry" as Entry {
+  component "MediaState\n由MemberDisk派生" as MediaState
+  component DataState
+}
+
+Entry --> Health : BG -> VD -> Pool派生
+PhysicalState --> MD : MemberDiskEvent
+PhysicalState --> MediaState : 当前介质事实
+Decision --> DiskState : io + allocation + membership
+ReconcileActivity ..> DiskState : 不参与投影，仅管理执行
+Connectivity --> ServiceState : 必要但不充分
+
+note bottom of Pool
+PoolState = Lifecycle × Health × Activity
+end note
+
+note bottom of PN
+Connected(n) 不代表 PoolServing(p,n)
+end note
+
+note bottom of MD
+Decision fields / Observation input / Projection 与执行活动分离
+MemberDisk保存已接受的最新物理事实和Shrink意图
+私有执行槽只拥有Activity
+end note
+@enduml
