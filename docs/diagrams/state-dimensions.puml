@@ -12,7 +12,7 @@ rectangle "Pool" as Pool {
 }
 
 rectangle "MemberDisk" as MD {
-  database "Persisted MemberDisk fields (SDB)\nidentity/tier/capacity/topology\nphysical/shrink intent/io/allocation/membership/bitmap" as Decision
+  database "Persisted MemberDisk fields (SDB)\nidentity/tier/capacity/topology\nshrink intent/io/allocation/membership/bitmap" as Decision
   component "Operational Projection\nUA / DA / DI / UI / REMOVED" as DiskState
 }
 
@@ -50,7 +50,8 @@ end note
 
 note bottom of MD
 Decision fields / Observation input / Projection 与执行活动分离
-MemberDisk保存已接受的最新物理事实和Shrink意图
+物理事实只保存在active/pending事件
+MemberDisk保存已提交能力和Shrink意图
 私有执行槽只拥有Activity
 end note
 @enduml

@@ -68,7 +68,11 @@ SDB 不提供覆盖 Tier 位图与 VD/BGMap 的统一事务或业务 WAL。系�
 
 ### D-017 状态表直接调用 Service 的自然异步方法
 
-业务步骤写成所属 Service 的 `async fn`。`reconcile_once` 在穷举状态表中直接调用这些方法，不经过 Action enum、函数注册表或 `move |task| async move`。它只返回 `Progressed/Stable`；Query 不创建 reconciliation Future。
+业务步骤写成所属 Service 的 `async fn`。`reconcile_once` 在穷举状态表中直接 `await` 这些方法，不经过 Action enum、函数注册表或 `move |task| async move`。每条非稳态规则显式声明起始状态、输入事件、action 和结束状态；action 完成后验证权威后置条件。它只返回 `Transitioned/Stable`；Query 不创建 reconciliation Future。
+
+### D-020 完整转换契约，按需读取跨领域状态
+
+MemberDisk 本地转换使用 `MemberDiskState + shrink_requested` 作为起止状态。排空转换额外读取 VDM 权威的 BG 引用关系，并要求 action 成功后 `has_references=false`。跨领域状态按转换需要读取，不构造全局大快照；DOWN 通知与停 IO 不依赖 VDM 查询。复合的“排空 + 停 IO + Remove”方法禁止出现，三者是三个独立转换。
 
 ### D-018 先具体实现，再提炼机制
 

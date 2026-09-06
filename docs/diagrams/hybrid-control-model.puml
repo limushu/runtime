@@ -38,7 +38,7 @@ Service --> Objects : query / committed update
 Service --> Metadata : field-level update
 Metadata --> SDB
 Service --> Node
-Service --> VD
+Service --> VD : has_references / evacuate
 Node --> user_dp
 VD --> user_dp
 

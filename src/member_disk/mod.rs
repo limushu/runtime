@@ -16,7 +16,7 @@ pub use model::{
     MemberDiskState, MemberDiskUpdate, MembershipState,
 };
 pub use ports::{
-    Cancelled, MetadataError, MetadataService, PoolNodeError, PoolNodeService, UserDpRequest,
-    VirtualDiskService,
+    MetadataError, MetadataService, PoolNodeError, PoolNodeService, UserDpRequest,
+    VirtualDiskError, VirtualDiskService,
 };
 pub use service::{MemberDiskClient, MemberDiskService, MemberDiskServiceError};

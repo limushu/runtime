@@ -1,4 +1,6 @@
-use crate::member_disk::{Cancelled, DiskUuid, MemberDiskError, MetadataError, PoolNodeError};
+use crate::member_disk::{
+    DiskUuid, MemberDiskError, MetadataError, PoolNodeError, VirtualDiskError,
+};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,7 +9,9 @@ pub enum MemberDiskServiceError {
     ServiceStopped,
     Cancelled,
     PoolNode(PoolNodeError),
+    VirtualDisk(VirtualDiskError),
     Metadata(MetadataError),
+    TransitionIncomplete(String),
     InvalidState(MemberDiskError),
 }
 
@@ -18,7 +22,9 @@ impl fmt::Display for MemberDiskServiceError {
             Self::ServiceStopped => write!(f, "MemberDisk service has stopped"),
             Self::Cancelled => write!(f, "MemberDisk operation was cancelled"),
             Self::PoolNode(error) => error.fmt(f),
+            Self::VirtualDisk(error) => error.fmt(f),
             Self::Metadata(error) => write!(f, "MemberDisk metadata update failed: {error}"),
+            Self::TransitionIncomplete(message) => message.fmt(f),
             Self::InvalidState(error) => error.fmt(f),
         }
     }
@@ -26,15 +32,18 @@ impl fmt::Display for MemberDiskServiceError {
 
 impl std::error::Error for MemberDiskServiceError {}
 
-impl From<Cancelled> for MemberDiskServiceError {
-    fn from(_: Cancelled) -> Self {
-        Self::Cancelled
-    }
-}
-
 impl From<MemberDiskError> for MemberDiskServiceError {
     fn from(error: MemberDiskError) -> Self {
         Self::InvalidState(error)
+    }
+}
+
+impl From<VirtualDiskError> for MemberDiskServiceError {
+    fn from(error: VirtualDiskError) -> Self {
+        match error {
+            VirtualDiskError::Cancelled => Self::Cancelled,
+            error => Self::VirtualDisk(error),
+        }
     }
 }
 

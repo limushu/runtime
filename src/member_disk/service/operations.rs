@@ -73,23 +73,18 @@ impl MemberDiskService {
         Ok(())
     }
 
-    pub(super) async fn evacuate_down_disk(
+    /// Requests one VDM evacuation. The state driver separately verifies that
+    /// VDM no longer has BG references after this action returns.
+    pub(super) async fn evacuate(
         &self,
         disk: &DiskUuid,
         cancel: &CancellationToken,
     ) -> Result<(), MemberDiskServiceError> {
         self.virtual_disks.evacuate(cancel, disk).await?;
-        self.commit_change(disk, MemberDiskUpdate::Remove).await?;
         Ok(())
     }
 
-    pub(super) async fn evacuate_online_disk(
-        &self,
-        disk: &DiskUuid,
-        cancel: &CancellationToken,
-    ) -> Result<(), MemberDiskServiceError> {
-        self.virtual_disks.evacuate(cancel, disk).await?;
-        self.set_disk_down(disk).await?;
+    pub(super) async fn remove(&self, disk: &DiskUuid) -> Result<(), MemberDiskServiceError> {
         self.commit_change(disk, MemberDiskUpdate::Remove).await?;
         Ok(())
     }

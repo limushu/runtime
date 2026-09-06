@@ -70,7 +70,8 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **已确认：** 每个 MemberDisk 是完整领域对象而不是 Actor API；盘级执行槽保存 active/pending 事件、取消令牌和等待者，不复制业务状态。
 - **已确认：** MemberDisk 决策元数据、DiskMap 输入事实、派生运行状态和在途意图是不同信息，不得用单一状态枚举替代完整实体。
 - **当前实现：** 仓库只有一个 `pool-control-plane` crate；`MemberDiskService` 私有持有对象目录，并通过统一的“校验 -> SDB -> 内存”路径修改。
-- **当前实现：** `reconcile_once` 直接穷举 `(MemberDiskState, active MemberDiskEvent, shrink_requested)` 并调用 Service 方法；`Progressed` 重新读取对象并继续同一事件，`Stable` 结束驱动，不存在 Action enum、执行转发表或隐藏兜底分支。
+- **当前实现：** `reconcile_once` 直接穷举 `(MemberDiskState, active MemberDiskEvent, shrink_requested)`；分支用普通 `await` 调用一个业务 action，再验证声明的结束状态。`Transitioned` 重新读取权威状态并继续同一事件，`Stable` 结束驱动，不存在 Action enum、执行转发表或隐藏兜底分支。
+- **当前实现：** VDM 是 BG 引用关系的权威来源；排空完成不能只相信一次 Future 返回，必须通过 `has_references` 验证。该查询只发生在需要排空的转换中，不会把不可失败的 DOWN 边界耦合到 VDM 可用性。
 - **当前实现：** `SetDiskState::Down` 同时表示通知 DOWN 和停止 IO；Shrink 期间 DOWN 会先让当前 VDm step 协作稳定退出，再从对象真实状态继续。
 - **待验证：** MemberDisk 私有执行循环中哪些代码会在第二个真实领域重复；在此之前不建立统一 Service/Reconciler/ObjectRunner 抽象或公共 runtime crate。
 - **待决：** Tier、PoolCore、Rebuild 的最终服务粒度，以及 Monitor 切主时在途操作恢复协议。

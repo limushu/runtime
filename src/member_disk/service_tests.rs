@@ -117,6 +117,9 @@ impl PoolNodeService for Nodes {
 
 struct VirtualDisks {
     calls: Arc<Mutex<Vec<Call>>>,
+    has_references: AtomicBool,
+    clear_references_on_success: AtomicBool,
+    reference_queries: AtomicUsize,
     controlled: bool,
     started: Semaphore,
     release: Semaphore,
@@ -137,11 +140,29 @@ impl VirtualDisks {
     fn call_count(&self) -> usize {
         self.call_count.load(Ordering::SeqCst)
     }
+
+    fn reference_queries(&self) -> usize {
+        self.reference_queries.load(Ordering::SeqCst)
+    }
+
+    fn keep_references_after_success(&self) {
+        self.clear_references_on_success
+            .store(false, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
 impl VirtualDiskService for VirtualDisks {
-    async fn evacuate(&self, cancel: &CancellationToken, disk: &DiskUuid) -> Result<(), Cancelled> {
+    async fn has_references(&self, _disk: &DiskUuid) -> Result<bool, VirtualDiskError> {
+        self.reference_queries.fetch_add(1, Ordering::SeqCst);
+        Ok(self.has_references.load(Ordering::SeqCst))
+    }
+
+    async fn evacuate(
+        &self,
+        cancel: &CancellationToken,
+        disk: &DiskUuid,
+    ) -> Result<(), VirtualDiskError> {
         self.calls.lock().await.push(Call::Evacuate(disk.clone()));
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -151,19 +172,22 @@ impl VirtualDiskService for VirtualDisks {
         let result = if self.controlled {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => Err(Cancelled),
+                _ = cancel.cancelled() => Err(VirtualDiskError::Cancelled),
                 permit = self.release.acquire() => {
                     permit.unwrap().forget();
                     Ok(())
                 }
             }
         } else if cancel.is_cancelled() {
-            Err(Cancelled)
+            Err(VirtualDiskError::Cancelled)
         } else {
             Ok(())
         };
 
         self.active.fetch_sub(1, Ordering::SeqCst);
+        if result.is_ok() && self.clear_references_on_success.load(Ordering::SeqCst) {
+            self.has_references.store(false, Ordering::SeqCst);
+        }
         result
     }
 }
@@ -207,6 +231,9 @@ fn runtime(
     });
     let virtual_disks = Arc::new(VirtualDisks {
         calls: calls.clone(),
+        has_references: AtomicBool::new(true),
+        clear_references_on_success: AtomicBool::new(true),
+        reference_queries: AtomicUsize::new(0),
         controlled: controlled_evacuation,
         started: Semaphore::new(0),
         release: Semaphore::new(0),
@@ -294,6 +321,11 @@ async fn online_cancels_the_recovery_wait_and_returns_to_up_active() {
         MemberDiskState::UpActive
     );
     assert_eq!(virtual_disks.call_count(), 0);
+    assert_eq!(
+        virtual_disks.reference_queries(),
+        0,
+        "mandatory DOWN and replacement UP must not depend on VDM"
+    );
     stop(client, task).await;
 }
 
@@ -582,6 +614,28 @@ async fn failed_sdb_change_is_not_published_to_memory() {
     assert_eq!(
         client.get(disk).await.unwrap().state(),
         MemberDiskState::UpActive
+    );
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn evacuation_must_reach_its_declared_finish_state() {
+    let (client, task, _, _, virtual_disks) = runtime(std::time::Duration::ZERO, false, false);
+    let disk = DiskUuid::new("disk-1");
+    virtual_disks.keep_references_after_success();
+
+    client
+        .submit(MemberDiskEvent::Shrink { disk: disk.clone() })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        client.wait_idle(disk.clone()).await,
+        Err(MemberDiskServiceError::TransitionIncomplete(_))
+    ));
+    assert_eq!(
+        client.get(disk).await.unwrap().state(),
+        MemberDiskState::UpInactive
     );
     stop(client, task).await;
 }

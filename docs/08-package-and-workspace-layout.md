@@ -75,7 +75,7 @@ kube-managed-future-runner/
 
 - `MetadataService`：提交 `DiskUuid + MemberDiskUpdate`；
 - `PoolNodeService`：向当前可服务 Pool 节点执行一次 user_dp 广播；是否重试由调用领域决定；
-- `VirtualDiskService`：排空该盘关联的 BG。
+- `VirtualDiskService`：查询该盘是否仍被 BG 引用，并排空这些引用；VDM 是该关系的权威来源。
 
 这些 trait 是领域边界，不是通用 Runtime trait。
 
@@ -93,13 +93,15 @@ kube-managed-future-runner/
 保存 MemberDisk 的协调决策。`reconcile_once` 穷举
 `(业务投影, active MemberDiskEvent, shrink_requested)`，并直接调用一个具体异步行为。
 顶层只按 `UpActive / UpInactive / DownActive / DownInactive / Removed` 分派到对应
-状态函数；每个状态函数再完整列出“未缩容/缩容中 × DOWN/UP/Shrink”的规则。这里没有
-Action enum、函数表或独立状态副本，也不依赖通配符的匹配顺序隐藏业务优先级。
+状态函数；每个状态函数再完整列出“未缩容/缩容中 × DOWN/UP/Shrink”的规则。每个执行
+分支表达 `start_state + event -> action -> finish_state`，action 返回后验证权威结束状态。
+这里没有 Action enum、函数表或独立状态副本，也不依赖通配符的匹配顺序隐藏业务优先级。
 
 ### `service/operations.rs`
 
-保存状态表调用的真实业务行为，例如 `set_disk_down`、等待恢复窗口、排空和上线。
+保存状态表调用的单一业务行为，例如 `set_disk_down`、等待恢复窗口、排空、移除和上线。
 开发者可以从状态表中的一个分支直接跳到对应方法，方法仍使用普通 `async/await` 编排。
+禁止把排空、停 IO 和移除重新包装成一个复合 action。
 
 ### `service/client.rs`
 
@@ -130,7 +132,8 @@ Pool/PoolManager（后续装配）
        -> 事件准入（只校验该 Pool 拥有对应 MemberDisk）
        -> active[DiskUuid]（同盘至多一个 active 事件，其余进入 pending）
        -> MemberDiskService::reconcile_once
-          -> 状态表直接调用 async 业务方法
+          -> 状态表直接 await 一个 async action
+          -> 验证声明的 finish_state
           -> MetadataService / PoolNodeService / VirtualDiskService
        -> 重新读取 MemberDisk，直到达到稳态
 ```

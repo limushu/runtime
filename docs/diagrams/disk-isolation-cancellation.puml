@@ -2,42 +2,65 @@
 skinparam backgroundColor white
 skinparam defaultFontName "Microsoft YaHei"
 skinparam shadowing false
+skinparam componentStyle rectangle
+left to right direction
 
-state "UA\nUP + ACTIVE" as UA
-state "DA\nDOWN + ACTIVE\n恢复窗口" as DA
-state "DI\nDOWN + INACTIVE\n排空中" as DI
-state "UI\nUP + INACTIVE\n计划缩容中" as UI
-state "REMOVED" as Removed
+rectangle "非计划 DOWN\nUA / Normal" as O_UA #EAF2F8
+rectangle "DA / Normal" as O_DA #EAF2F8
+rectangle "DI / HasRefs\nNormal" as O_DI_R #EAF2F8
+rectangle "DI / NoRefs\nNormal" as O_DI_E #EAF2F8
+rectangle "REMOVED" as O_REMOVED #EAF2F8
 
-[*] --> UA
-UA --> DA : Offline: ObserveDown提交SDB\nSetDiskState::Down（同时停IO）
-DA --> DI : 恢复窗口结束\nDisableAllocation提交SDB
-DI --> Removed : VDm evacuate完成\nRemove提交SDB
+O_UA -right-> O_DA : DOWN\nset_disk_down
+O_DA -right-> O_DI_R : DOWN\nwait_then_disable
+O_DI_R -right-> O_DI_E : DOWN\nVDM.evacuate\nverify no refs
+O_DI_E -right-> O_REMOVED : DOWN\nremove
 
-DA --> UA : Online替换Offline\nOpenDisk -> SetDiskState::Up -> CompleteOnline
-DI --> UA : Online等待Offline稳定退出后执行\nOpenDisk -> SetDiskState::Up -> CompleteOnline
+rectangle "计划 Shrink\nUA / Normal" as S_UA #E8F8F5
+rectangle "UA / Shrinking" as S_UA_S #E8F8F5
+rectangle "UI / HasRefs\nShrinking" as S_UI_R #E8F8F5
+rectangle "UI / NoRefs\nShrinking" as S_UI_E #E8F8F5
+rectangle "DI / NoRefs\nShrinking" as S_DI_E #E8F8F5
+rectangle "REMOVED" as S_REMOVED #E8F8F5
 
-UA --> UI : Shrink\nDisableAllocation提交SDB
-UI --> Removed : VDm evacuate -> SetDiskState::Down\nRemove提交SDB
-UI --> DI : Shrink期间观察到物理DOWN\n执行set_disk_down，继续原Shrink排空
-Removed --> UA : Physical UP\nOpenDisk -> SetDiskState::Up -> Rejoin
+S_UA -right-> S_UA_S : Shrink\nrequest_shrink
+S_UA_S -right-> S_UI_R : Shrink or UP\ndisable_allocation
+S_UI_R -right-> S_UI_E : Shrink or UP\nVDM.evacuate\nverify no refs
+S_UI_E -right-> S_DI_E : same active event\nset_disk_down
+S_DI_E -right-> S_REMOVED : same active event\nremove
 
-note right of DA
-DOWN事实可以被重放：
-ObserveDown元数据更新可幂等跳过，
-但SetDiskState::Down必须再次发送，
-防止主切换发生在SDB提交与user_dp应用之间。
+O_UA -[hidden]down-> S_UA
+O_DA -[hidden]down-> S_UA_S
+O_DI_R -[hidden]down-> S_UI_R
+O_DI_E -[hidden]down-> S_UI_E
+O_REMOVED -[hidden]down-> S_REMOVED
+
+note bottom of O_DI_R
+HasRefs / NoRefs 由 VDM 权威查询，
+不是 MemberDisk 保存的状态副本。
+只有排空转换读取 VDM；
+DOWN 安全转换不依赖 VDM。
 end note
 
-note bottom of DI
-取消不回滚已经提交的领域效果。
-事件先更新MemberDisk事实或意图；当前step收到协作取消，
-等待下游稳定返回后，从最新对象重新选择下一步。
+note bottom of S_UI_R
+每条边都是：
+start_state + event
+-> await action
+-> verify finish_state
 end note
 
-note bottom of Removed
-这是保留身份的稳定状态，不删除MemberDisk对象。
-UP触发Rejoin后可回到UA。
-状态由MemberDisk字段投影，不存在第二份运行时状态机副本。
+note bottom of S_UI_E
+Shrink 排空中收到 DOWN：
+当前 VDM Future 先协作稳定退出；
+再执行 set_disk_down；
+随后从 DI / Shrinking 继续排空。
+end note
+
+note bottom of S_DI_E
+Transitioned 后重新读取权威状态，
+继续驱动同一个 active event。
+
+UP 可从 DA / DI 协作替换为 open_and_serve；
+REMOVED + UP 进入 Rejoin。
 end note
 @enduml

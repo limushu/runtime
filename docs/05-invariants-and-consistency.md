@@ -206,7 +206,7 @@ Monitor 切主、Task 失败或执行重试不能改变 Operation Context 的因
 
 ## 业务策略与当前具体执行
 
-当前 MemberDisk 生产路径由 `MemberDisk` 方法校验字段变化，`reconcile_once` 按 `MemberDisk` 已提交状态和 active 事件执行状态表中的一行。每盘只有一个 active reconciliation；物理 DOWN/UP 不进入对象，保存在私有执行槽中。不同事件进入 pending 队列并取消旧 step，旧 Future 稳定返回后再处理下一个事件，不向运行中 Future 注入旁路命令。
+当前 MemberDisk 生产路径由 `MemberDisk` 方法校验字段变化，`reconcile_once` 按 `MemberDisk` 已提交状态和 active 事件执行状态表中的一行。每一行明确起始状态、事件、单一 action 和结束状态；action 成功但结束状态未成立仍视为失败。排空结束必须由 VDM 权威查询确认，不能只依赖 Future 的临时返回。每盘只有一个 active reconciliation；物理 DOWN/UP 不进入对象，保存在私有执行槽中。不同事件进入 pending 队列并取消旧 step，旧 Future 稳定返回后再处理下一个事件，不向运行中 Future 注入旁路命令。
 
 查询不创建 reconciliation Future。需要互斥的盘事件必须从同一个 `MemberDiskClient` 进入，不能绕过入口直接并发调用写流程。只有第二个真实领域证明存在相同的 active/cancel/repoll 语义后，才允许把机械代码下沉。
 

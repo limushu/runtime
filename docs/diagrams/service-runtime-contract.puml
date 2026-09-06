@@ -13,7 +13,7 @@ package "MemberDisk Domain（当前原型）" {
   component "MemberDiskService::run\none root Tokio task" as Runtime
   component "Per-Disk Runtime Slot\nactive + pending event\nCancellationToken / IdleWaiters" as Slot
   component "FuturesUnordered\nadmission / query / reconciliation" as Futures
-  component "MemberDiskService\nreconcile_once / business methods\ncommit_change" as Service
+  component "MemberDiskService\ntransition rules / business actions\nfinish-state verification / commit_change" as Service
   database "HashMap<DiskUuid, MemberDisk>\ncommitted in-memory view" as Objects
 }
 
@@ -34,7 +34,7 @@ Service --> Objects : query / apply committed update
 Service --> Metadata : DiskUuid + MemberDiskUpdate
 Metadata --> SDB : serial durable commit
 Service --> Node : OpenDisk / SetDiskState
-Service --> VD : evacuate
+Service --> VD : has_references / evacuate
 Futures --> Runtime : event / step finished
 Runtime --> Client : accepted / query / idle result
 Client ..> Runtime : all senders dropped = Drain
@@ -54,7 +54,8 @@ note bottom of Slot
 end note
 
 note bottom of Service
-状态表直接调用普通async/await方法
+start_state + event -> await action -> finish_state
+action返回后验证权威结束状态
 DOWN通知和停IO是同一个SetDiskState::Down动作
 DOWN/UP保存在执行槽，Shrink意图持久化
 end note

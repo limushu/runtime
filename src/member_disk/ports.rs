@@ -40,9 +40,6 @@ pub enum UserDpRequest {
     SetDiskState { disk: DiskUuid, state: DiskIoState },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cancelled;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolNodeError {
     Cancelled,
@@ -66,6 +63,29 @@ impl fmt::Display for PoolNodeError {
 
 impl std::error::Error for PoolNodeError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtualDiskError {
+    Cancelled,
+    Failed(String),
+}
+
+impl VirtualDiskError {
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+impl fmt::Display for VirtualDiskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("VirtualDisk operation was cancelled"),
+            Self::Failed(message) => write!(f, "VirtualDisk operation failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for VirtualDiskError {}
+
 #[async_trait]
 pub trait PoolNodeService: Send + Sync {
     /// Makes one broadcast attempt to all currently serviceable Pool nodes.
@@ -79,7 +99,15 @@ pub trait PoolNodeService: Send + Sync {
 
 #[async_trait]
 pub trait VirtualDiskService: Send + Sync {
+    /// Reads the authoritative VDM/BG relationship. A successful evacuation
+    /// must make this return `false`, including after Monitor failover.
+    async fn has_references(&self, disk: &DiskUuid) -> Result<bool, VirtualDiskError>;
+
     /// Returns after all BGs have left this MemberDisk. On cancellation, VDm
     /// first stops new BG work and settles work already in flight.
-    async fn evacuate(&self, cancel: &CancellationToken, disk: &DiskUuid) -> Result<(), Cancelled>;
+    async fn evacuate(
+        &self,
+        cancel: &CancellationToken,
+        disk: &DiskUuid,
+    ) -> Result<(), VirtualDiskError>;
 }

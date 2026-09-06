@@ -109,7 +109,7 @@ impl MemberDiskService {
                         );
                     } else {
                         match finished.result {
-                            Ok(ReconcileResult::Progressed) => self.start_reconcile(
+                            Ok(ReconcileResult::Transitioned) => self.start_reconcile(
                                 slot.event,
                                 VecDeque::new(),
                                 &mut active,

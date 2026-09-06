@@ -204,7 +204,7 @@ MemberDiskState = project(MemberDisk fields)
 Reconcile slot = active/pending event + private Runtime execution state
 ```
 
-核心元数据只有 MemberDisk 领域可以修改；`io_state` 是完成对应 user_dp 动作后提交的有效 IO 能力，`shrink_requested` 是已接受的持久化管理意图；DiskMap `physical_state` 与 `observed_at` 只随事件进入 active/pending 槽，不复制到对象。UA/DA/DI/UI/Removed 是对象已提交字段的派生投影。代码中不需要为这些分析维度分别建立 Record、Snapshot 或业务 Actor 类型。状态表读取 `MemberDisk` 的业务投影、当前事件和 Shrink 意图，不保存第二份对象状态。IO 能力、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
+核心元数据只有 MemberDisk 领域可以修改；`io_state` 是完成对应 user_dp 动作后提交的有效 IO 能力，`shrink_requested` 是已接受的持久化管理意图；DiskMap `physical_state` 与 `observed_at` 只随事件进入 active/pending 槽，不复制到对象。UA/DA/DI/UI/Removed 是对象已提交字段的派生投影。代码中不需要为这些分析维度分别建立 Record、Snapshot 或业务 Actor 类型。状态表读取 `MemberDisk` 的业务投影、当前事件和 Shrink 意图；只有排空转换按需读取 VDM 的 BG 引用关系，不保存第二份对象状态。IO 能力、空间分配能力和成员生命周期在分析上可以分别观察，而运行投影使用只包含合法组合的复合状态：
 
 ```rust
 enum MemberDiskState {
@@ -222,7 +222,7 @@ enum MemberDiskState {
 Allocatable(m)=IoUp(m)\land AllocationActive(m)\land Member(m)
 \]
 
-因此 `DA` 保留的是“分配策略尚未关闭”的策略含义，而不是允许向 IO 能力为 Down 的盘实际分配空间。当前原型把 `PhysicalChanged { state, observed_at }` 作为运行槽中的 active 事件，由穷举状态表根据对象状态和当前事件选择并直接执行一个业务步骤。状态表不持有 Actor、channel、Future、task 或锁。
+因此 `DA` 保留的是“分配策略尚未关闭”的策略含义，而不是允许向 IO 能力为 Down 的盘实际分配空间。当前原型把 `PhysicalChanged { state, observed_at }` 作为运行槽中的 active 事件，由穷举状态表根据对象状态和当前事件选择并直接执行一个业务步骤，再验证该步骤声明的结束状态。状态表不持有 Actor、channel、Future、task 或锁。
 
 ### 5.3 PoolNode
 
@@ -490,7 +490,7 @@ Footprint(o_1)\cap Footprint(o_2)\neq\varnothing
 由此得到分工：
 
 - 当前 MemberDisk Service 用可执行状态表选择业务步骤，领域对象方法校验状态变化；
-- 外部事实或意图通过明确 MemberDiskClient 到达领域专属运行循环，并先提交到 MemberDisk；
+- 外部事实或意图通过明确 MemberDiskClient 到达领域专属运行循环；物理事实留在 active/pending 事件中，Shrink 意图由第一条转换提交到 MemberDisk；
 - 私有运行循环对同一盘至多运行一个 active step；事件未改变对象时自然合并，改变对象时标记重新计算并请求当前调用链协作停止；
 - 旧 Future 稳定退出后，Runtime 重新读取最新对象并选择下一步；不同硬盘可以并行；
 - 这些语义当前是 MemberDisk 的具体实现，不预设为所有领域的统一框架；
@@ -529,18 +529,21 @@ CancelDecision(State_o,CommittedEffects,Cause)
 
 ```text
 Offline:
-UA --ObserveDown(SDB) + SetDiskState::Down--> DA
+UA --SetDiskState::Down + ApplyDown----------> DA
 DA --recovery window + DisableAllocation----> DI
-DI --VDm evacuate + Remove------------------> REMOVED
+DI/HasRefs --VDm evacuate--------------------> DI/NoRefs
+DI/NoRefs --Remove---------------------------> REMOVED
 
 Online replacement:
 DA/DI --old Workflow settles----------------> OpenDisk
       --SetDiskState::Up + CompleteOnline----> UA
 
 Shrink:
-UA --DisableAllocation-----------------------> UI
-UI --VDm evacuate + SetDiskState::Down
-   --Remove----------------------------------> REMOVED
+UA/Normal --RequestShrink--------------------> UA/Shrinking
+UA/Shrinking --DisableAllocation-------------> UI/Shrinking
+UI/Shrinking/HasRefs --VDm evacuate----------> UI/Shrinking/NoRefs
+UI/Shrinking/NoRefs --SetDiskState::Down-----> DI/Shrinking/NoRefs
+DI/Shrinking/NoRefs --Remove-----------------> REMOVED
 ```
 
 其中 `DA -> DI` 不是不可逆承诺。排空期间收到物理 UP 时，事件进入 pending 并请求当前 step 协作停止；VdDomain 必须等待在途 BG 到稳定结果后返回。旧 Future 退出后，UP 成为 active 事件，状态表从最新 MemberDisk 选择 `OpenDisk -> SetDiskState::Up -> CompleteOnline`。当前代码不为了表达这段过程再保存一份独立状态机副本。
@@ -698,21 +701,29 @@ Reconcile(P^{mem},P^{real})
 
 ### 14.1 普通开发者的编程表面
 
-当前 MemberDisk 纵切面使用一张可执行状态表。开发者直接阅读“当前对象状态、active 事件、Shrink 意图、业务方法和目标状态”，不需要理解 Action DSL 或执行转发表。顶层只按对象状态分派，每个状态函数完整列出“未缩容/缩容中 × DOWN/UP/Shrink”：
+当前 MemberDisk 纵切面使用一张可执行状态表。开发者直接阅读“当前对象状态、active 事件、Shrink 意图、业务方法和目标状态”，不需要理解 Action DSL 或执行转发表。每条非稳态规则遵循同一合同：
+
+```text
+start_state + event -> await action -> verify finish_state
+```
+
+顶层只按对象状态分派，每个状态函数完整列出“未缩容/缩容中 × DOWN/UP/Shrink”：
 
 ```rust
-match member.state() {
-    UpActive => self.reconcile_up_active(disk, event, shrink).await,
-    UpInactive => self.reconcile_up_inactive(disk, event, shrink, cancel).await,
-    DownActive => self.reconcile_down_active(disk, event, shrink, cancel).await,
-    DownInactive => self.reconcile_down_inactive(disk, event, shrink, cancel).await,
-    Removed => self.reconcile_removed(disk, event, shrink, cancel).await,
+match start.member {
+    UpActive => self.reconcile_up_active(disk, event, start).await,
+    UpInactive => self.reconcile_up_inactive(disk, event, start, cancel).await,
+    DownActive => self.reconcile_down_active(disk, event, start, cancel).await,
+    DownInactive => self.reconcile_down_inactive(disk, event, start, cancel).await,
+    Removed => self.reconcile_removed(disk, event, start, cancel).await,
 }
 ```
 
 例如 `reconcile_up_active` 明确表达：未缩容时 DOWN 关闭 IO、UP 已稳定、Shrink 先提交管理意图；缩容中 DOWN 仍先完成不可打断的 IO 安全边界，而 UP 和重复 Shrink 都继续关闭空间分配。重复分支被有意保留，使单个状态的全部规则可以独立审查。
 
 DOWN、UP、Shrink 都是 `MemberDiskEvent`。DOWN/UP 只进入执行槽；Shrink 第一个稳定步骤提交 `shrink_requested`。`set_disk_down` 是状态表直接调用的领域方法：它调用 PoolNode 的单次通用广播能力，但“失败必须重试、盘级冲突不能取消”的策略属于 MemberDisk。`SetDiskState::Down` 对 user_dp 同时表示接收 DOWN 和停止 IO，成功后再通过 `commit_change(ApplyDown)` 提交有效 `io_state=Down`。
+
+完整状态不等于每一步读取所有领域。普通转换的起止状态由 `MemberDiskState + shrink_requested` 构成；只有排空规则需要读取 VDM 的 `has_references`。排空 Future 返回后再次查询 VDM，只有引用确实清零才满足 finish state。这样既能验证跨领域效果，也不会让不可失败的 DOWN 转换依赖 VDM 可用性。
 
 若主节点在 user_dp 成功后、`ApplyDown` 提交前退出，新主从 DiskMap 重新取得 DOWN 事实，并根据尚未推进的 `io_state` 重放幂等动作，不会把外部事实误当成外部效果已经完成。
 
@@ -724,7 +735,7 @@ DOWN、UP、Shrink 都是 `MemberDiskEvent`。DOWN/UP 只进入执行槽；Shrin
 4. 业务代码不构造 `TaskSpec`、`BoxFuture` 或 `move |task| async move`；
 5. Operation Context 作为附加上下文传播因果、取消和 Trace，不成为执行主体；
 6. MemberDisk 决策元数据统一走“只读校验 -> MetadataService 提交字段级更新 -> 内存应用”的公共路径；业务工作流不操作 Guard，不传完整对象快照，也不重复编写持久化模板；
-7. 每个状态表分支使用近似同步的 `await` 表达一步真实业务；取消由恢复窗口和下游领域能力在稳定边界解释；
+7. 每个状态表分支使用近似同步的 `await` 表达一个 action，并在返回后验证 finish state；取消由恢复窗口和下游领域能力在稳定边界解释；
 8. 不同事件到达时，私有运行循环将其加入 pending 并取消当前 step；旧 Future 稳定退出后用下一个事件重新读取对象。
 
 ### 14.2 策略声明与机制执行

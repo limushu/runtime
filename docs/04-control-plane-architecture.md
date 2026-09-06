@@ -124,7 +124,7 @@ PoolCore 不直接拥有全部 MemberDisk、VD 和 BG 数据。
 - 工作流如何协作取消、恢复和审计；
 - 是否值得抽取公共执行机制。
 
-业务执行优先实现为所属 Service 上的自然 `async fn`。复杂可打断对象由可执行状态表读取完整对象，直接选择并调用一个业务步骤；步骤成功提交后重新读取对象选择下一步，不需要 Action enum 或内部结果事件。简单线性操作仍可以直接运行完整 Future。Operation Context 只传播因果、取消和 Trace；决定流程走向的事实必须保存在领域对象中。
+业务执行优先实现为所属 Service 上的自然 `async fn`。复杂可打断对象由可执行状态表读取当前转换需要的权威状态，直接选择并 `await` 一个业务步骤；随后验证声明的结束状态，再重新读取权威状态选择下一步。状态表不需要 Action enum 或内部结果事件。简单线性操作仍可以直接运行完整 Future。Operation Context 只传播因果、取消和 Trace；决定流程走向的事实必须来自其领域权威来源。
 
 ### 当前执行实现与显式领域能力
 
@@ -148,7 +148,8 @@ self.virtual_disks.evacuate_member_disk(&context, disk).await?;
 - 所有 SDB 决策字段复用私有 `commit_change` 路径：对象只读校验，`MetadataService` 提交字段级 `MemberDiskUpdate`，成功后再把同一更新应用到内存对象；
 - `MetadataService` 不接收完整 `MemberDisk`，不拥有领域对象，也不提供 MemberDisk 业务查询；
 - DOWN、UP、Shrink 统一进入每盘执行槽；`reconcile_once` 直接按 `(MemberDiskState, active MemberDiskEvent, shrink_requested)` 调用一个业务方法。物理事件不触发 MemberDisk 元数据更新；Shrink 第一步提交持久化管理意图；
-- 状态表没有 Action enum、执行转发表或兜底分支；每一步成功后重新读取对象并验证目标状态；
+- 每个非稳态分支完整表达 `start_state + event -> action -> finish_state`。action 通过普通 `await` 直接调用，完成后验证权威后置条件；状态表没有 Action enum、执行转发表或兜底分支；
+- VDM 的 `has_references` 是 BG 引用是否清空的权威判定。它只在排空转换中读取，避免 DOWN 安全边界依赖无关服务；
 - `SetDiskState::Down` 是一个动作：user_dp 接收 DOWN 的同时停止该盘 IO；
 - 私有运行状态拥有 active 事件、pending 事件队列、当前 step Future、取消令牌和等待者；
 - 相邻同类事件自然合并；不同事件进入 pending 并请求当前 step 协作停止，稳定返回后由 pending 事件与最新 MemberDisk 状态重新计算；需要最终结果的调用方显式使用 `wait_idle`；
