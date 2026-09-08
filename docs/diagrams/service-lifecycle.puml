@@ -1,0 +1,43 @@
+@startuml
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+
+[*] --> Initializing
+Initializing --> Running : initialize ok
+Initializing --> Stopping : stop
+Initializing --> Draining : drain
+Initializing --> Failed : initialize failed
+
+Running --> Paused : pause
+Paused --> Running : resume
+Running --> Draining : drain / clients closed
+Paused --> Draining : drain / clients closed
+Running --> Stopping : stop
+Paused --> Stopping : stop
+Draining --> Stopping : stop
+Running --> Failed : root handler panic
+Paused --> Failed : in-flight handler panic
+Draining --> Failed : in-flight handler panic
+Stopping --> Failed : in-flight handler panic
+
+Draining --> Stopped : accepted work settled\nshutdown ok
+Stopping --> Stopped : cooperative cancellation settled\nshutdown ok
+Draining --> Failed : shutdown failed
+Stopping --> Failed : shutdown failed
+
+note right of Draining
+  Reject new business
+  Do not cancel accepted Futures
+end note
+
+note right of Stopping
+  Reject new business
+  Cancel service tree and cancellable Tasks
+  Wait for stable settlement
+end note
+
+note bottom of Stopped
+  ServiceTask::abort or dropping its ownership
+  force-drops the root Future as the final escape hatch
+end note
+@enduml

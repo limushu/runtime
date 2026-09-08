@@ -191,6 +191,27 @@ impl MemberDisk {
         self.allocation_bitmap.allocate_one()
     }
 
+    /// Selects one BLK without publishing an in-memory mutation. The service
+    /// uses this to build a cross-disk allocation that is committed to SDB
+    /// before it becomes visible in memory.
+    pub(crate) fn plan_blk_allocation(&self) -> Result<BlkId, MemberDiskError> {
+        if !self.can_allocate() {
+            return Err(MemberDiskError::NotAllocatable {
+                state: self.state(),
+            });
+        }
+        self.allocation_bitmap
+            .next_free()
+            .ok_or(MemberDiskError::NoFreeBlk)
+    }
+
+    /// Publishes one allocation that the metadata service already committed.
+    pub(crate) fn apply_committed_allocation(&mut self, blk: BlkId) {
+        self.allocation_bitmap
+            .mark_allocated(blk)
+            .expect("a committed allocation plan must still be valid");
+    }
+
     /// Releases an existing BLK even while the disk is Down or Inactive.
     pub fn release_blk(&mut self, blk: BlkId) -> Result<(), MemberDiskError> {
         self.ensure_member()?;
@@ -396,6 +417,9 @@ pub enum MemberDiskError {
     BlkNotAllocated {
         blk: BlkId,
     },
+    BlkAlreadyAllocated {
+        blk: BlkId,
+    },
     AllocationStillActive,
     BlksStillAllocated {
         allocated_blks: u64,
@@ -424,6 +448,9 @@ impl fmt::Display for MemberDiskError {
             ),
             Self::BlkNotAllocated { blk } => {
                 write!(f, "BLK {} is not allocated", blk.index())
+            }
+            Self::BlkAlreadyAllocated { blk } => {
+                write!(f, "BLK {} is already allocated", blk.index())
             }
             Self::AllocationStillActive => {
                 write!(f, "allocation must be disabled before removing member disk")

@@ -1,4 +1,4 @@
-use super::{DiskIoState, DiskUuid, MemberDiskUpdate};
+use super::{BlkRef, DiskIoState, DiskUuid, MemberDiskUpdate};
 use async_trait::async_trait;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +32,11 @@ pub trait MetadataService: Send + Sync {
         disk: &DiskUuid,
         update: &MemberDiskUpdate,
     ) -> Result<(), MetadataError>;
+
+    /// Atomically commits one cross-disk BLK allocation to the SDB Partition
+    /// representation. The MemberDisk service publishes the same allocation
+    /// to memory only after this call succeeds.
+    async fn allocate_blks(&self, blks: &[BlkRef]) -> Result<(), MetadataError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

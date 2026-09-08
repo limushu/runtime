@@ -12,6 +12,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     Metadata(MemberDiskUpdate),
+    Allocate(Vec<BlkRef>),
     PoolNode(UserDpRequest),
     Evacuate(DiskUuid),
 }
@@ -32,6 +33,14 @@ impl MetadataService for Metadata {
             return Err(MetadataError::new("SDB unavailable"));
         }
         self.calls.lock().await.push(Call::Metadata(update.clone()));
+        Ok(())
+    }
+
+    async fn allocate_blks(&self, blks: &[BlkRef]) -> Result<(), MetadataError> {
+        if self.fail {
+            return Err(MetadataError::new("SDB unavailable"));
+        }
+        self.calls.lock().await.push(Call::Allocate(blks.to_vec()));
         Ok(())
     }
 }
@@ -193,13 +202,20 @@ impl VirtualDiskService for VirtualDisks {
 }
 
 fn member() -> MemberDisk {
+    member_in("disk-1", "tier-ssd", "rack-1")
+}
+
+fn member_in(uuid: &str, tier: &str, rack: &str) -> MemberDisk {
     let mut disk = MemberDisk::new(
-        DiskUuid::new("disk-1"),
+        DiskUuid::new(uuid),
         "pool-1",
-        "tier-ssd",
+        tier,
         "ssd",
         GIB,
-        vec![FailureDomain::new("node", "node-1")],
+        vec![
+            FailureDomain::new("node", format!("node-{uuid}")),
+            FailureDomain::new("rack", rack),
+        ],
     )
     .unwrap();
     disk.mark_io_up().unwrap();
@@ -208,7 +224,14 @@ fn member() -> MemberDisk {
 
 type RuntimeParts = (
     MemberDiskClient,
-    tokio::task::JoinHandle<()>,
+    crate::runtime::ServiceTask,
+    Arc<Mutex<Vec<Call>>>,
+    Arc<Nodes>,
+    Arc<VirtualDisks>,
+);
+
+type SpawnedRuntimeParts = (
+    MemberDiskRuntime,
     Arc<Mutex<Vec<Call>>>,
     Arc<Nodes>,
     Arc<VirtualDisks>,
@@ -219,6 +242,35 @@ fn runtime(
     controlled_evacuation: bool,
     fail_metadata: bool,
 ) -> RuntimeParts {
+    runtime_with_members(
+        vec![member()],
+        recovery_window,
+        controlled_evacuation,
+        fail_metadata,
+    )
+}
+
+fn runtime_with_members(
+    members: Vec<MemberDisk>,
+    recovery_window: std::time::Duration,
+    controlled_evacuation: bool,
+    fail_metadata: bool,
+) -> RuntimeParts {
+    let (running, calls, nodes, virtual_disks) = spawn_runtime_with_members(
+        members,
+        recovery_window,
+        controlled_evacuation,
+        fail_metadata,
+    );
+    (running.client, running.task, calls, nodes, virtual_disks)
+}
+
+fn spawn_runtime_with_members(
+    members: Vec<MemberDisk>,
+    recovery_window: std::time::Duration,
+    controlled_evacuation: bool,
+    fail_metadata: bool,
+) -> SpawnedRuntimeParts {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let nodes = Arc::new(Nodes {
         calls: calls.clone(),
@@ -242,7 +294,7 @@ fn runtime(
         max_active: AtomicUsize::new(0),
     });
     let service = MemberDiskService::new(
-        vec![member()],
+        members,
         Arc::new(Metadata {
             calls: calls.clone(),
             fail: fail_metadata,
@@ -251,8 +303,8 @@ fn runtime(
         virtual_disks.clone(),
         recovery_window,
     );
-    let (client, task) = service.spawn(16);
-    (client, task, calls, nodes, virtual_disks)
+    let running = service.spawn(16);
+    (running, calls, nodes, virtual_disks)
 }
 
 fn physical(state: PhysicalState, observed_at: u64) -> MemberDiskEvent {
@@ -263,7 +315,7 @@ fn physical(state: PhysicalState, observed_at: u64) -> MemberDiskEvent {
     }
 }
 
-async fn stop(client: MemberDiskClient, task: tokio::task::JoinHandle<()>) {
+async fn stop(client: MemberDiskClient, task: crate::runtime::ServiceTask) {
     drop(client);
     task.await.unwrap();
 }
@@ -274,13 +326,17 @@ async fn offline_is_driven_to_removed_by_the_state_table() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(physical(PhysicalState::Down, 1_000))
+        .call(physical(PhysicalState::Down, 1_000))
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
     assert_eq!(
-        client.get(disk.clone()).await.unwrap().state(),
+        client
+            .call(GetMemberDisk(disk.clone()))
+            .await
+            .unwrap()
+            .state(),
         MemberDiskState::Removed
     );
     assert_eq!(
@@ -306,18 +362,18 @@ async fn online_cancels_the_recovery_wait_and_returns_to_up_active() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
     nodes.wait_down().await;
     client
-        .submit(physical(PhysicalState::Up, current_time()))
+        .call(physical(PhysicalState::Up, current_time()))
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
     assert_eq!(
-        client.get(disk).await.unwrap().state(),
+        client.call(GetMemberDisk(disk)).await.unwrap().state(),
         MemberDiskState::UpActive
     );
     assert_eq!(virtual_disks.call_count(), 0);
@@ -337,17 +393,17 @@ async fn up_cannot_interrupt_the_required_down_broadcast() {
     nodes.block_down();
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
     nodes.wait_down_started().await;
 
     client
-        .submit(physical(PhysicalState::Up, current_time()))
+        .call(physical(PhysicalState::Up, current_time()))
         .await
         .unwrap();
     nodes.release_down();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
     let node_calls: Vec<_> = calls
         .lock()
@@ -373,7 +429,7 @@ async fn up_cannot_interrupt_the_required_down_broadcast() {
         ]
     );
     assert_eq!(
-        client.get(disk).await.unwrap().state(),
+        client.call(GetMemberDisk(disk)).await.unwrap().state(),
         MemberDiskState::UpActive
     );
     stop(client, task).await;
@@ -386,12 +442,12 @@ async fn repeated_down_is_merged_in_the_disk_slot() {
     nodes.block_down();
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
     nodes.wait_down_started().await;
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
 
@@ -399,11 +455,82 @@ async fn repeated_down_is_merged_in_the_disk_slot() {
     nodes.release_down();
 
     client
-        .submit(physical(PhysicalState::Up, current_time()))
+        .call(physical(PhysicalState::Up, current_time()))
         .await
         .unwrap();
-    client.wait_idle(disk).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk)).await.unwrap();
     assert_eq!(nodes.down_attempts(), 1);
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn member_disk_conflict_and_progress_are_visible_as_structured_runtime_data() {
+    let (running, _, nodes, _) = spawn_runtime_with_members(
+        vec![member()],
+        std::time::Duration::from_secs(3_600),
+        false,
+        false,
+    );
+    let client = running.client;
+    let observer = running.observer;
+    let task = running.task;
+    let disk = DiskUuid::new("disk-1");
+    nodes.block_down();
+
+    client
+        .call(physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    nodes.wait_down_started().await;
+
+    let snapshot = observer.snapshot();
+    assert_eq!(
+        snapshot.lifecycle,
+        crate::runtime::ServiceLifecycle::Running
+    );
+    assert_eq!(snapshot.activity, crate::runtime::ServiceActivity::Busy);
+    assert_eq!(snapshot.active_tasks.len(), 1);
+    assert_eq!(snapshot.active_tasks[0].key, "disk/disk-1");
+    assert_eq!(snapshot.active_tasks[0].kind, "offline");
+    assert!(!snapshot.active_tasks[0].trace_id.is_empty());
+
+    client
+        .call(physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    assert_eq!(observer.snapshot().active_tasks.len(), 1);
+
+    client
+        .call(physical(PhysicalState::Up, current_time()))
+        .await
+        .unwrap();
+    assert_eq!(
+        observer.snapshot().active_tasks[0].state,
+        crate::runtime::TaskState::Cancelling
+    );
+
+    nodes.release_down();
+    client.call(WaitMemberDiskIdle(disk)).await.unwrap();
+
+    let history = observer.history();
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        crate::runtime::RuntimeEventKind::TaskCancelRequested { cause, .. }
+            if cause.contains("online")
+    )));
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        crate::runtime::RuntimeEventKind::StateTransition { action, .. }
+            if action == "set disk DOWN"
+    )));
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        crate::runtime::RuntimeEventKind::TaskFinished {
+            outcome: crate::runtime::TaskOutcome::Cancelled,
+            ..
+        }
+    )));
+
     stop(client, task).await;
 }
 
@@ -414,17 +541,17 @@ async fn shrink_replaces_the_recovery_wait_without_losing_its_intent() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
     nodes.wait_down().await;
     client
-        .submit(MemberDiskEvent::Shrink { disk: disk.clone() })
+        .call(MemberDiskEvent::Shrink { disk: disk.clone() })
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
-    let removed = client.get(disk).await.unwrap();
+    let removed = client.call(GetMemberDisk(disk)).await.unwrap();
     assert_eq!(removed.state(), MemberDiskState::Removed);
     assert!(removed.shrink_requested());
     assert_eq!(virtual_disks.call_count(), 1);
@@ -438,14 +565,14 @@ async fn disk_service_retries_a_failed_down_broadcast() {
     nodes.fail_next_down(1);
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
     assert_eq!(nodes.down_attempts(), 2);
     assert_eq!(
-        client.get(disk).await.unwrap().state(),
+        client.call(GetMemberDisk(disk)).await.unwrap().state(),
         MemberDiskState::Removed
     );
     stop(client, task).await;
@@ -457,7 +584,7 @@ async fn dropping_the_client_drains_a_required_down_broadcast() {
     nodes.block_down();
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
     nodes.wait_down_started().await;
@@ -490,7 +617,7 @@ async fn aborting_the_root_task_force_drops_a_blocked_down_broadcast() {
     nodes.block_down();
 
     client
-        .submit(physical(PhysicalState::Down, current_time()))
+        .call(physical(PhysicalState::Down, current_time()))
         .await
         .unwrap();
     nodes.wait_down_started().await;
@@ -512,10 +639,10 @@ async fn shrink_drains_before_stopping_io_and_removing_the_disk() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(MemberDiskEvent::Shrink { disk: disk.clone() })
+        .call(MemberDiskEvent::Shrink { disk: disk.clone() })
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
     assert_eq!(
         calls.lock().await.as_slice(),
@@ -531,7 +658,7 @@ async fn shrink_drains_before_stopping_io_and_removing_the_disk() {
             Call::Metadata(MemberDiskUpdate::Remove),
         ]
     );
-    let removed = client.get(disk.clone()).await.unwrap();
+    let removed = client.call(GetMemberDisk(disk.clone())).await.unwrap();
     assert_eq!(removed.state(), MemberDiskState::Removed);
     assert!(removed.shrink_requested());
     stop(client, task).await;
@@ -543,24 +670,28 @@ async fn a_new_up_event_rejoins_a_disk_removed_by_shrink() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(MemberDiskEvent::Shrink { disk: disk.clone() })
+        .call(MemberDiskEvent::Shrink { disk: disk.clone() })
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
     assert_eq!(
-        client.get(disk.clone()).await.unwrap().state(),
+        client
+            .call(GetMemberDisk(disk.clone()))
+            .await
+            .unwrap()
+            .state(),
         MemberDiskState::Removed
     );
 
     // The physical value was already Up before removal. This new event is
     // nevertheless an explicit rejoin request and clears the Shrink intent.
     client
-        .submit(physical(PhysicalState::Up, 3_000))
+        .call(physical(PhysicalState::Up, 3_000))
         .await
         .unwrap();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
 
-    let rejoined = client.get(disk).await.unwrap();
+    let rejoined = client.call(GetMemberDisk(disk)).await.unwrap();
     assert_eq!(rejoined.state(), MemberDiskState::UpActive);
     assert!(!rejoined.shrink_requested());
     stop(client, task).await;
@@ -572,13 +703,13 @@ async fn down_during_shrink_settles_then_resumes_from_the_real_state() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(MemberDiskEvent::Shrink { disk: disk.clone() })
+        .call(MemberDiskEvent::Shrink { disk: disk.clone() })
         .await
         .unwrap();
     virtual_disks.wait_started().await;
 
     client
-        .submit(physical(PhysicalState::Down, 2_000))
+        .call(physical(PhysicalState::Down, 2_000))
         .await
         .unwrap();
     nodes.wait_down().await;
@@ -588,9 +719,9 @@ async fn down_during_shrink_settles_then_resumes_from_the_real_state() {
     assert_eq!(virtual_disks.max_active.load(Ordering::SeqCst), 1);
 
     virtual_disks.release_one();
-    client.wait_idle(disk.clone()).await.unwrap();
+    client.call(WaitMemberDiskIdle(disk.clone())).await.unwrap();
     assert_eq!(
-        client.get(disk).await.unwrap().state(),
+        client.call(GetMemberDisk(disk)).await.unwrap().state(),
         MemberDiskState::Removed
     );
     stop(client, task).await;
@@ -602,17 +733,17 @@ async fn failed_sdb_change_is_not_published_to_memory() {
     let disk = DiskUuid::new("disk-1");
 
     client
-        .submit(physical(PhysicalState::Down, 1_000))
+        .call(physical(PhysicalState::Down, 1_000))
         .await
         .unwrap();
     assert_eq!(
-        client.wait_idle(disk.clone()).await,
+        client.call(WaitMemberDiskIdle(disk.clone())).await,
         Err(MemberDiskServiceError::Metadata(MetadataError::new(
             "SDB unavailable"
         )))
     );
     assert_eq!(
-        client.get(disk).await.unwrap().state(),
+        client.call(GetMemberDisk(disk)).await.unwrap().state(),
         MemberDiskState::UpActive
     );
     stop(client, task).await;
@@ -625,18 +756,107 @@ async fn evacuation_must_reach_its_declared_finish_state() {
     virtual_disks.keep_references_after_success();
 
     client
-        .submit(MemberDiskEvent::Shrink { disk: disk.clone() })
+        .call(MemberDiskEvent::Shrink { disk: disk.clone() })
         .await
         .unwrap();
 
     assert!(matches!(
-        client.wait_idle(disk.clone()).await,
+        client.call(WaitMemberDiskIdle(disk.clone())).await,
         Err(MemberDiskServiceError::TransitionIncomplete(_))
     ));
     assert_eq!(
-        client.get(disk).await.unwrap().state(),
+        client.call(GetMemberDisk(disk)).await.unwrap().state(),
         MemberDiskState::UpInactive
     );
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn typed_call_allocates_blks_from_member_disks_in_one_tier() {
+    let members = vec![
+        member_in("disk-1", "tier-ssd", "rack-1"),
+        member_in("disk-2", "tier-ssd", "rack-2"),
+        member_in("disk-3", "tier-hdd", "rack-3"),
+    ];
+    let (client, task, calls, _, _) =
+        runtime_with_members(members, std::time::Duration::ZERO, false, false);
+
+    let allocation = client
+        .call(AllocateBlks::new("tier-ssd", 2).distinct_by("rack"))
+        .await
+        .unwrap();
+
+    assert_eq!(allocation.blks().len(), 2);
+    assert_eq!(allocation.blks()[0].disk(), &DiskUuid::new("disk-1"));
+    assert_eq!(allocation.blks()[1].disk(), &DiskUuid::new("disk-2"));
+    assert!(
+        calls
+            .lock()
+            .await
+            .contains(&Call::Allocate(allocation.blks().to_vec()))
+    );
+    assert_eq!(
+        client
+            .call(GetMemberDisk(DiskUuid::new("disk-1")))
+            .await
+            .unwrap()
+            .allocation_bitmap()
+            .allocated_blks(),
+        1
+    );
+
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn failed_blk_allocation_is_not_published_to_memory() {
+    let (client, task, _, _, _) = runtime(std::time::Duration::ZERO, false, true);
+    let disk = DiskUuid::new("disk-1");
+
+    assert!(matches!(
+        client.call(AllocateBlks::new("tier-ssd", 1)).await,
+        Err(MemberDiskServiceError::Metadata(_))
+    ));
+    assert_eq!(
+        client
+            .call(GetMemberDisk(disk))
+            .await
+            .unwrap()
+            .allocation_bitmap()
+            .allocated_blks(),
+        0
+    );
+
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn blk_allocation_excludes_a_disk_with_an_active_lifecycle_event() {
+    let (client, task, _, nodes, _) = runtime(std::time::Duration::from_secs(3_600), false, false);
+    let disk = DiskUuid::new("disk-1");
+    nodes.block_down();
+
+    client
+        .call(physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    nodes.wait_down_started().await;
+
+    assert_eq!(
+        client.call(AllocateBlks::new("tier-ssd", 1)).await,
+        Err(MemberDiskServiceError::InsufficientAllocationCandidates {
+            tier: "tier-ssd".into(),
+            requested: 1,
+            available: 0,
+        })
+    );
+
+    client
+        .call(physical(PhysicalState::Up, current_time()))
+        .await
+        .unwrap();
+    nodes.release_down();
+    client.call(WaitMemberDiskIdle(disk)).await.unwrap();
     stop(client, task).await;
 }
 

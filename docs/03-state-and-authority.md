@@ -120,7 +120,7 @@ Operation 观测记录不能保存决定流程走向的独立 `phase/status` 真
 | MemberDisk 有效 IO 能力 | SDB 中持久化的 `MemberDisk` 决策字段 | `io_state` 只在对应 user_dp 动作成功后提交 |
 | DOWN 起始时间 | DiskMap 事件的 `observed_at` | 随 active/pending 事件存在，不进入 MemberDisk |
 | MemberDisk UA/DA/DI/UI/Removed | 由 IO 能力、Allocation、Membership 派生 | 只读运行投影，不是第二份核心元数据 |
-| MemberDisk 在途 reconciliation | `MemberDiskService::run` 的局部对象槽 | 每盘保存 active 事件、pending 事件、取消令牌和 IdleWaiter，不进入 SDB 业务真相 |
+| MemberDisk 在途 reconciliation | 公共 `ObjectTaskCoordinator` + Runtime Task Registry | 每盘保存 active/pending 输入和取消控制，Task 保存进度/Trace；都不进入 SDB 业务真相 |
 | VD 类型、冗余、ChunkSize | SDB | VD 决策上下文 |
 | BGMap | SDB | 逻辑介质映射工作集 |
 | BGEntry 数据有效性 | SDB | 与介质事实共同计算 BG 状态 |
@@ -131,7 +131,7 @@ Operation 观测记录不能保存决定流程走向的独立 `phase/status` 真
 | BG、VD、Pool 健康状态 | 派生规则 | 计算并对外发布 |
 | 共享缓存使用关系 | 待确认 | 构造跨 Pool 缓存视图 |
 | Operation Context/里程碑 | 业务观测平面，存储位置待定 | 因果关联和进度投影，不驱动业务决策 |
-| Workflow/Task Attempt/Future | 当前由 MemberDisk 私有运行循环承载 | 临时执行，不作为核心事实 |
+| Workflow/Task Attempt/Future | 当前由 MemberDisk 根循环与公共对象槽承载 | 临时执行，不作为核心事实 |
 | CausalGraph | 业务观测平面，存储位置待定 | 实时与历史影响追溯 |
 
 DiskMap/NodeMap 通知本身不是新的权威数据副本；它们是权威全局视图发生变化后，驱动 Pool 更新和决策的事实载体。

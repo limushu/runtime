@@ -17,7 +17,7 @@ package "PoolManager" {
 
 package "One Pool" {
   component "MemberDiskClient" as Client
-  component "MemberDiskService::run\none root task" as Runtime
+  component "ServiceRuntime root\none Tokio task" as Runtime
   component "MemberDiskService" as Service
   database "MemberDisk Objects" as Objects
   component "MetadataService" as Metadata
