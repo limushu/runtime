@@ -80,7 +80,7 @@ MemberDisk 的对象规则和可执行状态表保留在领域内；已从纵切
 
 ### D-019 跨服务通信属于显式 Service 能力
 
-领域之间使用指向明确目标实例的类型化 Service facade。其内部 `ServiceClient<R>` 封装 channel、oneshot 和 Operation Context 传播；请求不携带隐藏的目标 ServiceId，也不通过请求类型自动查找服务。Task 不是跨服务通信能力的所有者。
+领域之间使用指向明确目标实例的类型化 Service facade。其内部 `ServiceClient<S>` 封装统一 Request/Reply Envelope、oneshot 和 Operation Context 传播；请求不携带隐藏的目标 ServiceId，也不通过请求类型自动查找服务。Task 不是跨服务通信能力的所有者。
 
 ### D-020 Operation 观测不能成为隐形业务 WAL
 
@@ -106,9 +106,9 @@ MemberDisk 的 SDB 决策记录、DiskMap 输入事实、Shrink 管理意图、U
 
 `REMOVED` 是 MemberDisk 的稳定成员状态，不表示从对象目录删除身份和历史元数据。之后收到物理 UP，MemberDisk 直接执行 Rejoin：在所有当前可服务 Pool 节点打开硬盘并发布 UP，成功后提交 `MemberDiskUpdate::Rejoin`，回到 `UA`。
 
-### D-026 一个类型化 call，响应语义由 Request 决定
+### D-026 每个 Service 使用统一 Request/Reply 协议
 
-目标 `ServiceClient` 已经确定路由，因此外部统一使用 `client.call(request)`。`ServiceRequest<P>` 静态关联 `Response`：MemberDisk 事件返回 `Accepted`，查询返回 `MemberDisk`，BLK 申请返回 `Allocation`。内部协议枚举和 typed oneshot 仍然显式存在，但普通调用者不需要理解或手写它们；当前不引入基于请求类型自动选服务的 Router，也不为隐藏一处清晰分发而引入异步类型擦除。
+目标 `ServiceClient<S>` 已经确定路由；`ManagedService` 为一个服务关联 `Request`、`Reply` 和领域 `Error`。通用 Envelope 携带 `S::Request` 与唯一的 `oneshot<Result<S::Reply, CallError<S::Error>>>`，因此生命周期拒绝无需让业务枚举逐项寻找返回通道。MemberDisk 的公开 facade 再把统一 `MemberDiskReply` 投影为事件的 `Accepted`、查询的 `MemberDisk` 和 BLK 申请的 `Allocation`，并以 `submit_in/get_in/wait_idle_in/allocate_blks_in` 保留跨服务 `OperationContext`。当前不引入基于请求类型自动选服务的 Router，也不为隐藏一处清晰分发而引入异步类型擦除。
 
 ### D-027 MemberDisk 领域拥有成员、Tier 与 BLK 分配
 
@@ -120,7 +120,7 @@ MemberDisk 的 SDB 决策记录、DiskMap 输入事实、Shrink 管理意图、U
 
 ### D-029 Runtime 生命周期与关闭语义
 
-Runtime 实现 `Initializing / Running / Paused / Draining / Stopping / Stopped / Failed`。Pause 只拒绝新请求并继续驱动在途工作；Drain 拒绝新请求且不取消已接收工作；Stop 请求 Service token 和可取消 Task 协作停止并等待稳定退出；Abort 才直接 drop 根 Future。控制通道在根 `select!` 中优先于业务通道。
+Runtime 实现 `Initializing / Running / Paused / Draining / Stopping / Stopped / Failed`。Pause 只拒绝新请求并继续驱动在途工作；Drain 拒绝新请求且不取消已接收工作；Stop 请求 Service token 和可取消 Task 协作停止并等待稳定退出；Abort 才直接 drop 根 Future。Drain/Stop 只在 shutdown 完成、旧队列已按 `Stopped/Failed` 终态拒绝后回复控制 waiter。handler panic 返回 `HandlerPanicked` 并使实例进入 `Failed`，其余在途 Future 被丢弃并以 `RequestAborted` 闭合；panic/abort 都显式产生 Request/Operation 完成事件。控制通道在根 `select!` 中优先于业务通道。
 
 ### D-030 Task 是可选执行尝试，观测不成为业务权威
 

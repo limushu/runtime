@@ -22,7 +22,7 @@ package "pool-control-plane crate" {
     component "ports.rs\nMetadata / PoolNode / VDM capabilities" as Ports
     package "service/" {
       component "mod.rs\nowned committed directory" as Service
-      component "client.rs\ntyped requests + private protocol" as Client
+      component "client.rs\ntyped facade + private unified protocol" as Client
       component "runtime.rs\nManagedService adaptation\nconflict rule + task attachment" as Adapter
       component "reconcile.rs\nexecutable state table" as Reconcile
       component "operations.rs\nnormal async business actions" as Operations

@@ -1,17 +1,21 @@
 use pool_control_plane::member_disk::{
-    Accepted, AllocateBlks, Allocation, GetMemberDisk, MemberDisk, MemberDiskClient,
-    MemberDiskEvent,
+    Accepted, AllocateBlks, Allocation, DiskUuid, MemberDisk, MemberDiskClient, MemberDiskEvent,
 };
+use pool_control_plane::runtime::OperationContext;
 
 #[allow(dead_code)]
-async fn typed_calls_are_usable_without_the_private_protocol(
+async fn facade_calls_are_usable_without_the_private_protocol(
     client: &MemberDiskClient,
+    operation: &OperationContext,
     event: MemberDiskEvent,
-    get: GetMemberDisk,
+    disk: DiskUuid,
 ) {
-    let _: Accepted = client.call(event).await.unwrap();
-    let _: MemberDisk = client.call(get).await.unwrap();
-    let _: Allocation = client.call(AllocateBlks::new("tier-ssd", 1)).await.unwrap();
+    let _: Accepted = client.submit_in(operation, event).await.unwrap();
+    let _: MemberDisk = client.get(disk).await.unwrap();
+    let _: Allocation = client
+        .allocate_blks_in(operation, AllocateBlks::new("tier-ssd", 1))
+        .await
+        .unwrap();
 }
 
 #[test]

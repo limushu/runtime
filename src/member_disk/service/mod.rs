@@ -5,9 +5,7 @@ mod operations;
 mod reconcile;
 mod runtime;
 
-pub use client::{
-    Accepted, GetMemberDisk, MemberDiskClient, MemberDiskRuntime, WaitMemberDiskIdle,
-};
+pub use client::{Accepted, MemberDiskCallError, MemberDiskClient, MemberDiskRuntime};
 pub use error::MemberDiskServiceError;
 
 use super::{

@@ -758,7 +758,8 @@ MemberDisk 的 `resolve_conflict` 将相邻同类事件判为 `Join`，将不同
 
 ```text
 MemberDisk ServiceInstance
-├── ServiceClient::call(Request) + typed oneshot
+├── MemberDiskClient：submit / get / wait_idle / allocate_blks
+│   └── ServiceClient<MemberDiskService> + unified Request/Reply Envelope
 ├── ServiceControl：Pause / Resume / Drain / Stop / CancelTask
 ├── ServiceObserver：Lifecycle / Idle-Busy / Task / Trace / structured events
 ├── ServiceTask：根 task 所有权、Join 和最终 Abort
@@ -767,18 +768,22 @@ MemberDisk ServiceInstance
 └── MemberDiskService：唯一元数据修改者与可执行状态表
 ```
 
-当前 MemberDisk 采用一个公共根 task 直接 poll 多个请求和多盘 Workflow Future。这是具体实现而不是领域模型定理。Channel Close 和显式 Drain 停止接收新请求并等待已有 Future；Stop 请求协作取消并等待稳定退出；ServiceTask::abort 才直接 drop 根 Future。ServiceTask 所有权被遗忘时也会自动 abort，防止后台服务泄漏。
+当前 MemberDisk 采用一个公共根 task 直接 poll 多个请求和多盘 Workflow Future。这是具体实现而不是领域模型定理。Channel Close 和显式 Drain 停止接收新请求并等待已有 Future；Stop 请求协作取消并等待稳定退出。Drain/Stop 在 shutdown 完成并以 `Stopped/Failed` 拒绝旧队列后才回复 waiter。ServiceTask::abort 才直接 drop 根 Future；ServiceTask 所有权被遗忘时也会自动 abort，防止后台服务泄漏，并以 `RequestAborted` 与完成事件闭合已接收请求。
 
 ### 14.4 Service Client 与领域 facade 契约
 
-当前 `MemberDiskClient` 是 `ServiceClient<MemberDiskMessage>` 的公开别名，只持有指向该 Service 实例的业务发送端和运行状态预检能力，负责：
+当前 `MemberDiskClient` 是领域 facade，内部包装 `ServiceClient<MemberDiskService>`，只持有指向该 Service 实例的业务发送端和运行状态预检能力，负责：
 
-- 封装业务通道和 oneshot；
-- 通过统一 `call(Request)` 和 typed oneshot 返回请求接收、查询、等待及 BLK 分配结果；
+- 封装统一的 `MemberDiskRequest` / `MemberDiskReply` 协议和 Envelope oneshot；
+- 通过 `submit/get/wait_idle/allocate_blks` 把统一 Reply 投影为业务调用方期望的具体结果，并用对应 `_in` 方法在跨服务调用时保留 `OperationContext`；
 - 不直接持有 `MemberDiskService` 或访问对象目录；
 - 为未来进程拆分保留类型化 request/response 语义。
 
-不存在“把任意请求交给全局 Router 自动选择目标”的隐式行为。调用者先取得明确的目标 Handle，再执行 `call(request)`。MemberDisk 的内部消息每个变体携带自身 typed oneshot，`ServiceRequest<MemberDiskMessage>` 在编译期绑定响应类型，因此不需要通用 Response enum。
+不存在“把任意请求交给全局 Router 自动选择目标”的隐式行为。调用者先取得明确的目标 Handle，再调用领域 facade。每个 Service 定义一组 `Request`、`Reply` 和领域 `Error`；通用 Envelope 持有一个返回通道，框架可直接返回 `CallError::Unavailable/ServiceStopped/RequestAborted/HandlerPanicked/ProtocolViolation`，业务失败则返回 `CallError::Business(error)`。
+
+Runtime 将 `ServiceReply` 以 `&mut` 借给 handler。事件 handler 可以先发送 `Accepted`，再继续驱动后台收敛；若 handler 在回复前返回领域错误，Runtime 自动把它发送给调用者；若成功结束却没有回复，Runtime 返回协议错误。提前回复后发生的后续错误进入请求和 Operation 观测；若流程创建了 Task，领域以对应 `TaskOutcome` 结束它，因为“已接收”和“最终收敛”是两个不同承诺。
+
+handler panic 会显式回复 `HandlerPanicked`、闭合自身 Request/Operation 并使 Service 进入 `Failed`；Runtime 随后 drop 其余在途 Future，它们通过 `ServiceReply` 与完成守卫返回 `RequestAborted` 并产生完成事件。强制 abort 同样闭合已接收请求，而正常 Drain/Stop 不产生 `RequestAborted`。
 
 Service Client 不负责判断业务冲突，也不拥有 Task。Task Registry 位于 Runtime 的 `ObservationHub`，领域仅在已经运行的 handler 中按需附加 `TaskAttempt`。Task 是对 Future 执行的观测与控制记录，不能成为业务流程主体或通信能力所有者。
 

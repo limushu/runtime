@@ -128,9 +128,9 @@ PoolCore 不直接拥有全部 MemberDisk、VD 和 BG 数据。
 
 ### 当前执行实现与显式领域能力
 
-当前不规定所有领域必须服从同一种对象调度策略。公共 `ServiceRuntime` 统一 typed channel/oneshot、单根 Future poll、生命周期、Task/Trace 与观测；可选的 `ObjectTaskCoordinator<K, I, E>` 管理每个 Key 的 active/pending 输入、精确取消和 idle waiters。业务方法仍是自然 `async fn`，MemberDisk 只在一处 `ManagedService` 适配中选择哪些请求进入对象槽、哪些请求创建 Task。
+当前不规定所有领域必须服从同一种对象调度策略。公共 `ServiceRuntime` 统一 Request/Reply Envelope、单根 Future poll、生命周期、Task/Trace 与观测；可选的 `ObjectTaskCoordinator<K, I, E>` 管理每个 Key 的 active/pending 输入、精确取消和 idle waiters。业务方法仍是自然 `async fn`，MemberDisk 只在一处 `ManagedService` 适配中选择哪些请求进入对象槽、哪些请求创建 Task。
 
-所有调用都使用指向明确目标实例的 Client。请求类型不声明目的地，也不存在依据请求类型自动选择服务的全局 Router。`client.call(request)` 通过请求的静态 `Response` 类型返回结果；是否直接查询、进入 DiskUuid 对象槽或执行 BLK 分配，由目标 Service 的私有协议决定。每个实例同时暴露独立 `ServiceControl`、`ServiceObserver` 和根 `ServiceTask`。
+所有调用都使用指向明确目标实例的 Client。请求类型不声明目的地，也不存在依据请求类型自动选择服务的全局 Router。每个 Service 关联一个完整的 `Request` enum、一个统一的 `Reply` enum 和一个领域 `Error`；领域 facade 把 `Reply` 投影成 `submit/get/allocate_blks` 等方法各自清晰的返回类型。是否直接查询、进入 DiskUuid 对象槽或执行 BLK 分配，由目标 Service 的显式协议分发决定。每个实例同时暴露独立 `ServiceControl`、`ServiceObserver` 和根 `ServiceTask`。
 
 跨领域端口仍可以提供命名能力，例如：
 
@@ -139,7 +139,7 @@ self.pool_nodes.publish_member_disk(&context, disk, Down).await?;
 self.virtual_disks.evacuate_member_disk(&context, disk).await?;
 ```
 
-内部消息枚举、channel 和 oneshot 对普通调用者不可见。MemberDisk 的每个请求通过 `ServiceRequest<MemberDiskMessage>` 静态关联响应类型，因此不需要统一 Response enum。业务代码不通过 Task 发起跨服务通信。
+内部 `MemberDiskRequest`、`MemberDiskReply`、channel 和 oneshot 对普通调用者不可见。通用 Envelope 持有唯一的返回通道，因此 Runtime 可以直接拒绝排队中的请求；`CallError<MemberDiskServiceError>` 明确区分生命周期/通信/协议错误和领域错误。业务代码不通过 Task 发起跨服务通信。
 
 ### MemberDisk 对象与具体执行槽
 
@@ -152,7 +152,7 @@ self.virtual_disks.evacuate_member_disk(&context, disk).await?;
 - VDM 的 `has_references` 是 BG 引用是否清空的权威判定。它只在排空转换中读取，避免 DOWN 安全边界依赖无关服务；
 - `SetDiskState::Down` 是一个动作：user_dp 接收 DOWN 的同时停止该盘 IO；
 - 公共 `ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error>` 拥有 active 事件、pending 事件队列、TaskControl 和等待者，不保存 MemberDisk 状态副本；
-- MemberDisk 通过 `resolve_conflict` 普通函数声明相邻同类事件 Join、不同事件 QueueAndCancel；旧 Task 稳定返回后由 pending 事件与最新 MemberDisk 状态重新计算；测试或管理请求通过 `call(WaitMemberDiskIdle(...))` 等待；
+- MemberDisk 通过 `resolve_conflict` 普通函数声明相邻同类事件 Join、不同事件 QueueAndCancel；旧 Task 稳定返回后由 pending 事件与最新 MemberDisk 状态重新计算；测试或管理请求通过 `MemberDiskClient::wait_idle(disk)` 等待；
 - Shrink 排空时收到 DOWN，DOWN 进入 pending 并取消在线排空 step；VDm 稳定返回后执行不可打断的 DOWN，再由已持久化 Shrink 意图从 DI 恢复排空，前后不并发；
 - 一个 MemberDisk Service 实例只有一个由 `ServiceRuntime` 创建的根 task，不为每盘创建 Tokio task/mailbox。
 - 盘级 Task token 只中止恢复等待、排空和上线等可替换步骤；`set_disk_down` 不接收该 token，并在 MemberDisk 领域内重试通用广播。Drain 等待已有 Future 收敛，Stop 请求协作取消，强制停止由根 `ServiceTask` 的所有者执行 abort。
@@ -205,7 +205,7 @@ UserDpGateway
 VnodeGateway
 ```
 
-领域服务不应依赖外部系统的具体客户端类型。未来即使改为 RPC 或拆分进程，上层仍保持明确目标 Handle 的 typed `call(Request)` 语义。
+领域服务不应依赖外部系统的具体客户端类型。未来即使改为 RPC 或拆分进程，上层仍保持明确目标 Handle 的命名 facade 与类型化 request/reply 语义。
 
 ## 建议依赖方向
 
@@ -235,7 +235,7 @@ Types -> Config -> Repository/Ports -> Domain Service -> Runtime -> Interface
 已经由当前 MemberDisk 纵切面验证：
 
 - 当前 MemberDisk 使用公共 Service 根 task poll 事件、查询、BLK 申请和多盘 reconciliation Future；
-- `ServiceClient::call` 已统一外部 request/response 机制；查询、事件接收和 BLK 申请由响应类型区分语义；
+- `ServiceClient::call` 已统一底层 Request/Reply Envelope；`MemberDiskClient` 用命名方法把统一 Reply 投影为查询、事件接收和 BLK 申请的具体结果；
 - `ObjectTaskCoordinator` 已承接不含 Disk 业务词汇的 active/pending/cancel/waiter 机制，MemberDisk 只提供冲突决策函数并调用已有状态表；
 - MemberDisk 对象、Service 状态表/业务步骤与 Runtime 执行槽的职责分离；
 - 自然 `async fn` 业务方法、显式领域 facade、完整收敛路径，以及新事件等待旧 Future 稳定退出后重新计算。

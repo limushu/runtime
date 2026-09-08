@@ -20,6 +20,6 @@ pub use ports::{
     VirtualDiskError, VirtualDiskService,
 };
 pub use service::{
-    Accepted, GetMemberDisk, MemberDiskClient, MemberDiskRuntime, MemberDiskService,
-    MemberDiskServiceError, WaitMemberDiskIdle,
+    Accepted, MemberDiskCallError, MemberDiskClient, MemberDiskRuntime, MemberDiskService,
+    MemberDiskServiceError,
 };

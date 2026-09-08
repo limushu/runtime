@@ -10,6 +10,10 @@
   每个对象递归 `spawn`；
 - 每个实例暴露四个职责明确的句柄：typed `client`、高优先级 `control`、只读
   `observer`、具有强制回收语义的根 `task`；
+- 每个 Service 只定义一组 `Request`、`Reply` 和领域 `Error`；通用 Envelope 持有唯一的
+  `oneshot`，`CallError` 将生命周期/通信错误与领域错误分开；
+- handler panic 和强制 abort 都会显式结束已接收 Request/Operation；前者返回
+  `HandlerPanicked` 并使服务进入 `Failed`，被强制丢弃的在途请求返回 `RequestAborted`；
 - 生命周期完整覆盖 `Initializing -> Running <-> Paused -> Draining/Stopping ->
   Stopped`，初始化或关闭失败进入 `Failed`；
 - Query 可以只作为普通 Future 执行；只有需要审计、进度或精确取消的工作才在 handler
@@ -26,12 +30,12 @@
 ```rust
 let running = member_disk_service.spawn(128);
 
-// 业务通道：目标实例已经明确，请求静态关联响应类型。
-running.client.call(member_disk_event).await?;
-let disk = running.client.call(GetMemberDisk(disk_id)).await?;
+// 领域 facade：目标实例已经明确，私有 Request/Reply enum 不会泄漏给 Pool 工作流。
+running.client.submit(member_disk_event).await?;
+let disk = running.client.get(disk_id).await?;
 let allocation = running
     .client
-    .call(AllocateBlks::new("tier-ssd", 3))
+    .allocate_blks(AllocateBlks::new("tier-ssd", 3))
     .await?;
 
 // 观测通道：无需解析日志。

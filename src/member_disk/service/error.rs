@@ -1,7 +1,6 @@
 use crate::member_disk::{
     DiskUuid, MemberDiskError, MetadataError, PoolNodeError, VirtualDiskError,
 };
-use crate::runtime::ServiceUnavailable;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,8 +12,6 @@ pub enum MemberDiskServiceError {
         requested: usize,
         available: usize,
     },
-    ServiceStopped,
-    Unavailable(ServiceUnavailable),
     Cancelled,
     PoolNode(PoolNodeError),
     VirtualDisk(VirtualDiskError),
@@ -36,8 +33,6 @@ impl fmt::Display for MemberDiskServiceError {
                 f,
                 "Tier {tier} has {available} eligible allocation candidates, but {requested} were requested"
             ),
-            Self::ServiceStopped => write!(f, "MemberDisk service has stopped"),
-            Self::Unavailable(reason) => reason.fmt(f),
             Self::Cancelled => write!(f, "MemberDisk operation was cancelled"),
             Self::PoolNode(error) => error.fmt(f),
             Self::VirtualDisk(error) => error.fmt(f),
@@ -49,12 +44,6 @@ impl fmt::Display for MemberDiskServiceError {
 }
 
 impl std::error::Error for MemberDiskServiceError {}
-
-impl From<ServiceUnavailable> for MemberDiskServiceError {
-    fn from(reason: ServiceUnavailable) -> Self {
-        Self::Unavailable(reason)
-    }
-}
 
 impl From<MemberDiskError> for MemberDiskServiceError {
     fn from(error: MemberDiskError) -> Self {

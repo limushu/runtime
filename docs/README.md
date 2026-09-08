@@ -65,7 +65,7 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **已确认：** 核心业务状态只属于领域对象；Operation Context 不建立第二套 `phase/status` 业务状态机。
 - **已确认：** 业务执行优先写成所属 Service 上的自然 `async fn`；跨服务通信通过明确目标实例的类型化 Service facade；请求不携带隐藏路由身份。
 - **已确认：** 每个请求都是 Future，但只有需要审计或命令式并发控制的操作才创建受管 Task；Query 直接执行。
-- **当前实现：** `ServiceClient::call(Request)` 统一 typed channel/oneshot；MemberDisk 采用 `Client -> ServiceRuntime root -> MemberDiskService::handle -> executable state table`，不实现通用 ActionFlow DSL。
+- **当前实现：** `ServiceClient::call(Request)` 通过统一 Request/Reply Envelope 和单一 oneshot 通信，`CallError` 分离框架、业务、handler panic 与强制 abort；MemberDisk facade 提供保留 `OperationContext` 的 `_in` 调用，内部采用 `Client -> ServiceRuntime root -> MemberDiskService::handle -> executable state table`，不实现通用 ActionFlow DSL。
 - **当前实现：** DOWN、UP、Shrink 是同一个 `MemberDiskEvent` 的变体；物理事件保存在每盘 active/pending 槽中而不写入 MemberDisk，Shrink 第一步提交持久化管理意图；不同事件请求当前 step 稳定停止。
 - **当前实现：** `ServiceRuntime` 为每个服务实例创建唯一根执行单元，统一 poll 请求 Future，不为每个硬盘创建 Tokio task。
 - **当前实现：** `ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error>` 保存盘级 active/pending 输入、取消控制和等待者；MemberDisk 以一个普通函数声明冲突策略，执行槽不复制业务状态。

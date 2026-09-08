@@ -60,9 +60,10 @@ kube-managed-future-runner/
 
 ### `runtime/service.rs`
 
-定义 `ManagedService`、typed `ServiceRequest`、`ServiceRuntime` 和 `ServiceInstance`。每个
-实例只创建一个根 Tokio task，根循环优先处理控制命令，并用 `FuturesUnordered` poll 已接收
-handler Future。业务 Service 不需要自行维护第二个 loop。
+定义 `CallError`、`ServiceReply`、`ManagedService`、`ServiceClient`、`ServiceRuntime` 和
+`ServiceInstance`。每个 Service 关联一组 `Request`、`Reply` 和领域 `Error`；通用 Envelope
+持有统一 oneshot。每个实例只创建一个根 Tokio task，根循环优先处理控制命令，并用
+`FuturesUnordered` poll 已接收 handler Future。业务 Service 不需要自行维护第二个 loop。
 
 ### `runtime/lifecycle.rs`
 
@@ -96,13 +97,16 @@ WaitIdle 及 RAII 清理；领域用一个决策函数赋予“相同、冲突�
 ### `member_disk/service/`
 
 - `mod.rs`：Service 依赖、已提交对象目录和唯一 `validate -> SDB -> memory` 修改入口；
-- `client.rs`：公开 typed Request 到私有 `MemberDiskMessage` 的静态映射；
+- `client.rs`：私有 `MemberDiskRequest` / `MemberDiskReply` 协议，以及把统一 Reply 投影为
+  `submit/get/wait_idle/allocate_blks` 具体结果的公开领域 facade；对应 `_in` 方法保留跨服务
+  `OperationContext`；
 - `runtime.rs`：MemberDisk 对 `ManagedService` 的适配、一处协议 match、盘事件对象槽准入、
   Task 附着和状态表循环；
 - `reconcile.rs`：穷举 `start_state + event + shrink intent -> action -> finish_state`；
 - `operations.rs`：状态表调用的普通异步业务方法；
 - `allocation.rs`：Tier/故障域选盘、SDB-first 位图发布，并排除正在做生命周期变更的盘；
-- `error.rs`：领域端口和 Runtime 不可用状态到统一服务错误的转换。
+- `error.rs`：MemberDisk 状态、端口与取消产生的领域错误；Runtime 的生命周期、通信和协议
+  错误由外层 `CallError<MemberDiskServiceError>` 表达。
 
 这些文件共同实现一个 `MemberDiskService`，不产生额外 Service、业务 Actor 或每盘 Tokio
 task。`ObjectTaskCoordinator` 相当于隐藏在机制层的对象 mailbox，而不是开发者要继承的
@@ -113,7 +117,7 @@ task。`ObjectTaskCoordinator` 相当于隐藏在机制层的对象 mailbox，�
 盘事件：
 
 ```text
-MemberDiskClient::call(event)
+MemberDiskClient::submit(event)
   -> ServiceRuntime business mailbox
   -> MemberDiskService::handle（唯一协议分发）
   -> ObjectTaskCoordinator[DiskUuid]
@@ -127,9 +131,9 @@ MemberDiskClient::call(event)
 查询与 BLK 申请：
 
 ```text
-call(GetMemberDisk) -> direct read Future -> no Task
+MemberDiskClient::get(disk) -> direct read Future -> no Task
 
-call(AllocateBlks)
+MemberDiskClient::allocate_blks(request)
   -> attach non-cancellable Task
   -> filter Tier / allocation / fault-domain / active-object guards
   -> MetadataService SDB commit
@@ -163,6 +167,8 @@ Runtime 不能引用 MemberDisk/BG/Node 类型。其他领域不能获得 Member
 - Idle/Busy、请求统计、Task/Trace、进度、阻塞原因、状态转换事件；
 - 精确 Task 取消、服务级协作 Stop、Drain 和最终 force abort；
 - 根任务所有权丢失时自动 abort，避免 task 泄漏；
+- handler panic/根 abort 显式闭合 Request/Operation，Drain/Stop 在 shutdown 和旧队列终态
+  拒绝完成后才回复控制 waiter；
 - 可选对象槽及 MemberDisk 冲突策略；
 - MemberDisk DOWN/UP/Shrink、可靠 DOWN、排空、重试、SDB-first 与 BLK 分配；
 - Runtime 契约测试和 MemberDisk 端到端结构化观测测试。

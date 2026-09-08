@@ -17,8 +17,8 @@ pub use observation::{
     TraceContext,
 };
 pub use service::{
-    ManagedService, RequestContext, ServiceClient, ServiceConfig, ServiceContext, ServiceInstance,
-    ServiceMessage, ServiceRequest, ServiceRuntime, ServiceTask,
+    CallError, ManagedService, RequestContext, ServiceClient, ServiceConfig, ServiceContext,
+    ServiceInstance, ServiceReply, ServiceRuntime, ServiceTask,
 };
 pub use task::{TaskAttempt, TaskControl, TaskMeta, TaskOutcome};
 

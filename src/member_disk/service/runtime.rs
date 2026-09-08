@@ -1,18 +1,17 @@
 use super::{
     MemberDiskService, MemberDiskServiceError,
-    client::{Accepted, MemberDiskMessage},
+    client::{Accepted, MemberDiskReply, MemberDiskRequest},
     reconcile::ReconcileResult,
 };
 use crate::{
     member_disk::{DiskUuid, MemberDiskEvent, PhysicalState},
     runtime::{
         ConflictDecision, ManagedService, ObjectActivity, ObjectAdmission, ObjectLease,
-        RequestContext, ServiceConfig, ServiceRuntime, TaskMeta, TaskOutcome,
+        RequestContext, ServiceConfig, ServiceReply, ServiceRuntime, TaskMeta, TaskOutcome,
     },
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 
 impl MemberDiskService {
     pub fn spawn(self, queue_capacity: usize) -> super::MemberDiskRuntime {
@@ -24,25 +23,22 @@ impl MemberDiskService {
     /// Starts this domain on the common runtime with explicit lifecycle,
     /// concurrency and observation configuration.
     pub fn spawn_with_config(self, config: ServiceConfig) -> super::MemberDiskRuntime {
-        ServiceRuntime::spawn(self, config)
+        ServiceRuntime::spawn(self, config).into()
     }
 
     async fn handle_event(
         self: Arc<Self>,
         event: MemberDiskEvent,
-        reply: oneshot::Sender<Result<Accepted, MemberDiskServiceError>>,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
         context: RequestContext,
     ) -> Result<(), MemberDiskServiceError> {
-        if let Err(error) = self.get_member(event.disk()).await.map(|_| ()) {
-            let _ = reply.send(Err(error.clone()));
-            return Err(error);
-        }
+        self.get_member(event.disk()).await?;
 
         let disk = event.disk().clone();
         let admission =
             self.object_tasks
                 .admit(disk, event, context.cancellation(), Self::resolve_conflict);
-        let _ = reply.send(Ok(Accepted));
+        reply.send(MemberDiskReply::Accepted(Accepted));
 
         let lease = match admission {
             ObjectAdmission::Joined => return Ok(()),
@@ -129,29 +125,27 @@ impl MemberDiskService {
     async fn handle_get(
         &self,
         disk: DiskUuid,
-        reply: oneshot::Sender<Result<crate::member_disk::MemberDisk, MemberDiskServiceError>>,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
     ) -> Result<(), MemberDiskServiceError> {
-        let result = self.get_member(&disk).await;
-        let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
-        let _ = reply.send(result);
-        status
+        let member = self.get_member(&disk).await?;
+        reply.send(MemberDiskReply::Member(member));
+        Ok(())
     }
 
     async fn handle_wait_idle(
         &self,
         disk: DiskUuid,
-        reply: oneshot::Sender<Result<(), MemberDiskServiceError>>,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
     ) -> Result<(), MemberDiskServiceError> {
-        let result = self.object_tasks.wait_idle(disk).await;
-        let status = result.clone();
-        let _ = reply.send(result);
-        status
+        self.object_tasks.wait_idle(disk).await?;
+        reply.send(MemberDiskReply::Idle);
+        Ok(())
     }
 
     async fn handle_allocation(
         &self,
         request: crate::member_disk::AllocateBlks,
-        reply: oneshot::Sender<Result<crate::member_disk::Allocation, MemberDiskServiceError>>,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
         context: RequestContext,
     ) -> Result<(), MemberDiskServiceError> {
         let task = context.start_task(
@@ -169,33 +163,38 @@ impl MemberDiskService {
         if result.is_ok() {
             task.progress(100);
         }
-        let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
         let outcome = match &result {
             Ok(_) => TaskOutcome::Completed,
             Err(error) => TaskOutcome::Failed(error.to_string()),
         };
         task.finish(outcome);
-        let _ = reply.send(result);
-        status
+        let allocation = result?;
+        reply.send(MemberDiskReply::Allocation(allocation));
+        Ok(())
     }
 }
 
 #[async_trait]
 impl ManagedService for MemberDiskService {
-    type Message = MemberDiskMessage;
+    type Request = MemberDiskRequest;
+    type Reply = MemberDiskReply;
+    type Error = MemberDiskServiceError;
+
+    fn operation(request: &Self::Request) -> Option<crate::runtime::OperationSpec> {
+        request.operation()
+    }
 
     async fn handle(
         self: Arc<Self>,
-        message: Self::Message,
+        request: Self::Request,
+        reply: &mut ServiceReply<Self::Reply, Self::Error>,
         context: RequestContext,
     ) -> Result<(), MemberDiskServiceError> {
-        match message {
-            MemberDiskMessage::ApplyEvent { event, reply } => {
-                self.handle_event(event, reply, context).await
-            }
-            MemberDiskMessage::Get { disk, reply } => self.handle_get(disk, reply).await,
-            MemberDiskMessage::WaitIdle { disk, reply } => self.handle_wait_idle(disk, reply).await,
-            MemberDiskMessage::Allocate { request, reply } => {
+        match request {
+            MemberDiskRequest::ApplyEvent(event) => self.handle_event(event, reply, context).await,
+            MemberDiskRequest::Get(disk) => self.handle_get(disk, reply).await,
+            MemberDiskRequest::WaitIdle(disk) => self.handle_wait_idle(disk, reply).await,
+            MemberDiskRequest::Allocate(request) => {
                 self.handle_allocation(request, reply, context).await
             }
         }
