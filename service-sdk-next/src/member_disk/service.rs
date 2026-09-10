@@ -5,7 +5,7 @@ use super::{
     MemberDiskQuery, MemberDiskQueryReply, MemberDiskReply, MemberDiskSeed, MemberDiskServiceError,
     MemberDiskState, PoolNodes, VirtualDisks,
 };
-use crate::service::{CommandActivity, CommandContext, CommandDecision, Service, TaskSnapshot};
+use crate::service::{CommandActivity, CommandDecision, ExecutionContext, Service, TaskSnapshot};
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
@@ -127,7 +127,9 @@ impl Service for MemberDiskService {
     type QueryReply = MemberDiskQueryReply;
     type Command = MemberDiskCommand;
     type CommandReply = MemberDiskReply;
-    type Key = DiskUuid;
+    // MemberDisk commands are batches. Per-disk conflicts are managed by the
+    // domain's operation table, so the SDK has no single command key here.
+    type Key = ();
     type Error = MemberDiskServiceError;
 
     fn name(&self) -> &'static str {
@@ -172,7 +174,7 @@ impl Service for MemberDiskService {
     async fn handle_command(
         self: Arc<Self>,
         command: Self::Command,
-        context: CommandContext<Self::Key>,
+        context: ExecutionContext<Self::Key>,
     ) -> Result<Self::CommandReply, Self::Error> {
         let reply = match command {
             MemberDiskCommand::DiskDown { disks, observed_at } => {

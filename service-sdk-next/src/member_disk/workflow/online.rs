@@ -1,5 +1,5 @@
 use super::{append_error, append_states, changes, partition_cancelled};
-use crate::member_disk::operations::{DiskResult, OperationPermit};
+use crate::member_disk::operations::{DiskOperation, DiskResult};
 use crate::member_disk::{
     DiskIoState, DiskOpenResult, DiskUuid, MemberDiskMutation, MemberDiskService,
     MemberDiskServiceError, MemberDiskState, PortError,
@@ -11,15 +11,18 @@ impl MemberDiskService {
     /// opened successfully. No per-disk network loop is hidden in this method.
     pub(super) async fn online(
         &self,
-        permits: Vec<OperationPermit>,
-    ) -> Vec<(OperationPermit, DiskResult)> {
-        let (mut finished, active) = self.prepare_online(permits);
+        disk_operations: Vec<DiskOperation>,
+    ) -> Vec<(DiskOperation, DiskResult)> {
+        let (mut finished, active) = self.prepare_online(disk_operations);
         if active.is_empty() {
             return finished;
         }
 
         self.progress_all(&active, 20, "opening disks on Pool nodes");
-        let disks = active.iter().map(|permit| permit.disk.clone()).collect();
+        let disks = active
+            .iter()
+            .map(|operation| operation.disk.clone())
+            .collect();
         let open_results = match self.pool_nodes.open_disks(disks).await {
             Ok(results) => index_open_results(results),
             Err(error) => {
@@ -28,22 +31,22 @@ impl MemberDiskService {
         };
 
         let mut opened = Vec::new();
-        for permit in active {
-            match open_results.get(&permit.disk) {
-                Some(Ok(())) if permit.cancel.is_cancelled() => {
-                    finished.push((permit, Err(MemberDiskServiceError::Cancelled)))
+        for operation in active {
+            match open_results.get(&operation.disk) {
+                Some(Ok(())) if operation.cancel.is_cancelled() => {
+                    finished.push((operation, Err(MemberDiskServiceError::Cancelled)))
                 }
-                Some(Ok(())) => opened.push(permit),
+                Some(Ok(())) => opened.push(operation),
                 Some(Err(error)) => finished.push((
-                    permit,
+                    operation,
                     Err(MemberDiskServiceError::PoolNodes(error.clone())),
                 )),
                 None => {
                     let error = MemberDiskServiceError::PoolNodes(PortError(format!(
                         "PoolNodes omitted the open result for {}",
-                        permit.disk
+                        operation.disk
                     )));
-                    finished.push((permit, Err(error)));
+                    finished.push((operation, Err(error)));
                 }
             }
         }
@@ -60,12 +63,12 @@ impl MemberDiskService {
         finished.extend(cancelled);
         let mutations = opened
             .iter()
-            .map(|permit| {
-                let mutation = match self.state(&permit.disk) {
+            .map(|operation| {
+                let mutation = match self.state(&operation.disk) {
                     Ok((MemberDiskState::Removed, _)) => MemberDiskMutation::Rejoin,
                     _ => MemberDiskMutation::CompleteOnline,
                 };
-                (permit.disk.clone(), mutation)
+                (operation.disk.clone(), mutation)
             })
             .collect();
         if let Err(error) = self.commit(mutations).await {
@@ -78,35 +81,38 @@ impl MemberDiskService {
 
     fn prepare_online(
         &self,
-        permits: Vec<OperationPermit>,
-    ) -> (Vec<(OperationPermit, DiskResult)>, Vec<OperationPermit>) {
+        disk_operations: Vec<DiskOperation>,
+    ) -> (Vec<(DiskOperation, DiskResult)>, Vec<DiskOperation>) {
         let mut finished = Vec::new();
         let mut active = Vec::new();
-        for permit in permits {
-            match self.state(&permit.disk) {
+        for operation in disk_operations {
+            match self.state(&operation.disk) {
                 Ok((MemberDiskState::UpActive, false)) => {
-                    finished.push((permit, Ok(MemberDiskState::UpActive)))
+                    finished.push((operation, Ok(MemberDiskState::UpActive)))
                 }
                 Ok((state, true)) if state != MemberDiskState::Removed => finished.push((
-                    permit,
+                    operation,
                     Err(MemberDiskServiceError::InvalidState(
                         "a disk with an accepted shrink intent must finish removal before rejoin"
                             .into(),
                     )),
                 )),
-                Ok(_) if permit.cancel.is_cancelled() => {
-                    finished.push((permit, Err(MemberDiskServiceError::Cancelled)))
+                Ok(_) if operation.cancel.is_cancelled() => {
+                    finished.push((operation, Err(MemberDiskServiceError::Cancelled)))
                 }
-                Ok(_) => active.push(permit),
-                Err(error) => finished.push((permit, Err(error))),
+                Ok(_) => active.push(operation),
+                Err(error) => finished.push((operation, Err(error))),
             }
         }
         (finished, active)
     }
 
-    async fn push_up(&self, permits: &[OperationPermit]) -> Result<(), MemberDiskServiceError> {
+    async fn push_up(
+        &self,
+        disk_operations: &[DiskOperation],
+    ) -> Result<(), MemberDiskServiceError> {
         self.pool_nodes
-            .push_disk_states(changes(permits, DiskIoState::Up))
+            .push_disk_states(changes(disk_operations, DiskIoState::Up))
             .await
             .map_err(MemberDiskServiceError::PoolNodes)
     }

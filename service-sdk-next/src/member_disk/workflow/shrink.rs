@@ -1,5 +1,5 @@
 use super::{append_error, append_states, partition_cancelled};
-use crate::member_disk::operations::{DiskResult, OperationPermit};
+use crate::member_disk::operations::{DiskOperation, DiskResult};
 use crate::member_disk::{MemberDiskMutation, MemberDiskService};
 use futures_util::future::join_all;
 
@@ -8,9 +8,9 @@ impl MemberDiskService {
     /// concurrency is the explicit `join_all` around independent evacuations.
     pub(super) async fn shrink(
         &self,
-        permits: Vec<OperationPermit>,
-    ) -> Vec<(OperationPermit, DiskResult)> {
-        let (mut finished, active) = self.skip_removed(permits);
+        disk_operations: Vec<DiskOperation>,
+    ) -> Vec<(DiskOperation, DiskResult)> {
+        let (mut finished, active) = self.skip_removed(disk_operations);
         if active.is_empty() {
             return finished;
         }
@@ -38,15 +38,15 @@ impl MemberDiskService {
         }
 
         self.progress_all(&active, 45, "evacuating VirtualDisk references");
-        let evacuations = active.into_iter().map(|permit| async move {
-            let result = self.evacuate(&permit).await;
-            (permit, result)
+        let evacuations = active.into_iter().map(|operation| async move {
+            let result = self.evacuate(&operation).await;
+            (operation, result)
         });
         let mut evacuated = Vec::new();
-        for (permit, result) in join_all(evacuations).await {
+        for (operation, result) in join_all(evacuations).await {
             match result {
-                Ok(()) => evacuated.push(permit),
-                Err(error) => finished.push((permit, Err(error))),
+                Ok(()) => evacuated.push(operation),
+                Err(error) => finished.push((operation, Err(error))),
             }
         }
         if evacuated.is_empty() {

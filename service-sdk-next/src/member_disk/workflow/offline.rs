@@ -1,5 +1,5 @@
 use super::{append, append_error, cancelled, changes};
-use crate::member_disk::operations::{DiskResult, OperationPermit};
+use crate::member_disk::operations::{DiskOperation, DiskResult};
 use crate::member_disk::{
     DiskIoState, MemberDiskMutation, MemberDiskService, MemberDiskServiceError,
 };
@@ -12,10 +12,10 @@ impl MemberDiskService {
     /// action. Long-running isolation remains independent per disk.
     pub(super) async fn offline(
         &self,
-        permits: Vec<OperationPermit>,
+        disk_operations: Vec<DiskOperation>,
         observed_at: u64,
-    ) -> Vec<(OperationPermit, DiskResult)> {
-        let (finished, active) = self.skip_removed(permits);
+    ) -> Vec<(DiskOperation, DiskResult)> {
+        let (finished, active) = self.skip_removed(disk_operations);
         if active.is_empty() {
             return finished;
         }
@@ -26,48 +26,48 @@ impl MemberDiskService {
         }
 
         self.progress_all(&active, 25, "DOWN committed; isolating disks");
-        let isolation = active.into_iter().map(|permit| async move {
-            let result = self.isolate_disk(&permit, observed_at).await;
-            (permit, result)
+        let isolation = active.into_iter().map(|operation| async move {
+            let result = self.isolate_disk(&operation, observed_at).await;
+            (operation, result)
         });
         append(finished, join_all(isolation).await)
     }
 
-    async fn isolate_disk(&self, permit: &OperationPermit, observed_at: u64) -> DiskResult {
-        let (_, shrinking) = self.state(&permit.disk)?;
+    async fn isolate_disk(&self, operation: &DiskOperation, observed_at: u64) -> DiskResult {
+        let (_, shrinking) = self.state(&operation.disk)?;
         if !shrinking {
             self.operations
-                .progress(permit, 35, "waiting for the recovery window");
-            self.wait_recovery_window(observed_at, &permit.cancel)
+                .progress(operation, 35, "waiting for the recovery window");
+            self.wait_recovery_window(observed_at, &operation.cancel)
                 .await?;
         }
 
-        cancelled(&permit.cancel)?;
+        cancelled(&operation.cancel)?;
         self.commit(vec![(
-            permit.disk.clone(),
+            operation.disk.clone(),
             MemberDiskMutation::DisableAllocation,
         )])
         .await?;
 
         self.operations
-            .progress(permit, 60, "evacuating VirtualDisk references");
-        self.evacuate(permit).await?;
+            .progress(operation, 60, "evacuating VirtualDisk references");
+        self.evacuate(operation).await?;
 
-        cancelled(&permit.cancel)?;
-        self.commit(vec![(permit.disk.clone(), MemberDiskMutation::Remove)])
+        cancelled(&operation.cancel)?;
+        self.commit(vec![(operation.disk.clone(), MemberDiskMutation::Remove)])
             .await?;
-        Ok(self.state(&permit.disk)?.0)
+        Ok(self.state(&operation.disk)?.0)
     }
 
     pub(super) async fn evacuate(
         &self,
-        permit: &OperationPermit,
+        operation: &DiskOperation,
     ) -> Result<(), MemberDiskServiceError> {
         self.virtual_disks
-            .evacuate(&permit.disk, &permit.cancel)
+            .evacuate(&operation.disk, &operation.cancel)
             .await
             .map_err(|error| {
-                if permit.cancel.is_cancelled() {
+                if operation.cancel.is_cancelled() {
                     MemberDiskServiceError::Cancelled
                 } else {
                     MemberDiskServiceError::VirtualDisks(error)
@@ -79,17 +79,20 @@ impl MemberDiskService {
     /// same DOWN capability in MemberDisk. Cancellation cannot split it.
     pub(super) async fn set_disks_down(
         &self,
-        permits: &[OperationPermit],
+        disk_operations: &[DiskOperation],
     ) -> Result<(), MemberDiskServiceError> {
-        let changes = changes(permits, DiskIoState::Down);
+        let changes = changes(disk_operations, DiskIoState::Down);
         loop {
             match self.pool_nodes.push_disk_states(changes.clone()).await {
                 Ok(()) => break,
                 Err(_) => tokio::time::sleep(self.config.mandatory_retry_delay).await,
             }
         }
-        self.commit_all(permits, MemberDiskMutation::SetIo(DiskIoState::Down))
-            .await
+        self.commit_all(
+            disk_operations,
+            MemberDiskMutation::SetIo(DiskIoState::Down),
+        )
+        .await
     }
 
     async fn wait_recovery_window(

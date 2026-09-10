@@ -2,12 +2,12 @@ mod offline;
 mod online;
 mod shrink;
 
-use super::operations::{DiskResult, OperationKind, OperationPermit, OperationWait, WaitReason};
+use super::operations::{DiskOperation, DiskResult, OperationKind, OperationWait, WaitReason};
 use super::{
     DiskIoState, DiskStateChange, DiskUuid, MemberDiskMutation, MemberDiskOutcome, MemberDiskReply,
     MemberDiskService, MemberDiskServiceError, MemberDiskState,
 };
-use crate::service::CommandContext;
+use crate::service::ExecutionContext;
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +17,7 @@ impl MemberDiskService {
         operation: OperationKind,
         disks: Vec<DiskUuid>,
         observed_at: Option<u64>,
-        context: &CommandContext<DiskUuid>,
+        context: &ExecutionContext<()>,
     ) -> MemberDiskReply {
         let order = unique(disks);
         let mut pending = order.clone();
@@ -41,9 +41,9 @@ impl MemberDiskService {
                 let finished = self.run_started(operation, plan.start, observed_at).await;
                 finished
                     .into_iter()
-                    .map(|(permit, result)| {
-                        let disk = permit.disk.clone();
-                        self.operations.finish(permit, result.clone());
+                    .map(|(disk_operation, result)| {
+                        let disk = disk_operation.disk.clone();
+                        self.operations.finish(disk_operation, result.clone());
                         (disk, result)
                     })
                     .collect::<Vec<_>>()
@@ -80,28 +80,31 @@ impl MemberDiskService {
     async fn run_started(
         &self,
         operation: OperationKind,
-        permits: Vec<OperationPermit>,
+        disk_operations: Vec<DiskOperation>,
         observed_at: Option<u64>,
-    ) -> Vec<(OperationPermit, DiskResult)> {
+    ) -> Vec<(DiskOperation, DiskResult)> {
         match operation {
             OperationKind::Offline => {
-                self.offline(permits, observed_at.expect("offline carries observed_at"))
-                    .await
+                self.offline(
+                    disk_operations,
+                    observed_at.expect("offline carries observed_at"),
+                )
+                .await
             }
-            OperationKind::Online => self.online(permits).await,
-            OperationKind::Shrink => self.shrink(permits).await,
+            OperationKind::Online => self.online(disk_operations).await,
+            OperationKind::Shrink => self.shrink(disk_operations).await,
         }
     }
 
     pub(super) async fn commit_all(
         &self,
-        permits: &[OperationPermit],
+        disk_operations: &[DiskOperation],
         mutation: MemberDiskMutation,
     ) -> Result<(), MemberDiskServiceError> {
         self.commit(
-            permits
+            disk_operations
                 .iter()
-                .map(|permit| (permit.disk.clone(), mutation.clone()))
+                .map(|operation| (operation.disk.clone(), mutation.clone()))
                 .collect(),
         )
         .await
@@ -109,17 +112,17 @@ impl MemberDiskService {
 
     pub(super) fn skip_removed(
         &self,
-        permits: Vec<OperationPermit>,
-    ) -> (Vec<(OperationPermit, DiskResult)>, Vec<OperationPermit>) {
+        disk_operations: Vec<DiskOperation>,
+    ) -> (Vec<(DiskOperation, DiskResult)>, Vec<DiskOperation>) {
         let mut finished = Vec::new();
         let mut active = Vec::new();
-        for permit in permits {
-            match self.state(&permit.disk) {
+        for operation in disk_operations {
+            match self.state(&operation.disk) {
                 Ok((MemberDiskState::Removed, _)) => {
-                    finished.push((permit, Ok(MemberDiskState::Removed)))
+                    finished.push((operation, Ok(MemberDiskState::Removed)))
                 }
-                Ok(_) => active.push(permit),
-                Err(error) => finished.push((permit, Err(error))),
+                Ok(_) => active.push(operation),
+                Err(error) => finished.push((operation, Err(error))),
             }
         }
         (finished, active)
@@ -127,12 +130,12 @@ impl MemberDiskService {
 
     pub(super) fn progress_all(
         &self,
-        permits: &[OperationPermit],
+        disk_operations: &[DiskOperation],
         progress: u8,
         detail: &'static str,
     ) {
-        for permit in permits {
-            self.operations.progress(permit, progress, detail);
+        for operation in disk_operations {
+            self.operations.progress(operation, progress, detail);
         }
     }
 }
@@ -165,65 +168,68 @@ fn unique(disks: Vec<DiskUuid>) -> Vec<DiskUuid> {
         .collect()
 }
 
-pub(super) fn changes(permits: &[OperationPermit], state: DiskIoState) -> Vec<DiskStateChange> {
-    permits
+pub(super) fn changes(
+    disk_operations: &[DiskOperation],
+    state: DiskIoState,
+) -> Vec<DiskStateChange> {
+    disk_operations
         .iter()
-        .map(|permit| DiskStateChange {
-            disk: permit.disk.clone(),
+        .map(|operation| DiskStateChange {
+            disk: operation.disk.clone(),
             state,
         })
         .collect()
 }
 
 pub(super) fn partition_cancelled(
-    permits: Vec<OperationPermit>,
-) -> (Vec<(OperationPermit, DiskResult)>, Vec<OperationPermit>) {
+    disk_operations: Vec<DiskOperation>,
+) -> (Vec<(DiskOperation, DiskResult)>, Vec<DiskOperation>) {
     let mut cancelled = Vec::new();
     let mut active = Vec::new();
-    for permit in permits {
-        if permit.cancel.is_cancelled() {
-            cancelled.push((permit, Err(MemberDiskServiceError::Cancelled)));
+    for operation in disk_operations {
+        if operation.cancel.is_cancelled() {
+            cancelled.push((operation, Err(MemberDiskServiceError::Cancelled)));
         } else {
-            active.push(permit);
+            active.push(operation);
         }
     }
     (cancelled, active)
 }
 
 pub(super) fn append(
-    mut left: Vec<(OperationPermit, DiskResult)>,
-    right: Vec<(OperationPermit, DiskResult)>,
-) -> Vec<(OperationPermit, DiskResult)> {
+    mut left: Vec<(DiskOperation, DiskResult)>,
+    right: Vec<(DiskOperation, DiskResult)>,
+) -> Vec<(DiskOperation, DiskResult)> {
     left.extend(right);
     left
 }
 
 pub(super) fn append_error(
-    finished: Vec<(OperationPermit, DiskResult)>,
-    permits: Vec<OperationPermit>,
+    finished: Vec<(DiskOperation, DiskResult)>,
+    disk_operations: Vec<DiskOperation>,
     error: MemberDiskServiceError,
-) -> Vec<(OperationPermit, DiskResult)> {
+) -> Vec<(DiskOperation, DiskResult)> {
     append(
         finished,
-        permits
+        disk_operations
             .into_iter()
-            .map(|permit| (permit, Err(error.clone())))
+            .map(|operation| (operation, Err(error.clone())))
             .collect(),
     )
 }
 
 pub(super) fn append_states(
     service: &MemberDiskService,
-    finished: Vec<(OperationPermit, DiskResult)>,
-    permits: Vec<OperationPermit>,
-) -> Vec<(OperationPermit, DiskResult)> {
+    finished: Vec<(DiskOperation, DiskResult)>,
+    disk_operations: Vec<DiskOperation>,
+) -> Vec<(DiskOperation, DiskResult)> {
     append(
         finished,
-        permits
+        disk_operations
             .into_iter()
-            .map(|permit| {
-                let result = service.state(&permit.disk).map(|(state, _)| state);
-                (permit, result)
+            .map(|operation| {
+                let result = service.state(&operation.disk).map(|(state, _)| state);
+                (operation, result)
             })
             .collect(),
     )

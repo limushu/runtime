@@ -138,7 +138,11 @@ pub struct ServiceSnapshot {
 }
 
 #[derive(Clone)]
-pub struct CommandContext<K> {
+/// Runtime context for one accepted command execution.
+///
+/// It belongs to the whole command, which may cover several domain objects.
+/// A domain can derive finer-grained child cancellation scopes when needed.
+pub struct ExecutionContext<K> {
     execution: u64,
     key: Option<K>,
     cancellation: CancellationToken,
@@ -146,7 +150,7 @@ pub struct CommandContext<K> {
     changed: watch::Sender<u64>,
 }
 
-impl<K> CommandContext<K> {
+impl<K> ExecutionContext<K> {
     pub fn execution_id(&self) -> u64 {
         self.execution
     }
@@ -741,7 +745,7 @@ impl<S: Service> Runtime<S> {
             format!("command: {:?}", pending.command),
         );
         let cancellation = CancellationToken::new();
-        let context = CommandContext {
+        let context = ExecutionContext {
             execution,
             key: key.clone(),
             cancellation: cancellation.clone(),

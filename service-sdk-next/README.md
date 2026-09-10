@@ -26,6 +26,21 @@ MemberDiskService
 SDK 不知道 Disk、Node 或 BG。`MemberDiskService` 也不实现自己的 select 循环。它只把
 一个普通 Future 返回给 SDK，SDK 的根任务负责持续 poll。
 
+一次批量命令只有一个 SDK `Execution`，因此只有一个 `ExecutionContext<()>`。它保存整批
+命令的 execution id、进度和父取消 token，不冒充某块硬盘的上下文。MemberDisk 随后为批次
+中的每块盘建立一个 `DiskOperation`：
+
+```text
+ExecutionContext<()>                 一次批量命令
+  ├─ DiskOperation(disk-a)            独立冲突槽位 + 子取消 token
+  ├─ DiskOperation(disk-b)            独立冲突槽位 + 子取消 token
+  └─ DiskOperation(disk-c)            独立冲突槽位 + 子取消 token
+```
+
+停止服务或取消整批命令会通过父 token 传播到全部单盘操作；同盘冲突只取消对应的
+`DiskOperation`，不会误伤批次中的其他盘。因为批量命令不存在唯一的 SDK 对象键，
+`MemberDiskService::Key` 明确使用 `()`，真正的 UUID 互斥只存在于 MemberDisk 的操作表中。
+
 ## 开发者首先看到的代码
 
 命令入口只负责选择业务流程：

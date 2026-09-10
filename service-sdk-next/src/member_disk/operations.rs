@@ -49,11 +49,15 @@ struct ActiveOperation {
 }
 
 pub(super) struct OperationPlan {
-    pub(super) start: Vec<OperationPermit>,
+    pub(super) start: Vec<DiskOperation>,
     pub(super) wait: Vec<OperationWait>,
 }
 
-pub(super) struct OperationPermit {
+/// One disk's domain operation inside a command execution.
+///
+/// Its cancellation token is a child of the command's token, so stopping the
+/// command stops every disk while a conflict can cancel only this disk.
+pub(super) struct DiskOperation {
     pub(super) id: u64,
     pub(super) disk: DiskUuid,
     pub(super) cancel: CancellationToken,
@@ -136,7 +140,7 @@ impl OperationTable {
                     detail: "accepted".into(),
                 },
             );
-            start.push(OperationPermit {
+            start.push(DiskOperation {
                 id,
                 disk: disk.clone(),
                 cancel,
@@ -149,28 +153,30 @@ impl OperationTable {
 
     pub(super) fn progress(
         &self,
-        permit: &OperationPermit,
+        operation: &DiskOperation,
         progress: u8,
         detail: impl Into<String>,
     ) {
         let mut active = self.inner.active.lock().expect("operation table poisoned");
-        if let Some(operation) = active.get_mut(&permit.disk)
-            && operation.id == permit.id
+        if let Some(active_operation) = active.get_mut(&operation.disk)
+            && active_operation.id == operation.id
         {
-            operation.progress = progress.min(100);
-            operation.detail = detail.into();
+            active_operation.progress = progress.min(100);
+            active_operation.detail = detail.into();
         }
     }
 
-    pub(super) fn finish(&self, permit: OperationPermit, result: DiskResult) {
-        let operation = {
+    pub(super) fn finish(&self, disk_operation: DiskOperation, result: DiskResult) {
+        let completed_operation = {
             let mut active = self.inner.active.lock().expect("operation table poisoned");
-            match active.get(&permit.disk) {
-                Some(operation) if operation.id == permit.id => active.remove(&permit.disk),
+            match active.get(&disk_operation.disk) {
+                Some(operation) if operation.id == disk_operation.id => {
+                    active.remove(&disk_operation.disk)
+                }
                 _ => None,
             }
         };
-        if let Some(operation) = operation {
+        if let Some(operation) = completed_operation {
             operation.completed.send_replace(Some(result));
         }
     }
@@ -200,7 +206,7 @@ impl OperationTable {
     }
 }
 
-impl Drop for OperationPermit {
+impl Drop for DiskOperation {
     fn drop(&mut self) {
         let Some(owner) = self.owner.upgrade() else {
             return;
