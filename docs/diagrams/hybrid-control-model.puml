@@ -16,8 +16,8 @@ package "PoolManager" {
 }
 
 package "One Pool" {
-  component "MemberDiskClient" as Client
-  component "MemberDiskService::run\none root task" as Runtime
+  component "MemberDiskClient\nroot methods + *_in(OperationContext)" as Client
+  component "ServiceRuntime root\none Tokio task" as Runtime
   component "MemberDiskService" as Service
   database "MemberDisk Objects" as Objects
   component "MetadataService" as Metadata
@@ -31,8 +31,8 @@ component user_dp
 DiskMap --> Index : physical fact by DiskUuid
 Index --> Registry : locate owning Pool
 Registry --> Client : explicit Pool target
-Client --> Runtime : private message + oneshot
-Runtime --> Service : apply event / run next step
+Client --> Runtime : Request/Reply Envelope + one oneshot
+Runtime --> Service : handle(request, &mut reply, context)
 Runtime --> Runtime : DiskUuid -> active/pending event + CancellationToken
 Service --> Objects : query / committed update
 Service --> Metadata : field-level update

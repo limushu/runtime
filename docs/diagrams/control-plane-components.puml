@@ -79,12 +79,15 @@ end note
 
 note bottom of Facades
 请求不携带隐藏目标
-提供命名call / submit / query
+目标Handle提供命名typed facade
+底层使用统一Request/Reply Envelope
+跨服务*_in保留OperationContext
 Task不是通信能力所有者
 end note
 
 note bottom of ServiceRuntime
-当前代码只验证MemberDisk纵切面
-PoolManager、Pool装配和公共Runtime尚未实现
+已实现统一Request/Reply、单根Future poll、独立控制通道
+生命周期、Task/Trace、结构化观测和对象槽
+PoolManager与Pool装配仍待实现
 end note
 @enduml

@@ -68,7 +68,7 @@ SDB 不提供覆盖 Tier 位图与 VD/BGMap 的统一事务或业务 WAL。系�
 
 ### D-017 状态表直接调用 Service 的自然异步方法
 
-业务步骤写成所属 Service 的 `async fn`。`reconcile_once` 在穷举状态表中直接 `await` 这些方法，不经过 Action enum、函数注册表或 `move |task| async move`。每条非稳态规则显式声明起始状态、输入事件、action 和结束状态；action 完成后验证权威后置条件。它只返回 `Transitioned/Stable`；Query 不创建 reconciliation Future。
+业务步骤写成所属 Service 的 `async fn`。`reconcile_once` 在穷举状态表中直接 `await` 这些方法，不经过 Action enum、函数注册表或 `move |task| async move`。每条非稳态规则显式声明起始状态、输入事件、action 和结束状态；action 完成后验证权威后置条件。它只返回 `Transitioned/Stable`；Query 不创建 Task。
 
 ### D-020 完整转换契约，按需读取跨领域状态
 
@@ -76,11 +76,11 @@ MemberDisk 本地转换使用 `MemberDiskState + shrink_requested` 作为起止�
 
 ### D-018 先具体实现，再提炼机制
 
-MemberDisk 的对象规则、可执行状态表、active reconciliation、Future poll 和协作取消先在领域内具体实现。不建立公共 Action DSL、Reconciler/ObjectRunner trait 或 Runtime crate。至少两个真实领域出现相同稳定机制后，才能提炼公共部分。
+MemberDisk 的对象规则和可执行状态表保留在领域内；已从纵切面提取 `ServiceRuntime`、`ServiceClient::call(Request)`、生命周期/观测与 `ObjectTaskCoordinator<K, I, E>`。不建立公共 Action DSL、状态机框架或独立 Runtime crate；业务 Key、冲突策略和状态表仍由领域实现。
 
 ### D-019 跨服务通信属于显式 Service 能力
 
-领域之间使用指向明确目标实例的类型化 Service facade。其内部 `ServiceClient<R>` 封装 channel、oneshot 和 Operation Context 传播；请求不携带隐藏的目标 ServiceId，也不通过请求类型自动查找服务。Task 不是跨服务通信能力的所有者。
+领域之间使用指向明确目标实例的类型化 Service facade。其内部 `ServiceClient<S>` 封装统一 Request/Reply Envelope、oneshot 和 Operation Context 传播；请求不携带隐藏的目标 ServiceId，也不通过请求类型自动查找服务。Task 不是跨服务通信能力的所有者。
 
 ### D-020 Operation 观测不能成为隐形业务 WAL
 
@@ -92,7 +92,7 @@ Monitor 的 `PoolManager` 维护 `PoolId -> Arc<Pool>`。`Pool` 拥有 Pool 元�
 
 ### D-022 对象执行槽是隐藏机制
 
-MemberDisk 是完整领域对象，不暴露 Actor API。`MemberDiskService::run` 的局部运行态以 `DiskUuid -> DiskSlot` 关联 active/pending 事件、取消令牌和 `wait_idle` 等待者；它不拥有持久化业务元数据，也不为每个硬盘创建独立 Tokio task/mailbox。
+MemberDisk 是完整领域对象，不暴露 Actor API。公共 `ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error>` 关联 active/pending 事件、TaskControl 和 idle 等待者；它不拥有持久化业务元数据，也不为每个硬盘创建独立 Tokio task/mailbox。MemberDisk 以一个普通决策函数提供冲突含义，槽位机制不解释领域状态或调用下一步业务动作。
 
 ### D-023 取消在业务步骤的稳定边界传播
 
@@ -105,6 +105,26 @@ MemberDisk 的 SDB 决策记录、DiskMap 输入事实、Shrink 管理意图、U
 ### D-025 REMOVED 保留对象并允许 UP 触发 Rejoin
 
 `REMOVED` 是 MemberDisk 的稳定成员状态，不表示从对象目录删除身份和历史元数据。之后收到物理 UP，MemberDisk 直接执行 Rejoin：在所有当前可服务 Pool 节点打开硬盘并发布 UP，成功后提交 `MemberDiskUpdate::Rejoin`，回到 `UA`。
+
+### D-026 每个 Service 使用统一 Request/Reply 协议
+
+目标 `ServiceClient<S>` 已经确定路由；`ManagedService` 为一个服务关联 `Request`、`Reply` 和领域 `Error`。通用 Envelope 携带 `S::Request` 与唯一的 `oneshot<Result<S::Reply, CallError<S::Error>>>`，因此生命周期拒绝无需让业务枚举逐项寻找返回通道。MemberDisk 的公开 facade 再把统一 `MemberDiskReply` 投影为事件的 `Accepted`、查询的 `MemberDisk` 和 BLK 申请的 `Allocation`，并以 `submit_in/get_in/wait_idle_in/allocate_blks_in` 保留跨服务 `OperationContext`。当前不引入基于请求类型自动选服务的 Router，也不为隐藏一处清晰分发而引入异步类型擦除。
+
+### D-027 MemberDisk 领域拥有成员、Tier 与 BLK 分配
+
+当前 MemberDisk 领域同时拥有成员目录、Tier/故障域信息和单盘 BLK 位图。BLK 申请因此是 `MemberDiskService` 的 request/response 能力，不拆成独立 SpaceManagerService，也不进入 `DiskUuid` 生命周期槽。第一阶段所有 MemberDisk 修改通过 `mutation_gate` 串行；对象 Guard 在 SDB `.await` 前释放，SDB 成功后再发布内存。后续只有在真实负载和 SDB 条件写契约明确后，才把该 gate 缩小到 Tier 或 Partition。
+
+### D-028 Service 实例具有四种独立句柄
+
+每个 `ServiceInstance` 同时暴露业务 `ServiceClient`、高优先级 `ServiceControl`、只读 `ServiceObserver` 和根所有权 `ServiceTask`。Client 不持有 Service 对象；Control 不与业务流量共享容量；Observer 不修改运行状态；ServiceTask 被 Pool 持有并负责最终 Join/Abort，所有权直接丢失时自动 abort，避免后台 Future 泄漏。
+
+### D-029 Runtime 生命周期与关闭语义
+
+Runtime 实现 `Initializing / Running / Paused / Draining / Stopping / Stopped / Failed`。Pause 只拒绝新请求并继续驱动在途工作；Drain 拒绝新请求且不取消已接收工作；Stop 请求 Service token 和可取消 Task 协作停止并等待稳定退出；Abort 才直接 drop 根 Future。Drain/Stop 只在 shutdown 完成、旧队列已按 `Stopped/Failed` 终态拒绝后回复控制 waiter。handler panic 返回 `HandlerPanicked` 并使实例进入 `Failed`，其余在途 Future 被丢弃并以 `RequestAborted` 闭合；panic/abort 都显式产生 Request/Operation 完成事件。控制通道在根 `select!` 中优先于业务通道。
+
+### D-030 Task 是可选执行尝试，观测不成为业务权威
+
+每个请求都有 handler Future，但 Query 无需 Operation/Task。需要进度、审计或精确控制的业务在已经运行的 handler 内调用 `RequestContext::start_task` 附加 `TaskAttempt`，不使用闭包包装工作流。Service 快照与 RuntimeEvent 提供生命周期、Idle/Busy、队列、Task、Trace、阻塞原因和状态转换；内存 history 与外部 EventSink 都是观测投影，不替代领域 SDB。
 
 ## 候选架构判断
 
@@ -170,9 +190,8 @@ MemberDisk 的 SDB 决策记录、DiskMap 输入事实、Shrink 管理意图、U
 
 ### Q-009 执行与并发模型
 
-- 业务请求和控制请求的具体通道类型与优先级；
-- Service Runtime、Reconcile slot、可选 ActorCell 与 Task Registry 的最小职责；
-- 如何在不递归 spawn 的前提下支持并发、取消和观测；
+- 第二个真实领域是否能在不扩张 `ManagedService` trait 的情况下复用当前契约；
+- 生产级 EventSink 的背压、丢弃和持久化策略；
 - Service 私有元数据如何从机制上禁止可变访问跨越 `.await`；
 - 如何从 Tier 全串行演进到安全并行。
 

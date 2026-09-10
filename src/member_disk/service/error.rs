@@ -6,7 +6,12 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberDiskServiceError {
     UnknownDisk(DiskUuid),
-    ServiceStopped,
+    EmptyAllocation,
+    InsufficientAllocationCandidates {
+        tier: String,
+        requested: usize,
+        available: usize,
+    },
     Cancelled,
     PoolNode(PoolNodeError),
     VirtualDisk(VirtualDiskError),
@@ -19,7 +24,15 @@ impl fmt::Display for MemberDiskServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownDisk(disk) => write!(f, "unknown MemberDisk {disk}"),
-            Self::ServiceStopped => write!(f, "MemberDisk service has stopped"),
+            Self::EmptyAllocation => write!(f, "BLK allocation count must be greater than zero"),
+            Self::InsufficientAllocationCandidates {
+                tier,
+                requested,
+                available,
+            } => write!(
+                f,
+                "Tier {tier} has {available} eligible allocation candidates, but {requested} were requested"
+            ),
             Self::Cancelled => write!(f, "MemberDisk operation was cancelled"),
             Self::PoolNode(error) => error.fmt(f),
             Self::VirtualDisk(error) => error.fmt(f),

@@ -79,7 +79,7 @@ Harel 将持续响应外部和内部刺激的系统称为 reactive system，并�
 
 Actor 模型强调封装状态、通过消息交互以及并发实体之间的隔离。[Hewitt、Bishop 和 Steiger 的原始 Actor 论文](https://www.ijcai.org/Proceedings/73/Papers/027B.pdf)为“服务拥有自己的核心状态、外部通过显式通信句柄访问”提供理论支撑。
 
-本文采用 Actor 的状态所有权和按对象串行思想，但不把 Actor 作为领域编程接口。MemberDisk 拥有完整核心元数据；DiskMap 观测以事件输入并可在冷恢复后重放。当前原型由一个 MemberDisk Service 根执行单元保存 `DiskUuid -> active/pending event + CancellationToken + idle waiters`，不为每盘创建 Tokio task 或 mailbox，也不建立第二份对象业务状态。不同事件到达时，运行槽取消当前 reconciliation；旧 Future 稳定返回后用下一个事件和最新对象选择下一步。
+本文采用 Actor 的状态所有权和按对象串行思想，但不把 Actor 作为领域编程接口。MemberDisk 拥有完整核心元数据；DiskMap 观测以事件输入并可在冷恢复后重放。当前实现由公共 Service 根执行单元持有 `ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error>`，以 `DiskUuid -> active/pending input + TaskControl + idle waiters` 保存执行状态，不为每盘创建 Tokio task 或 mailbox，也不建立第二份对象业务状态。不同事件到达时，MemberDisk 冲突策略请求取消当前 Task；旧 Future 稳定返回后用下一个事件和最新对象选择下一步。
 
 ### 3.3 Saga、Process Manager 与自然工作流
 
@@ -115,7 +115,7 @@ Kubernetes 官方将 Controller 描述为持续观察当前状态并使其接近
 Registry:PoolId\rightarrow Pool
 \]
 
-DiskMap 和 NodeMap 是全局事实视图；`PoolManager` 维护 Registry 并路由事实；`Pool` 是单 Pool 的业务、内存和生命周期隔离边界。执行机制只能位于领域 Service 内部、不能代替 Pool 业务对象；当前代码尚未提炼通用 Runtime。
+DiskMap 和 NodeMap 是全局事实视图；`PoolManager` 维护 Registry 并路由事实；`Pool` 是单 Pool 的业务、内存和生命周期隔离边界。执行机制只能服务于领域 Service、不能代替 Pool 业务对象；当前代码已形成 crate 内的完整 Service Host、类型化调用、对象任务槽、生命周期与结构化观测，但尚未实现 PoolManager 和 Pool 装配。
 
 ### 4.2 Pool 状态
 
@@ -269,7 +269,7 @@ BGEntryState=MediaState\times DataState
 | VdDomain | VD、BG、BGMap、Entry 数据有效性、健康计算 |
 | NodeDomain | Pool 成员关系、Pool 在 user_dp 上的服务状态、可服务节点视图 |
 
-领域之间通过显式 `call/submit/query` 能力交互，不共享可任意修改的内部对象。
+领域之间通过明确目标 Handle 的 typed `call(Request)` 交互，不共享可任意修改的内部对象。
 
 核心元数据采用唯一修改者约束。对元数据 \(x\)：
 
@@ -491,12 +491,12 @@ Footprint(o_1)\cap Footprint(o_2)\neq\varnothing
 
 - 当前 MemberDisk Service 用可执行状态表选择业务步骤，领域对象方法校验状态变化；
 - 外部事实或意图通过明确 MemberDiskClient 到达领域专属运行循环；物理事实留在 active/pending 事件中，Shrink 意图由第一条转换提交到 MemberDisk；
-- 私有运行循环对同一盘至多运行一个 active step；事件未改变对象时自然合并，改变对象时标记重新计算并请求当前调用链协作停止；
+- 公共对象槽对同一盘至多运行一个 active step；MemberDisk 冲突策略决定同类事件合并、不同事件排队并请求当前调用链协作停止；
 - 旧 Future 稳定退出后，Runtime 重新读取最新对象并选择下一步；不同硬盘可以并行；
-- 这些语义当前是 MemberDisk 的具体实现，不预设为所有领域的统一框架；
+- Key、冲突策略和状态表是 MemberDisk 的具体实现；active/pending/cancel/waiter 是当前已经抽出的机械槽位；
 - 多对象影响集合、可交换合并等高级策略必须由专门协调领域建模，不能塞进普通开发者的状态机接口。
 
-当前先由 MemberDisk 私有 message 和运行循环完整表达事件串行、active step 与重新计算，目的是看清真实业务语义，而不是让普通流程开发者操作这些状态。只有第二个领域出现相同代码后，才研究如何隐藏机械部分；不可交换的业务意图仍必须作为对象字段或专门协调模型明确表达。
+当前由 MemberDisk 内部协议、根运行循环和公共对象槽共同表达事件串行、active step 与重新计算，普通流程开发者不操作槽位状态。后续领域只能复用机械槽位，不能把不可交换的业务意图隐藏进框架；它们仍必须作为对象字段或专门协调模型明确表达。
 
 ## 9. 业务取消与不可逆点
 
@@ -736,54 +736,60 @@ DOWN、UP、Shrink 都是 `MemberDiskEvent`。DOWN/UP 只进入执行槽；Shrin
 5. Operation Context 作为附加上下文传播因果、取消和 Trace，不成为执行主体；
 6. MemberDisk 决策元数据统一走“只读校验 -> MetadataService 提交字段级更新 -> 内存应用”的公共路径；业务工作流不操作 Guard，不传完整对象快照，也不重复编写持久化模板；
 7. 每个状态表分支使用近似同步的 `await` 表达一个 action，并在返回后验证 finish state；取消由恢复窗口和下游领域能力在稳定边界解释；
-8. 不同事件到达时，私有运行循环将其加入 pending 并取消当前 step；旧 Future 稳定退出后用下一个事件重新读取对象。
+8. 不同事件到达时，MemberDisk 冲突策略返回 `QueueAndCancel`，公共槽位加入 pending 并取消当前 step；旧 Future 稳定退出后用下一个事件重新读取对象。
 
 ### 14.2 策略声明与机制执行
 
-冲突不再表现为 Request 修改对象中的物理副本。事件先进入同一块盘的私有执行槽：
+冲突不再表现为 Request 修改对象中的物理副本。事件先进入公共机制持有、MemberDisk 提供策略的同盘执行槽：
 
 ```rust
-DiskSlot {
+ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error> {
     active: MemberDiskEvent,
     pending: VecDeque<MemberDiskEvent>,
     cancel: CancellationToken,
 }
 ```
 
-相邻同类事件自然合并；不同事件追加到 pending，并由 `MemberDiskService::run` 取消当前 reconciliation 的盘级令牌。同一盘永远只有一个 reconciliation Future。旧 Future 稳定退出后，下一个事件成为 active；`set_disk_down` 不接收服务级或盘级 token，不被冲突打断。Shrink 排空中发生 DOWN 时，持久化 Shrink 意图不会丢失：在线排空稳定退出后，状态表从 `(UI, DOWN event, true)` 执行 DOWN，再从 `(DI, DOWN event, true)` 恢复排空。Query 直接读取对象目录，不创建 reconciliation Future。
+MemberDisk 的 `resolve_conflict` 将相邻同类事件判为 `Join`，将不同事件判为 `QueueAndCancel`；`ObjectTaskCoordinator` 机械执行 pending 入队、TaskControl 取消和后续提升。同一盘永远只有一个活动 Workflow Future。旧 Future 稳定退出后，下一个事件成为 active；`set_disk_down` 不接收盘级 token，不被业务冲突打断。Shrink 排空中发生 DOWN 时，持久化 Shrink 意图不会丢失：在线排空稳定退出后，状态表从 `(UI, DOWN event, true)` 执行 DOWN，再从 `(DI, DOWN event, true)` 恢复排空。Query 直接读取对象目录，不创建 Task。
 
 ### 14.3 当前 MemberDisk Runtime 契约
 
 每个 Service Runtime 对外表现为一个完整服务容器：
 
 ```text
-MemberDisk
-├── Private Command Channel + typed oneshot
-├── Disk Slots：DiskUuid -> active/pending event + CancellationToken / Waiters
-├── FuturesUnordered：poll 事件提交、查询和多盘 reconciliation
-├── MemberDiskService：唯一元数据修改者
-├── Channel Close：进入 Drain，停止接收新请求并等待已有 Future 收敛
-└── JoinHandle::abort：强制丢弃根 task 和全部受其拥有的 Future
+MemberDisk ServiceInstance
+├── MemberDiskClient：submit / get / wait_idle / allocate_blks
+│   └── ServiceClient<MemberDiskService> + unified Request/Reply Envelope
+├── ServiceControl：Pause / Resume / Drain / Stop / CancelTask
+├── ServiceObserver：Lifecycle / Idle-Busy / Task / Trace / structured events
+├── ServiceTask：根 task 所有权、Join 和最终 Abort
+├── ServiceRuntime root：FuturesUnordered poll 全部 handler Future
+├── ObjectTaskCoordinator：DiskUuid -> active/pending / TaskControl / Waiters
+└── MemberDiskService：唯一元数据修改者与可执行状态表
 ```
 
-当前 MemberDisk 采用一个根 task 直接 poll 多个盘 reconciliation Future。这是具体实现而不是领域模型定理。当前 Channel Close 只停止接收新请求并等待已有 Future 收敛；显式 Stop、超时取消和强制终止仍是后续运行时能力，文档不能把它们描述成已经实现。
+当前 MemberDisk 采用一个公共根 task 直接 poll 多个请求和多盘 Workflow Future。这是具体实现而不是领域模型定理。Channel Close 和显式 Drain 停止接收新请求并等待已有 Future；Stop 请求协作取消并等待稳定退出。Drain/Stop 在 shutdown 完成并以 `Stopped/Failed` 拒绝旧队列后才回复 waiter。ServiceTask::abort 才直接 drop 根 Future；ServiceTask 所有权被遗忘时也会自动 abort，防止后台服务泄漏，并以 `RequestAborted` 与完成事件闭合已接收请求。
 
 ### 14.4 Service Client 与领域 facade 契约
 
-当前 `MemberDiskClient` 只持有指向该 Service 实例的发送端，负责：
+当前 `MemberDiskClient` 是领域 facade，内部包装 `ServiceClient<MemberDiskService>`，只持有指向该 Service 实例的业务发送端和运行状态预检能力，负责：
 
-- 封装业务通道和 oneshot；
-- 使用 typed oneshot 返回请求接收、查询和等待结果；
+- 封装统一的 `MemberDiskRequest` / `MemberDiskReply` 协议和 Envelope oneshot；
+- 通过 `submit/get/wait_idle/allocate_blks` 把统一 Reply 投影为业务调用方期望的具体结果，并用对应 `_in` 方法在跨服务调用时保留 `OperationContext`；
 - 不直接持有 `MemberDiskService` 或访问对象目录；
-- 为未来进程拆分保留相同的 `call/submit/query` 语义。
+- 为未来进程拆分保留类型化 request/response 语义。
 
-不存在“把任意请求交给全局 Router 自动选择目标”的隐式行为。领域模块用 `VirtualDiskService`、`PoolNodeService` 等 facade 提供命名方法。MemberDisk 使用私有 `ServiceMessage`，每个变体携带自身 typed oneshot，因此不需要通用 Response enum。
+不存在“把任意请求交给全局 Router 自动选择目标”的隐式行为。调用者先取得明确的目标 Handle，再调用领域 facade。每个 Service 定义一组 `Request`、`Reply` 和领域 `Error`；通用 Envelope 持有一个返回通道，框架可直接返回 `CallError::Unavailable/ServiceStopped/RequestAborted/HandlerPanicked/ProtocolViolation`，业务失败则返回 `CallError::Business(error)`。
 
-Service Client 不负责判断业务冲突，也不拥有 Task。当前纵切面尚未实现 Task Registry；若以后加入，Task 只能是 Runtime 对 Future 执行的观测与控制记录，不能成为业务流程主体。
+Runtime 将 `ServiceReply` 以 `&mut` 借给 handler。事件 handler 可以先发送 `Accepted`，再继续驱动后台收敛；若 handler 在回复前返回领域错误，Runtime 自动把它发送给调用者；若成功结束却没有回复，Runtime 返回协议错误。提前回复后发生的后续错误进入请求和 Operation 观测；若流程创建了 Task，领域以对应 `TaskOutcome` 结束它，因为“已接收”和“最终收敛”是两个不同承诺。
+
+handler panic 会显式回复 `HandlerPanicked`、闭合自身 Request/Operation 并使 Service 进入 `Failed`；Runtime 随后 drop 其余在途 Future，它们通过 `ServiceReply` 与完成守卫返回 `RequestAborted` 并产生完成事件。强制 abort 同样闭合已接收请求，而正常 Drain/Stop 不产生 `RequestAborted`。
+
+Service Client 不负责判断业务冲突，也不拥有 Task。Task Registry 位于 Runtime 的 `ObservationHub`，领域仅在已经运行的 handler 中按需附加 `TaskAttempt`。Task 是对 Future 执行的观测与控制记录，不能成为业务流程主体或通信能力所有者。
 
 ### 14.5 框架隐藏与领域显式
 
-未来从真实重复中提炼出的框架应隐藏：
+当前公共 Runtime 已隐藏：
 
 - channel 和 oneshot 样板；
 - Future 集合轮询；

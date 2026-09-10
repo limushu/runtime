@@ -5,54 +5,64 @@ skinparam shadowing false
 skinparam componentStyle rectangle
 left to right direction
 
-package "pool-control-plane crate（当前）" {
-  component "lib.rs" as Lib
+package "pool-control-plane crate" {
+  component "lib.rs\npublic domain + runtime API" as Lib
 
-  package "member_disk" {
-    component "model.rs\nentity + updates + invariants" as Model
-    component "allocation.rs\nBLK bitmap" as Allocation
-    component "event.rs\nexternal facts + intents" as Event
-    component "ports.rs\nexplicit domain capabilities" as Ports
-    package "service/" {
-      component "mod.rs\nservice + object store\nSDB-first update" as Service
-      component "client.rs\nclient + private messages" as Client
-      component "reconcile.rs\nobject coordination decisions" as Reconcile
-      component "operations.rs\nasync business operations" as Operations
-      component "runtime.rs\nclient + one root poll loop" as Runtime
-      component "error.rs\nservice errors" as Error
-    }
-    component "*_tests.rs" as Tests
+  package "runtime/（业务无关）" {
+    component "service.rs\nServiceRuntime / Client / Instance\nroot Future poll" as Runtime
+    component "lifecycle.rs\nControl + lifecycle" as Lifecycle
+    component "observation.rs\nOperation / Trace / snapshots / events" as Observation
+    component "task.rs\nTaskAttempt + TaskControl" as Task
+    component "object_task.rs\nobject in-flight coordination" as ObjectTask
   }
+
+  package "member_disk/（领域实现）" {
+    component "model.rs + allocation.rs\nentity / bitmap / invariants" as Model
+    component "event.rs\nUP / DOWN / Shrink input" as Event
+    component "ports.rs\nMetadata / PoolNode / VDM capabilities" as Ports
+    package "service/" {
+      component "mod.rs\nowned committed directory" as Service
+      component "client.rs\ntyped facade + private unified protocol" as Client
+      component "runtime.rs\nManagedService adaptation\nconflict rule + task attachment" as Adapter
+      component "reconcile.rs\nexecutable state table" as Reconcile
+      component "operations.rs\nnormal async business actions" as Operations
+      component "allocation.rs\nTier / failure-domain selection" as AllocationService
+      component "error.rs" as Error
+    }
+  }
+
+  component "tests/runtime_component.rs\nruntime contract tests" as RuntimeTests
+  component "member_disk/service_tests.rs\nbusiness + integration tests" as DomainTests
 }
 
-component "Pool / PoolManager\nnot implemented yet" as Pool
-component "Future common runtime\nextract only after real duplication" as FutureRuntime
+component "Future Pool / PoolManager" as Pool
 
+Lib --> Runtime
 Lib --> Model
-Model --> Allocation
-Event --> Model
-Ports --> Model
-Service --> Model
-Service --> Event
-Service --> Ports
-Reconcile --> Service
+Runtime --> Lifecycle
+Runtime --> Observation
+Runtime --> Task
+ObjectTask --> Task
+Client --> Runtime
+Adapter --> Runtime
+Adapter --> ObjectTask
+Adapter --> Reconcile
 Reconcile --> Operations
 Operations --> Service
-Runtime --> Service
-Runtime --> Reconcile
-Client --> Runtime
-Error --> Model
-Tests --> Service
-Pool ..> Service : future assembly through Client
-Service ..> FutureRuntime : no dependency today
+AllocationService --> Service
+Service --> Model
+Service --> Ports
+DomainTests --> Adapter
+RuntimeTests --> Runtime
+Pool ..> Client : will own clients/control/observer/tasks
 
-note bottom of Service
-这些文件共同实现一个MemberDiskService
-不产生第二个ServiceLoop或Reconciler对象
+note bottom of Runtime
+通用层不出现 Disk / BG / Node 业务类型
+当前先留在单 crate 内，第二个领域验证后再决定是否拆 crate
 end note
 
-note bottom of FutureRuntime
-不是当前crate，也不是既定框架
-第二个真实领域证明重复后再提炼
+note bottom of Adapter
+领域只在一处适配公共运行契约
+业务流程仍是 Service 上的普通 async fn
 end note
 @enduml

@@ -5,58 +5,83 @@ skinparam shadowing false
 skinparam componentStyle rectangle
 left to right direction
 
-actor "Pool / PoolManager" as Caller
+actor "Pool / 调用者" as Owner
+actor "TUI / 审计" as Tui
 
-package "MemberDisk Domain（当前原型）" {
-  component "MemberDiskClient\nsubmit / get / wait_idle" as Client
-  component "Private ServiceMessage\nvariant + typed oneshot" as Message
-  component "MemberDiskService::run\none root Tokio task" as Runtime
-  component "Per-Disk Runtime Slot\nactive + pending event\nCancellationToken / IdleWaiters" as Slot
-  component "FuturesUnordered\nadmission / query / reconciliation" as Futures
-  component "MemberDiskService\ntransition rules / business actions\nfinish-state verification / commit_change" as Service
-  database "HashMap<DiskUuid, MemberDisk>\ncommitted in-memory view" as Objects
+package "ServiceInstance<S>" {
+  component "ServiceClient<S>\ncall(S::Request)" as Client
+  component "ServiceControl\nPause / Resume / Drain / Stop\nCancelTask" as Control
+  component "ServiceObserver\nSnapshot / Event stream / History" as Observer
+  component "ServiceTask\nroot ownership / abort / join" as TaskOwner
+
+  rectangle "ServiceRuntime: one root Tokio task" as Root {
+    component "priority control poll" as ControlPoll
+    component "business admission\nEnvelope<S>: Request + one Reply\nbounded + max in-flight" as Admission
+    component "FuturesUnordered\nhandler Futures" as Futures
+    component "Lifecycle\nInit / Run / Pause / Drain / Stop" as Lifecycle
+    component "CallError<E>\nUnavailable / Stopped / Aborted\nPanicked / Protocol / Business" as CallError
+    component "ObservationHub\nOperation / Task / Trace" as Hub
+  }
 }
 
-component "MetadataService" as Metadata
-database SDB
-component "PoolNodeService" as Node
-component "VirtualDiskService" as VD
+package "MemberDisk adaptation" {
+  component "MemberDiskRequest + MemberDiskReply\none explicit protocol match" as Protocol
+  component "MemberDiskClient facade\nsubmit / get / wait / allocate\n*_in keeps OperationContext" as Facade
+  component "MemberDiskService\nnormal async business methods" as Service
+  component "ObjectTaskCoordinator\nDiskUuid -> active + pending\nTaskControl / WaitIdle" as Objects
+  database "committed MemberDisk directory" as Metadata
+}
 
-Caller --> Client : explicit Pool target
-Client --> Message : mpsc + oneshot
-Message --> Runtime
-Runtime --> Futures : poll all futures
-Futures --> Service : validate disk ownership
-Runtime --> Slot : admit / queue / cancel / repoll
-Slot --> Futures : start one reconciliation
-Futures --> Service : reconcile_once(object, active event)
-Service --> Objects : query / apply committed update
-Service --> Metadata : DiskUuid + MemberDiskUpdate
-Metadata --> SDB : serial durable commit
-Service --> Node : OpenDisk / SetDiskState
-Service --> VD : has_references / evacuate
-Futures --> Runtime : event / step finished
-Runtime --> Client : accepted / query / idle result
-Client ..> Runtime : all senders dropped = Drain
-Caller ..> Runtime : JoinHandle::abort = force stop
+component "PoolNode / VDM / Metadata clients" as Dependencies
 
-note bottom of Runtime
-运行循环不解释业务状态分支
-事件槽和状态表属于MemberDiskService
-一个根task并发poll多个Future
-Drain等待Future收敛，业务不接收shutdown token
+Owner --> Facade : typed business method
+Facade --> Client : unified Request
+Owner --> Control : out-of-band control
+Owner --> TaskOwner : owns root lifetime
+Tui --> Observer : read / subscribe
+Client --> Admission : Envelope + unified oneshot
+Control --> ControlPoll
+ControlPoll --> Lifecycle
+Lifecycle --> CallError : reject queued request
+Admission --> Futures : handle(request, &mut reply, context)
+Futures --> Protocol
+Protocol --> Service : explicit match / async method
+Futures --> CallError : error or missing-reply fallback
+Futures --> Lifecycle : handler panic -> Failed
+Futures --> Hub : RequestFinished / OperationFinished
+Service --> Objects : optional object admission
+Service --> Hub : optional start_task / progress / transition
+Service --> Metadata : read / SDB-first publish
+Service --> Dependencies : explicit target client + await
+Objects --> Hub : precise Task cancellation
+Lifecycle --> Hub
+Hub --> Observer
+TaskOwner --> Root : join or final force-drop
+TaskOwner --> CallError : force-drop -> RequestAborted
+
+note bottom of Root
+一个 Service 只有一个根 Tokio task
+每个请求是 Future，但 Query 不必创建 Task
+控制通道独立且在 select 中优先
+Drain/Stop 在 shutdown + 旧队列终态拒绝后回复
 end note
 
-note bottom of Slot
-同一硬盘最多一个reconciliation Future
-不同事件进入pending并触发CancellationToken
-这里只保存事件与执行态，不复制MemberDisk业务状态
+note bottom of Protocol
+ServiceReply 以 &mut 借给 handler
+事件可先回复 Accepted 再继续收敛
+未回复的 Err / Ok 由 Runtime 统一兜底
+handler panic 返回 HandlerPanicked
+其余被丢弃请求返回 RequestAborted
 end note
 
-note bottom of Service
-start_state + event -> await action -> finish_state
-action返回后验证权威结束状态
-DOWN通知和停IO是同一个SetDiskState::Down动作
-DOWN/UP保存在执行槽，Shrink意图持久化
+note bottom of Objects
+仅提供 Join / Queue / Cancel / Promotion 机制
+Key 与冲突规则由 MemberDisk 决定
+不保存领域状态，不创建每对象 task
+end note
+
+note bottom of Hub
+Snapshot/Event 是观测投影，不是业务 WAL
+Operation 是因果身份，Task 是一次执行尝试
 end note
 @enduml

@@ -33,9 +33,9 @@
 | Operation Context | 一次业务影响的稳定因果身份，携带 owner、scope、cause、取消作用域和 Trace；不是业务状态机 | 已确认 |
 | Task Attempt | Runtime 对一个异步单元的一次执行尝试；可以失败、取消或因切主消失后重新创建 | 已确认 |
 | Future | Rust 中由运行时 poll 的临时代码对象，不是业务身份或核心事实来源 | 已确认 |
-| Managed Task | 业务方法按需提交的对象级执行；Runtime 按 `(ObjectKey, TaskKind)` 启动、合并同类或协作替换异类 | 已确认 |
+| Managed Task | 业务在已运行 Future 内按需附加的执行尝试，用于进度、Trace、审计和精确取消；对象合并由可选 Coordinator 负责 | 已确认 |
 | Domain Step | 一条 `start_state + event -> action -> finish_state` 转换；直接 `await` 一个 `async fn` action，完成后验证权威结束状态 | 已确认 |
-| Service Runtime | 承载控制/业务通道、事件提交、Step Future、Task、生命周期和观测的通用服务容器 | 候选 |
+| Service Runtime | 承载控制/业务通道、根 Future poll、Task、生命周期和结构化观测的通用服务容器 | 已实现 |
 | Causal Graph | 连接 Event、Operation Context、Task Attempt 和状态转换的业务因果有向图 | 已确认 |
 | Local Commit Point | 某个局部效果一旦正式提交便不再回滚的边界；不等价于整个父 Workflow 都不可取消 | 已确认 |
 

@@ -11,34 +11,38 @@ rectangle "Pool" as Pool {
   component "Activity Set" as Activity
 }
 
-rectangle "MemberDisk" as MD {
+rectangle "MemberDisk domain truth" as MD {
   database "Persisted MemberDisk fields (SDB)\nidentity/tier/capacity/topology\nshrink intent/io/allocation/membership/bitmap" as Decision
   component "Operational Projection\nUA / DA / DI / UI / REMOVED" as DiskState
 }
 
 component "DiskMap Event\nUP / DOWN" as PhysicalState
 
-rectangle "MemberDisk private execution loop" as Runtime {
-  component "Execution Activity\nactive reconciliation / cancel / idle waiters" as ReconcileActivity
+rectangle "Runtime observation projection" as Runtime {
+  component "ObjectTaskCoordinator\nactive / pending / cancellation / waiter" as ReconcileActivity
+  component "Operation / Task / Trace\nprogress / blocked_on / transitions" as TaskView
+  component "Service Lifecycle + Idle/Busy" as ServiceView
 }
 
 rectangle "PoolNode" as PN {
   component Membership
-  component "Connectivity\n来自NodeMap" as Connectivity
+  component "Connectivity\n来自 NodeMap" as Connectivity
   component "Pool ServiceState" as ServiceState
 }
 
 rectangle "BGEntry" as Entry {
-  component "MediaState\n由MemberDisk派生" as MediaState
+  component "MediaState\n由 MemberDisk 派生" as MediaState
   component DataState
 }
 
-Entry --> Health : BG -> VD -> Pool派生
-PhysicalState --> MD : MemberDiskEvent
-PhysicalState --> MediaState : 当前介质事实
+Entry --> Health : BG -> VD -> Pool 派生
+PhysicalState --> MD : MemberDiskEvent input
+PhysicalState --> MediaState : current media fact
 Decision --> DiskState : io + allocation + membership
-ReconcileActivity ..> DiskState : 不参与投影，仅管理执行
-Connectivity --> ServiceState : 必要但不充分
+ReconcileActivity ..> DiskState : drives but never owns truth
+TaskView ..> DiskState : observes transitions only
+ServiceView --> Activity
+Connectivity --> ServiceState : necessary but insufficient
 
 note bottom of Pool
 PoolState = Lifecycle × Health × Activity
@@ -48,10 +52,8 @@ note bottom of PN
 Connected(n) 不代表 PoolServing(p,n)
 end note
 
-note bottom of MD
-Decision fields / Observation input / Projection 与执行活动分离
-物理事实只保存在active/pending事件
-MemberDisk保存已提交能力和Shrink意图
-私有执行槽只拥有Activity
+note bottom of Runtime
+运行状态和观测记录都不是领域权威
+Monitor 切主后从 SDB + 当前外部事实重新收敛
 end note
 @enduml

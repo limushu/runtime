@@ -9,7 +9,7 @@ mod model_tests;
 #[cfg(test)]
 mod service_tests;
 
-pub use allocation::{AllocationBitmap, BlkId, BlkSize};
+pub use allocation::{AllocateBlks, Allocation, AllocationBitmap, BlkId, BlkRef, BlkSize};
 pub use event::{EpochMillis, MemberDiskEvent, PhysicalState};
 pub use model::{
     AllocationState, DiskIoState, DiskUuid, FailureDomain, MemberDisk, MemberDiskError,
@@ -19,4 +19,7 @@ pub use ports::{
     MetadataError, MetadataService, PoolNodeError, PoolNodeService, UserDpRequest,
     VirtualDiskError, VirtualDiskService,
 };
-pub use service::{MemberDiskClient, MemberDiskService, MemberDiskServiceError};
+pub use service::{
+    Accepted, MemberDiskCallError, MemberDiskClient, MemberDiskRuntime, MemberDiskService,
+    MemberDiskServiceError,
+};

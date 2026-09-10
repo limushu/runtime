@@ -1,6 +1,6 @@
 # Pool 管控面架构基线
 
-版本：`Baseline B0.6`
+版本：`Baseline B0.7`
 
 状态：理论基线 + MemberDisk 最小纵切面。PoolManager、Pool 装配和其他领域仍待实现。
 
@@ -45,7 +45,8 @@
 6. [不变量与一致性原则](05-invariants-and-consistency.md)
 7. [决策与待决问题](06-decisions-and-open-questions.md)
 8. [理论基础论文：对象状态机、领域工作流与收敛控制](07-pool-control-plane-theory.md)
-9. [Workspace、包边界与迁移规划](08-package-and-workspace-layout.md)
+9. [Workspace 与包边界](08-package-and-workspace-layout.md)
+10. [Service Runtime：生命周期、任务与观测](09-service-runtime.md)
 
 PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`assets/`](assets/)。
 
@@ -64,16 +65,17 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **已确认：** 核心业务状态只属于领域对象；Operation Context 不建立第二套 `phase/status` 业务状态机。
 - **已确认：** 业务执行优先写成所属 Service 上的自然 `async fn`；跨服务通信通过明确目标实例的类型化 Service facade；请求不携带隐藏路由身份。
 - **已确认：** 每个请求都是 Future，但只有需要审计或命令式并发控制的操作才创建受管 Task；Query 直接执行。
-- **当前实现：** MemberDisk 采用领域专属的 `Client -> MemberDiskService::run -> executable state table`，不实现通用 Reconciler/ActionFlow trait。
+- **当前实现：** `ServiceClient::call(Request)` 通过统一 Request/Reply Envelope 和单一 oneshot 通信，`CallError` 分离框架、业务、handler panic 与强制 abort；MemberDisk facade 提供保留 `OperationContext` 的 `_in` 调用，内部采用 `Client -> ServiceRuntime root -> MemberDiskService::handle -> executable state table`，不实现通用 ActionFlow DSL。
 - **当前实现：** DOWN、UP、Shrink 是同一个 `MemberDiskEvent` 的变体；物理事件保存在每盘 active/pending 槽中而不写入 MemberDisk，Shrink 第一步提交持久化管理意图；不同事件请求当前 step 稳定停止。
-- **当前实现：** `MemberDiskService::run` 是唯一根执行单元，直接 poll 多盘 Future，不再存在第二个 `ServiceLoop` 对象，也不为每个硬盘创建 Tokio task。
-- **已确认：** 每个 MemberDisk 是完整领域对象而不是 Actor API；盘级执行槽保存 active/pending 事件、取消令牌和等待者，不复制业务状态。
+- **当前实现：** `ServiceRuntime` 为每个服务实例创建唯一根执行单元，统一 poll 请求 Future，不为每个硬盘创建 Tokio task。
+- **当前实现：** `ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error>` 保存盘级 active/pending 输入、取消控制和等待者；MemberDisk 以一个普通函数声明冲突策略，执行槽不复制业务状态。
 - **已确认：** MemberDisk 决策元数据、DiskMap 输入事实、派生运行状态和在途意图是不同信息，不得用单一状态枚举替代完整实体。
 - **当前实现：** 仓库只有一个 `pool-control-plane` crate；`MemberDiskService` 私有持有对象目录，并通过统一的“校验 -> SDB -> 内存”路径修改。
 - **当前实现：** `reconcile_once` 直接穷举 `(MemberDiskState, active MemberDiskEvent, shrink_requested)`；分支用普通 `await` 调用一个业务 action，再验证声明的结束状态。`Transitioned` 重新读取权威状态并继续同一事件，`Stable` 结束驱动，不存在 Action enum、执行转发表或隐藏兜底分支。
 - **当前实现：** VDM 是 BG 引用关系的权威来源；排空完成不能只相信一次 Future 返回，必须通过 `has_references` 验证。该查询只发生在需要排空的转换中，不会把不可失败的 DOWN 边界耦合到 VDM 可用性。
 - **当前实现：** `SetDiskState::Down` 同时表示通知 DOWN 和停止 IO；Shrink 期间 DOWN 会先让当前 VDm step 协作稳定退出，再从对象真实状态继续。
-- **待验证：** MemberDisk 私有执行循环中哪些代码会在第二个真实领域重复；在此之前不建立统一 Service/Reconciler/ObjectRunner 抽象或公共 runtime crate。
+- **当前实现：** BLK 申请是 MemberDisk 领域的 typed Request，按 Tier 和可选故障域选择成员盘，SDB 提交后发布内存，不进入 DiskUuid 生命周期槽。
+- **当前实现：** 公共 Runtime 已提供独立业务/控制通道、完整 Service 生命周期、Idle/Busy、可选 Task、Trace、精确取消、结构化快照/事件和根任务强制回收，并由 MemberDisk 纵切面接入验证；第二个真实领域仍用于检验抽象的泛化边界，而不是决定这些机制是否存在。
 - **待决：** Tier、PoolCore、Rebuild 的最终服务粒度，以及 Monitor 切主时在途操作恢复协议。
 
 ## 基线完成标准

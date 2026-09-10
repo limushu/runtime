@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::{OperationContext, OperationSpec, TraceContext};
 use async_trait::async_trait;
 use std::sync::{
     Arc,
@@ -12,6 +13,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     Metadata(MemberDiskUpdate),
+    Allocate(Vec<BlkRef>),
     PoolNode(UserDpRequest),
     Evacuate(DiskUuid),
 }
@@ -32,6 +34,14 @@ impl MetadataService for Metadata {
             return Err(MetadataError::new("SDB unavailable"));
         }
         self.calls.lock().await.push(Call::Metadata(update.clone()));
+        Ok(())
+    }
+
+    async fn allocate_blks(&self, blks: &[BlkRef]) -> Result<(), MetadataError> {
+        if self.fail {
+            return Err(MetadataError::new("SDB unavailable"));
+        }
+        self.calls.lock().await.push(Call::Allocate(blks.to_vec()));
         Ok(())
     }
 }
@@ -193,13 +203,20 @@ impl VirtualDiskService for VirtualDisks {
 }
 
 fn member() -> MemberDisk {
+    member_in("disk-1", "tier-ssd", "rack-1")
+}
+
+fn member_in(uuid: &str, tier: &str, rack: &str) -> MemberDisk {
     let mut disk = MemberDisk::new(
-        DiskUuid::new("disk-1"),
+        DiskUuid::new(uuid),
         "pool-1",
-        "tier-ssd",
+        tier,
         "ssd",
         GIB,
-        vec![FailureDomain::new("node", "node-1")],
+        vec![
+            FailureDomain::new("node", format!("node-{uuid}")),
+            FailureDomain::new("rack", rack),
+        ],
     )
     .unwrap();
     disk.mark_io_up().unwrap();
@@ -208,7 +225,14 @@ fn member() -> MemberDisk {
 
 type RuntimeParts = (
     MemberDiskClient,
-    tokio::task::JoinHandle<()>,
+    crate::runtime::ServiceTask,
+    Arc<Mutex<Vec<Call>>>,
+    Arc<Nodes>,
+    Arc<VirtualDisks>,
+);
+
+type SpawnedRuntimeParts = (
+    MemberDiskRuntime,
     Arc<Mutex<Vec<Call>>>,
     Arc<Nodes>,
     Arc<VirtualDisks>,
@@ -219,6 +243,35 @@ fn runtime(
     controlled_evacuation: bool,
     fail_metadata: bool,
 ) -> RuntimeParts {
+    runtime_with_members(
+        vec![member()],
+        recovery_window,
+        controlled_evacuation,
+        fail_metadata,
+    )
+}
+
+fn runtime_with_members(
+    members: Vec<MemberDisk>,
+    recovery_window: std::time::Duration,
+    controlled_evacuation: bool,
+    fail_metadata: bool,
+) -> RuntimeParts {
+    let (running, calls, nodes, virtual_disks) = spawn_runtime_with_members(
+        members,
+        recovery_window,
+        controlled_evacuation,
+        fail_metadata,
+    );
+    (running.client, running.task, calls, nodes, virtual_disks)
+}
+
+fn spawn_runtime_with_members(
+    members: Vec<MemberDisk>,
+    recovery_window: std::time::Duration,
+    controlled_evacuation: bool,
+    fail_metadata: bool,
+) -> SpawnedRuntimeParts {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let nodes = Arc::new(Nodes {
         calls: calls.clone(),
@@ -242,7 +295,7 @@ fn runtime(
         max_active: AtomicUsize::new(0),
     });
     let service = MemberDiskService::new(
-        vec![member()],
+        members,
         Arc::new(Metadata {
             calls: calls.clone(),
             fail: fail_metadata,
@@ -251,8 +304,8 @@ fn runtime(
         virtual_disks.clone(),
         recovery_window,
     );
-    let (client, task) = service.spawn(16);
-    (client, task, calls, nodes, virtual_disks)
+    let running = service.spawn(16);
+    (running, calls, nodes, virtual_disks)
 }
 
 fn physical(state: PhysicalState, observed_at: u64) -> MemberDiskEvent {
@@ -263,7 +316,7 @@ fn physical(state: PhysicalState, observed_at: u64) -> MemberDiskEvent {
     }
 }
 
-async fn stop(client: MemberDiskClient, task: tokio::task::JoinHandle<()>) {
+async fn stop(client: MemberDiskClient, task: crate::runtime::ServiceTask) {
     drop(client);
     task.await.unwrap();
 }
@@ -404,6 +457,119 @@ async fn repeated_down_is_merged_in_the_disk_slot() {
         .unwrap();
     client.wait_idle(disk).await.unwrap();
     assert_eq!(nodes.down_attempts(), 1);
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn member_disk_conflict_and_progress_are_visible_as_structured_runtime_data() {
+    let (running, _, nodes, _) = spawn_runtime_with_members(
+        vec![member()],
+        std::time::Duration::from_secs(3_600),
+        false,
+        false,
+    );
+    let client = running.client;
+    let observer = running.observer;
+    let task = running.task;
+    let disk = DiskUuid::new("disk-1");
+    nodes.block_down();
+
+    client
+        .submit(physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    nodes.wait_down_started().await;
+
+    let snapshot = observer.snapshot();
+    assert_eq!(
+        snapshot.lifecycle,
+        crate::runtime::ServiceLifecycle::Running
+    );
+    assert_eq!(snapshot.activity, crate::runtime::ServiceActivity::Busy);
+    assert_eq!(snapshot.active_tasks.len(), 1);
+    assert_eq!(snapshot.active_tasks[0].key, "disk/disk-1");
+    assert_eq!(snapshot.active_tasks[0].kind, "offline");
+    assert!(!snapshot.active_tasks[0].trace_id.is_empty());
+
+    client
+        .submit(physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    assert_eq!(observer.snapshot().active_tasks.len(), 1);
+
+    client
+        .submit(physical(PhysicalState::Up, current_time()))
+        .await
+        .unwrap();
+    assert_eq!(
+        observer.snapshot().active_tasks[0].state,
+        crate::runtime::TaskState::Cancelling
+    );
+
+    nodes.release_down();
+    client.wait_idle(disk).await.unwrap();
+
+    let history = observer.history();
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        crate::runtime::RuntimeEventKind::TaskCancelRequested { cause, .. }
+            if cause.contains("online")
+    )));
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        crate::runtime::RuntimeEventKind::StateTransition { action, .. }
+            if action == "set disk DOWN"
+    )));
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        crate::runtime::RuntimeEventKind::TaskFinished {
+            outcome: crate::runtime::TaskOutcome::Cancelled,
+            ..
+        }
+    )));
+
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn facade_call_in_preserves_the_parent_operation_and_trace() {
+    let (running, _, nodes, _) = spawn_runtime_with_members(
+        vec![member()],
+        std::time::Duration::from_secs(3_600),
+        false,
+        false,
+    );
+    let client = running.client;
+    let observer = running.observer;
+    let task = running.task;
+    let disk = DiskUuid::new("disk-1");
+    let parent = OperationContext::root(
+        OperationSpec::new(
+            "pool",
+            "handle_disk_map_event",
+            "pool/pool-1",
+            "apply DiskMap event to pool",
+        )
+        .with_trace(TraceContext::new("pool-event-trace")),
+    );
+    nodes.block_down();
+
+    client
+        .submit_in(&parent, physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    nodes.wait_down_started().await;
+
+    let active = observer.snapshot().active_tasks[0].clone();
+    assert_eq!(active.operation_id, parent.id());
+    assert_eq!(active.trace_id, parent.trace().trace_id());
+
+    client
+        .submit(physical(PhysicalState::Up, current_time()))
+        .await
+        .unwrap();
+    nodes.release_down();
+    client.wait_idle(disk).await.unwrap();
     stop(client, task).await;
 }
 
@@ -607,9 +773,9 @@ async fn failed_sdb_change_is_not_published_to_memory() {
         .unwrap();
     assert_eq!(
         client.wait_idle(disk.clone()).await,
-        Err(MemberDiskServiceError::Metadata(MetadataError::new(
-            "SDB unavailable"
-        )))
+        Err(crate::runtime::CallError::Business(
+            MemberDiskServiceError::Metadata(MetadataError::new("SDB unavailable"))
+        ))
     );
     assert_eq!(
         client.get(disk).await.unwrap().state(),
@@ -631,12 +797,107 @@ async fn evacuation_must_reach_its_declared_finish_state() {
 
     assert!(matches!(
         client.wait_idle(disk.clone()).await,
-        Err(MemberDiskServiceError::TransitionIncomplete(_))
+        Err(crate::runtime::CallError::Business(
+            MemberDiskServiceError::TransitionIncomplete(_)
+        ))
     ));
     assert_eq!(
         client.get(disk).await.unwrap().state(),
         MemberDiskState::UpInactive
     );
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn facade_allocates_blks_from_member_disks_in_one_tier() {
+    let members = vec![
+        member_in("disk-1", "tier-ssd", "rack-1"),
+        member_in("disk-2", "tier-ssd", "rack-2"),
+        member_in("disk-3", "tier-hdd", "rack-3"),
+    ];
+    let (client, task, calls, _, _) =
+        runtime_with_members(members, std::time::Duration::ZERO, false, false);
+
+    let allocation = client
+        .allocate_blks(AllocateBlks::new("tier-ssd", 2).distinct_by("rack"))
+        .await
+        .unwrap();
+
+    assert_eq!(allocation.blks().len(), 2);
+    assert_eq!(allocation.blks()[0].disk(), &DiskUuid::new("disk-1"));
+    assert_eq!(allocation.blks()[1].disk(), &DiskUuid::new("disk-2"));
+    assert!(
+        calls
+            .lock()
+            .await
+            .contains(&Call::Allocate(allocation.blks().to_vec()))
+    );
+    assert_eq!(
+        client
+            .get(DiskUuid::new("disk-1"))
+            .await
+            .unwrap()
+            .allocation_bitmap()
+            .allocated_blks(),
+        1
+    );
+
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn failed_blk_allocation_is_not_published_to_memory() {
+    let (client, task, _, _, _) = runtime(std::time::Duration::ZERO, false, true);
+    let disk = DiskUuid::new("disk-1");
+
+    assert!(matches!(
+        client.allocate_blks(AllocateBlks::new("tier-ssd", 1)).await,
+        Err(crate::runtime::CallError::Business(
+            MemberDiskServiceError::Metadata(_)
+        ))
+    ));
+    assert_eq!(
+        client
+            .get(disk)
+            .await
+            .unwrap()
+            .allocation_bitmap()
+            .allocated_blks(),
+        0
+    );
+
+    stop(client, task).await;
+}
+
+#[tokio::test]
+async fn blk_allocation_excludes_a_disk_with_an_active_lifecycle_event() {
+    let (client, task, _, nodes, _) = runtime(std::time::Duration::from_secs(3_600), false, false);
+    let disk = DiskUuid::new("disk-1");
+    nodes.block_down();
+
+    client
+        .submit(physical(PhysicalState::Down, current_time()))
+        .await
+        .unwrap();
+    nodes.wait_down_started().await;
+
+    assert_eq!(
+        client.allocate_blks(AllocateBlks::new("tier-ssd", 1)).await,
+        Err(crate::runtime::CallError::Business(
+            MemberDiskServiceError::InsufficientAllocationCandidates {
+                tier: "tier-ssd".into(),
+                requested: 1,
+                available: 0,
+            }
+        ))
+    );
+
+    client
+        .submit(physical(PhysicalState::Up, current_time()))
+        .await
+        .unwrap();
+    nodes.release_down();
+    client.wait_idle(disk).await.unwrap();
     stop(client, task).await;
 }
 

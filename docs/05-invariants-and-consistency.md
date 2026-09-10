@@ -206,17 +206,17 @@ Monitor 切主、Task 失败或执行重试不能改变 Operation Context 的因
 
 ## 业务策略与当前具体执行
 
-当前 MemberDisk 生产路径由 `MemberDisk` 方法校验字段变化，`reconcile_once` 按 `MemberDisk` 已提交状态和 active 事件执行状态表中的一行。每一行明确起始状态、事件、单一 action 和结束状态；action 成功但结束状态未成立仍视为失败。排空结束必须由 VDM 权威查询确认，不能只依赖 Future 的临时返回。每盘只有一个 active reconciliation；物理 DOWN/UP 不进入对象，保存在私有执行槽中。不同事件进入 pending 队列并取消旧 step，旧 Future 稳定返回后再处理下一个事件，不向运行中 Future 注入旁路命令。
+当前 MemberDisk 生产路径由 `MemberDisk` 方法校验字段变化，`reconcile_once` 按 `MemberDisk` 已提交状态和 active 事件执行状态表中的一行。每一行明确起始状态、事件、单一 action 和结束状态；action 成功但结束状态未成立仍视为失败。排空结束必须由 VDM 权威查询确认，不能只依赖 Future 的临时返回。每盘只有一个 active reconciliation；物理 DOWN/UP 不进入对象，保存在框架执行槽中。不同事件进入 pending 队列并取消旧 step，旧 Future 稳定返回后再处理下一个事件，不向运行中 Future 注入旁路命令。
 
-查询不创建 reconciliation Future。需要互斥的盘事件必须从同一个 `MemberDiskClient` 进入，不能绕过入口直接并发调用写流程。只有第二个真实领域证明存在相同的 active/cancel/repoll 语义后，才允许把机械代码下沉。
+查询不创建 Task，但仍作为普通 handler Future 由根循环执行。需要互斥的盘事件必须通过目标 `MemberDiskClient::submit(event)` 进入，不能绕过入口直接并发调用写流程。当前已把 active/pending/cancel/promotion/waiter 下沉为不含 Disk 业务词汇的 `ObjectTaskCoordinator<K, I, E>`；Key、冲突判断和下一步业务动作仍由领域实现，不能继续下沉为通用状态机或 Action DSL。
 
 ## 共享意图的生命期
 
-多个提交合并到同一对象意图时，Workflow 的生命期属于对象意图槽位，不属于第一个提交者。当前 `submit` 只确认请求已经被 Service 安全接收，不订阅最终业务结果；需要等待的调用者显式使用 `wait_idle`：
+多个提交合并到同一对象意图时，Workflow 的生命期属于对象意图槽位，不属于第一个提交者。当前 `submit(MemberDiskEvent)` 返回 `Accepted`，只确认输入已经被 Service 校验并送入对象槽，不订阅最终业务结果；需要等待的测试或管理请求使用 `wait_idle(disk)`：
 
 - `MemberDiskClient` 被 clone 或 drop 不改变已接收 Workflow 的生命期；
-- `wait_idle` 的接收端离开不取消 Workflow；
-- 新事件与 active 事件不同时，私有运行循环把它加入 pending， 请求旧 Future 协作取消，并等待其稳定退出后重新计算下一步。
+- `wait_idle` 调用方离开不取消 Workflow；
+- 新事件与 active 事件不同时，MemberDisk 的 `resolve_conflict` 返回 `QueueAndCancel`；公共槽位加入 pending、请求旧 Future 协作取消，并等待其稳定退出后重新计算下一步。
 
 普通业务方法不在每行轮询取消。恢复窗口直接等待取消；跨领域调用接收同一个 `CancellationToken`，并约定只在下游已经停止、完成不可中断动作或到达稳定边界后返回。当前没有 `stable_boundary()` 或 `converge` 隐式机制。若未来把 step 驱动提炼为公共 Runner，也必须在接纳下游稳定结果后再阻止下一步。
 

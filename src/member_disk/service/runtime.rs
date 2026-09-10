@@ -1,272 +1,216 @@
 use super::{
-    MemberDiskClient, MemberDiskService, MemberDiskServiceError, client::ServiceMessage,
+    MemberDiskService, MemberDiskServiceError,
+    client::{Accepted, MemberDiskReply, MemberDiskRequest},
     reconcile::ReconcileResult,
 };
-use crate::member_disk::{DiskUuid, MemberDisk, MemberDiskEvent};
-use futures_util::{StreamExt, stream::FuturesUnordered};
-use std::{
-    collections::{HashMap, VecDeque},
-    future::Future,
-    pin::Pin,
-    sync::Arc,
+use crate::{
+    member_disk::{DiskUuid, MemberDiskEvent, PhysicalState},
+    runtime::{
+        ConflictDecision, ManagedService, ObjectActivity, ObjectAdmission, ObjectLease,
+        RequestContext, ServiceConfig, ServiceReply, ServiceRuntime, TaskMeta, TaskOutcome,
+    },
 };
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
-use tokio_util::sync::CancellationToken;
+use async_trait::async_trait;
+use std::sync::Arc;
 
 impl MemberDiskService {
-    /// Starts the only Tokio task owned by this service. Per-disk steps are
-    /// Futures polled by this task; they are not separately spawned tasks.
-    pub fn spawn(self, queue_capacity: usize) -> (MemberDiskClient, JoinHandle<()>) {
-        let (sender, receiver) = mpsc::channel(queue_capacity);
-        let client = MemberDiskClient::new(sender);
-        let service = Arc::new(self);
-        let task = tokio::spawn(service.run(receiver));
-        (client, task)
+    pub fn spawn(self, queue_capacity: usize) -> super::MemberDiskRuntime {
+        let mut config = ServiceConfig::new("member-disk", "member_disk");
+        config.business_capacity = queue_capacity;
+        self.spawn_with_config(config)
     }
 
-    /// Owns event admission, one active event per disk, and all step Futures.
-    async fn run(self: Arc<Self>, mut receiver: mpsc::Receiver<ServiceMessage>) {
-        let mut pending_admissions = VecDeque::new();
-        let mut admissions = FuturesUnordered::<AdmissionFuture>::new();
-        let mut queries = FuturesUnordered::<QueryFuture>::new();
-        let mut active: HashMap<DiskUuid, DiskSlot> = HashMap::new();
-        let mut reconciles = FuturesUnordered::<ReconcileFuture>::new();
-        let mut idle_waiters: HashMap<
-            DiskUuid,
-            Vec<oneshot::Sender<Result<(), MemberDiskServiceError>>>,
-        > = HashMap::new();
-        let mut last_results = HashMap::new();
-        let mut accepting = true;
+    /// Starts this domain on the common runtime with explicit lifecycle,
+    /// concurrency and observation configuration.
+    pub fn spawn_with_config(self, config: ServiceConfig) -> super::MemberDiskRuntime {
+        ServiceRuntime::spawn(self, config).into()
+    }
 
-        while accepting
-            || !pending_admissions.is_empty()
-            || !admissions.is_empty()
-            || !queries.is_empty()
-            || !reconciles.is_empty()
-        {
-            tokio::select! {
-                message = receiver.recv(), if accepting => match message {
-                    Some(ServiceMessage::Submit { event, reply }) => {
-                        pending_admissions.push_back(PendingAdmission { event, reply });
-                        self.start_next_admission(&mut pending_admissions, &mut admissions);
-                    }
-                    Some(ServiceMessage::Get { disk, reply }) => {
-                        let service = self.clone();
-                        queries.push(Box::pin(async move {
-                            let result = service.get_member(&disk).await;
-                            QueryFinished { reply, result }
-                        }));
-                    }
-                    Some(ServiceMessage::WaitIdle { disk, reply }) => {
-                        if active.contains_key(&disk) {
-                            idle_waiters.entry(disk).or_default().push(reply);
-                        } else {
-                            let result = last_results.get(&disk).cloned().unwrap_or(Ok(()));
-                            let _ = reply.send(result);
-                        }
-                    }
-                    None => {
-                        // Dropping all clients drains admitted work. Force stop
-                        // remains the caller's explicit JoinHandle::abort().
-                        accepting = false;
-                    }
-                },
-                Some(admission) = admissions.next(), if !admissions.is_empty() => {
-                    match admission.result {
-                        Ok(()) => {
-                            self.admit_event(
-                                admission.event,
-                                &mut active,
-                                &mut reconciles,
-                                &mut last_results,
-                            );
-                            let _ = admission.reply.send(Ok(()));
-                        }
-                        Err(error) => {
-                            let _ = admission.reply.send(Err(error));
-                        }
-                    }
-                    self.start_next_admission(&mut pending_admissions, &mut admissions);
-                }
-                Some(query) = queries.next(), if !queries.is_empty() => {
-                    let _ = query.reply.send(query.result);
-                }
-                Some(finished) = reconciles.next(), if !reconciles.is_empty() => {
-                    let mut slot = active
-                        .remove(&finished.disk)
-                        .expect("a finished reconciliation must have an active disk slot");
+    async fn handle_event(
+        self: Arc<Self>,
+        event: MemberDiskEvent,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
+        context: RequestContext,
+    ) -> Result<(), MemberDiskServiceError> {
+        self.get_member(event.disk()).await?;
 
-                    if let Some(next) = slot.pending.pop_front() {
-                        self.start_reconcile(
-                            next,
-                            slot.pending,
-                            &mut active,
-                            &mut reconciles,
-                            &mut last_results,
-                        );
-                    } else {
-                        match finished.result {
-                            Ok(ReconcileResult::Transitioned) => self.start_reconcile(
-                                slot.event,
-                                VecDeque::new(),
-                                &mut active,
-                                &mut reconciles,
-                                &mut last_results,
-                            ),
-                            Ok(ReconcileResult::Stable) => Self::finish_disk(
-                                finished.disk,
-                                Ok(()),
-                                &mut idle_waiters,
-                                &mut last_results,
-                            ),
-                            Err(error) => Self::finish_disk(
-                                finished.disk,
-                                Err(error),
-                                &mut idle_waiters,
-                                &mut last_results,
-                            ),
-                        }
-                    }
+        let disk = event.disk().clone();
+        let admission =
+            self.object_tasks
+                .admit(disk, event, context.cancellation(), Self::resolve_conflict);
+        reply.send(MemberDiskReply::Accepted(Accepted));
+
+        let lease = match admission {
+            ObjectAdmission::Joined => return Ok(()),
+            ObjectAdmission::Active(lease) => lease,
+            ObjectAdmission::Pending(pending) => pending
+                .activate()
+                .await
+                .ok_or(MemberDiskServiceError::Cancelled)?,
+        };
+        self.run_object_workflow(lease, context).await
+    }
+
+    fn resolve_conflict(
+        activity: ObjectActivity<'_, MemberDiskEvent>,
+        incoming: &MemberDiskEvent,
+    ) -> ConflictDecision {
+        if activity.latest().same_kind(incoming) {
+            return ConflictDecision::Join;
+        }
+
+        ConflictDecision::QueueAndCancel {
+            cause: format!(
+                "{} replaced by a newer {} event",
+                event_kind(activity.active()),
+                event_kind(incoming)
+            ),
+        }
+    }
+
+    async fn run_object_workflow(
+        self: Arc<Self>,
+        lease: ObjectLease<DiskUuid, MemberDiskEvent, MemberDiskServiceError>,
+        context: RequestContext,
+    ) -> Result<(), MemberDiskServiceError> {
+        let event = lease.input().clone();
+        let disk = event.disk().clone();
+        let task = context.start_task(
+            TaskMeta::new(
+                format!("disk/{disk}"),
+                event_kind(&event),
+                format!("reconcile member disk {disk}"),
+            ),
+            lease.cancellation().clone(),
+        );
+        lease.bind_task(task.control());
+
+        let result = loop {
+            let before = self.reconcile_state(&disk).await?;
+            task.blocked_on("next MemberDisk state transition");
+            match self.reconcile_once(&event, task.cancellation()).await {
+                Ok(ReconcileResult::Transitioned { action }) => {
+                    task.unblocked();
+                    let after = self.reconcile_state(&disk).await?;
+                    task.transition(
+                        format!("disk/{disk}"),
+                        event_kind(&event),
+                        format!("{before:?}"),
+                        action,
+                        format!("{after:?}"),
+                    );
+                    task.milestone(format!("member disk reached {after:?}"));
+                }
+                Ok(ReconcileResult::Stable) => {
+                    task.unblocked();
+                    break Ok(());
+                }
+                Err(error) => {
+                    task.unblocked();
+                    break Err(error);
                 }
             }
-        }
-    }
-
-    /// Event admission validates only that this Pool owns the disk. Physical
-    /// facts stay on the event; no MemberDisk metadata is changed here.
-    fn start_next_admission(
-        self: &Arc<Self>,
-        pending: &mut VecDeque<PendingAdmission>,
-        admissions: &mut FuturesUnordered<AdmissionFuture>,
-    ) {
-        if !admissions.is_empty() {
-            return;
-        }
-        let Some(pending) = pending.pop_front() else {
-            return;
         };
 
-        let service = self.clone();
-        admissions.push(Box::pin(async move {
-            let result = service.get_member(pending.event.disk()).await.map(|_| ());
-            AdmissionFinished {
-                event: pending.event,
-                reply: pending.reply,
-                result,
-            }
-        }));
-    }
-
-    /// Keeps one active event per disk. A distinct incoming event is queued and
-    /// asks the current stable step to settle; adjacent duplicates are merged.
-    fn admit_event(
-        self: &Arc<Self>,
-        event: MemberDiskEvent,
-        active: &mut HashMap<DiskUuid, DiskSlot>,
-        reconciles: &mut FuturesUnordered<ReconcileFuture>,
-        last_results: &mut HashMap<DiskUuid, Result<(), MemberDiskServiceError>>,
-    ) {
-        let disk = event.disk().clone();
-        let Some(slot) = active.get_mut(&disk) else {
-            self.start_reconcile(event, VecDeque::new(), active, reconciles, last_results);
-            return;
+        let outcome = match &result {
+            Ok(()) => TaskOutcome::Completed,
+            Err(MemberDiskServiceError::Cancelled) => TaskOutcome::Cancelled,
+            Err(error) => TaskOutcome::Failed(error.to_string()),
         };
-
-        let duplicate = slot.pending.back().map_or_else(
-            || slot.event.same_kind(&event),
-            |last| last.same_kind(&event),
-        );
-        if duplicate {
-            return;
-        }
-
-        slot.pending.push_back(event);
-        slot.cancel.cancel();
+        task.finish(outcome);
+        lease.finish(result.clone());
+        result
     }
 
-    fn start_reconcile(
-        self: &Arc<Self>,
-        event: MemberDiskEvent,
-        pending: VecDeque<MemberDiskEvent>,
-        active: &mut HashMap<DiskUuid, DiskSlot>,
-        reconciles: &mut FuturesUnordered<ReconcileFuture>,
-        last_results: &mut HashMap<DiskUuid, Result<(), MemberDiskServiceError>>,
-    ) {
-        let disk = event.disk().clone();
-        let cancel = CancellationToken::new();
-
-        // A later event is already waiting. The current event still gets one
-        // chance to cross a mandatory boundary, while cancellable work settles
-        // immediately and yields to the next event.
-        if !pending.is_empty() {
-            cancel.cancel();
-        }
-
-        last_results.remove(&disk);
-        active.insert(
-            disk.clone(),
-            DiskSlot {
-                event: event.clone(),
-                cancel: cancel.clone(),
-                pending,
-            },
-        );
-
-        let service = self.clone();
-        reconciles.push(Box::pin(async move {
-            let result = service.reconcile_once(&event, &cancel).await;
-            ReconcileFinished { disk, result }
-        }));
-    }
-
-    fn finish_disk(
+    async fn handle_get(
+        &self,
         disk: DiskUuid,
-        result: Result<(), MemberDiskServiceError>,
-        idle_waiters: &mut HashMap<
-            DiskUuid,
-            Vec<oneshot::Sender<Result<(), MemberDiskServiceError>>>,
-        >,
-        last_results: &mut HashMap<DiskUuid, Result<(), MemberDiskServiceError>>,
-    ) {
-        last_results.insert(disk.clone(), result.clone());
-        if let Some(waiters) = idle_waiters.remove(&disk) {
-            for waiter in waiters {
-                let _ = waiter.send(result.clone());
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
+    ) -> Result<(), MemberDiskServiceError> {
+        let member = self.get_member(&disk).await?;
+        reply.send(MemberDiskReply::Member(member));
+        Ok(())
+    }
+
+    async fn handle_wait_idle(
+        &self,
+        disk: DiskUuid,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
+    ) -> Result<(), MemberDiskServiceError> {
+        self.object_tasks.wait_idle(disk).await?;
+        reply.send(MemberDiskReply::Idle);
+        Ok(())
+    }
+
+    async fn handle_allocation(
+        &self,
+        request: crate::member_disk::AllocateBlks,
+        reply: &mut ServiceReply<MemberDiskReply, MemberDiskServiceError>,
+        context: RequestContext,
+    ) -> Result<(), MemberDiskServiceError> {
+        let task = context.start_task(
+            TaskMeta::new(
+                format!("tier/{}", request.tier()),
+                "allocate_blks",
+                format!("allocate {} BLKs", request.count()),
+            )
+            .non_cancellable(),
+            context.cancellation().clone(),
+        );
+        task.blocked_on("SDB MemberDisk allocation commit");
+        let result = self.allocate_blks(request).await;
+        task.unblocked();
+        if result.is_ok() {
+            task.progress(100);
+        }
+        let outcome = match &result {
+            Ok(_) => TaskOutcome::Completed,
+            Err(error) => TaskOutcome::Failed(error.to_string()),
+        };
+        task.finish(outcome);
+        let allocation = result?;
+        reply.send(MemberDiskReply::Allocation(allocation));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ManagedService for MemberDiskService {
+    type Request = MemberDiskRequest;
+    type Reply = MemberDiskReply;
+    type Error = MemberDiskServiceError;
+
+    fn operation(request: &Self::Request) -> Option<crate::runtime::OperationSpec> {
+        request.operation()
+    }
+
+    async fn handle(
+        self: Arc<Self>,
+        request: Self::Request,
+        reply: &mut ServiceReply<Self::Reply, Self::Error>,
+        context: RequestContext,
+    ) -> Result<(), MemberDiskServiceError> {
+        match request {
+            MemberDiskRequest::ApplyEvent(event) => self.handle_event(event, reply, context).await,
+            MemberDiskRequest::Get(disk) => self.handle_get(disk, reply).await,
+            MemberDiskRequest::WaitIdle(disk) => self.handle_wait_idle(disk, reply).await,
+            MemberDiskRequest::Allocate(request) => {
+                self.handle_allocation(request, reply, context).await
             }
         }
     }
 }
 
-struct DiskSlot {
-    event: MemberDiskEvent,
-    cancel: CancellationToken,
-    pending: VecDeque<MemberDiskEvent>,
+fn event_kind(event: &MemberDiskEvent) -> &'static str {
+    match event {
+        MemberDiskEvent::PhysicalChanged {
+            state: PhysicalState::Down,
+            ..
+        } => "offline",
+        MemberDiskEvent::PhysicalChanged {
+            state: PhysicalState::Up,
+            ..
+        } => "online",
+        MemberDiskEvent::Shrink { .. } => "shrink",
+    }
 }
-
-struct PendingAdmission {
-    event: MemberDiskEvent,
-    reply: oneshot::Sender<Result<(), MemberDiskServiceError>>,
-}
-
-struct AdmissionFinished {
-    event: MemberDiskEvent,
-    reply: oneshot::Sender<Result<(), MemberDiskServiceError>>,
-    result: Result<(), MemberDiskServiceError>,
-}
-
-struct QueryFinished {
-    reply: oneshot::Sender<Result<MemberDisk, MemberDiskServiceError>>,
-    result: Result<MemberDisk, MemberDiskServiceError>,
-}
-
-struct ReconcileFinished {
-    disk: DiskUuid,
-    result: Result<ReconcileResult, MemberDiskServiceError>,
-}
-
-type AdmissionFuture = Pin<Box<dyn Future<Output = AdmissionFinished> + Send>>;
-type QueryFuture = Pin<Box<dyn Future<Output = QueryFinished> + Send>>;
-type ReconcileFuture = Pin<Box<dyn Future<Output = ReconcileFinished> + Send>>;

@@ -35,7 +35,7 @@ Monitor=(Role,PoolManager,PoolRegistry,Gateways,\{Pool_p\mid p\in Pools\})
 PoolRegistry:PoolId\rightarrow Pool
 \]
 
-`Pool` 是业务对象和生命周期边界：它聚合本 Pool 的核心配置、领域能力、内存投影及其 Service 所有权。它不是通用 Runtime 的别名，也不等于一个 task。当前代码只验证了 MemberDisk Service 的一个根执行单元，以及在该根中统一 poll 事件、查询和多盘 Step Future；其他领域是否采用同样机制仍待真实实现证明。
+`Pool` 是业务对象和生命周期边界：它聚合本 Pool 的核心配置、领域能力、内存投影及其 Service 所有权。它不是通用 Runtime 的别名，也不等于一个 task。当前代码已经用 MemberDisk 验证公共 Service 根执行单元、独立控制通道、生命周期、Task/Trace、结构化观测和对象在途协调；其他领域仍用于检验该抽象的泛化边界。
 
 `PoolManager` 只负责创建、恢复、卸载、查找 Pool 和按归属路由事实，不实现 MemberDisk、Tier、VD/BG 的领域策略。
 

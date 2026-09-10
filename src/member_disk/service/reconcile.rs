@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 /// already reached a stable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReconcileResult {
-    Transitioned,
+    Transitioned { action: &'static str },
     Stable,
 }
 
@@ -17,7 +17,7 @@ pub(super) enum ReconcileResult {
 /// VDM outage cannot block the mandatory DOWN transition. This value is never
 /// persisted as a second state-machine copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReconcileState {
+pub(super) struct ReconcileState {
     member: MemberDiskState,
     shrinking: bool,
 }
@@ -469,7 +469,7 @@ impl MemberDiskService {
         }
     }
 
-    async fn reconcile_state(
+    pub(super) async fn reconcile_state(
         &self,
         disk: &DiskUuid,
     ) -> Result<ReconcileState, MemberDiskServiceError> {
@@ -498,7 +498,9 @@ impl MemberDiskService {
             )));
         }
 
-        Ok(ReconcileResult::Transitioned)
+        Ok(ReconcileResult::Transitioned {
+            action: "evacuate BG references",
+        })
     }
 
     /// Verifies the declared finish state after the branch directly awaits its
@@ -518,6 +520,8 @@ impl MemberDiskService {
             )));
         }
 
-        Ok(ReconcileResult::Transitioned)
+        Ok(ReconcileResult::Transitioned {
+            action: action_name,
+        })
     }
 }
