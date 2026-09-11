@@ -1,7 +1,7 @@
 mod runtime;
 
 pub use runtime::{
-    CallError, CommandActivity, CommandContext, CommandDecision, CommandReceipt, ControlError,
+    CallError, CommandActivity, CommandDecision, CommandReceipt, ControlError, ExecutionContext,
     ExecutionSnapshot, ExecutionState, Lifecycle, RunningService, ServiceActivity, ServiceConfig,
     ServiceControl, ServiceEndpoint, ServiceObserver, ServiceSnapshot,
 };
@@ -62,7 +62,7 @@ pub trait Service: Send + Sync + 'static {
     async fn handle_command(
         self: Arc<Self>,
         command: Self::Command,
-        context: CommandContext<Self::Key>,
+        context: ExecutionContext<Self::Key>,
     ) -> Result<Self::CommandReply, Self::Error>;
 
     /// Returns domain-owned tasks in one SDK-wide projection.

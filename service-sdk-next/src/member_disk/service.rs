@@ -1,20 +1,17 @@
 use super::model::MemberDisk;
+use super::operations::{OperationKind, OperationTable};
 use super::{
-    DiskUuid, MemberDiskCommand, MemberDiskMetadata, MemberDiskMutation, MemberDiskQuery,
-    MemberDiskQueryReply, MemberDiskReply, MemberDiskSeed, MemberDiskServiceError, MemberDiskState,
-    PoolNodes, VirtualDisks,
+    DiskUuid, MemberDiskCommand, MemberDiskCommit, MemberDiskMetadata, MemberDiskMutation,
+    MemberDiskQuery, MemberDiskQueryReply, MemberDiskReply, MemberDiskSeed, MemberDiskServiceError,
+    MemberDiskState, PoolNodes, VirtualDisks,
 };
-use crate::service::{
-    CommandActivity, CommandContext, CommandDecision, Service, TaskSnapshot, TaskState,
-};
+use crate::service::{CommandActivity, CommandDecision, ExecutionContext, Service, TaskSnapshot};
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
-use tokio::sync::Mutex as AsyncMutex;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct MemberDiskConfig {
@@ -33,26 +30,15 @@ impl Default for MemberDiskConfig {
 
 /// One Pool's MemberDisk domain service.
 ///
-/// `disks` is the private, authoritative in-memory projection. External code
-/// can only use `MemberDiskQuery` and `MemberDiskCommand` through the SDK.
+/// The live MemberDisk table is private. Queries return read-only views and
+/// commands are the only way to start a state-changing business flow.
 pub struct MemberDiskService {
-    pub(super) disks: RwLock<HashMap<DiskUuid, MemberDisk>>,
-    pub(super) commit_gate: AsyncMutex<()>,
+    disks: RwLock<HashMap<DiskUuid, MemberDisk>>,
     pub(super) metadata: Arc<dyn MemberDiskMetadata>,
     pub(super) pool_nodes: Arc<dyn PoolNodes>,
     pub(super) virtual_disks: Arc<dyn VirtualDisks>,
     pub(super) config: MemberDiskConfig,
-    tasks: Mutex<HashMap<DiskUuid, DomainTask>>,
-}
-
-struct DomainTask {
-    id: u64,
-    kind: &'static str,
-    disk: DiskUuid,
-    progress: u8,
-    detail: String,
-    cancellation: CancellationToken,
-    failed: bool,
+    pub(super) operations: OperationTable,
 }
 
 impl MemberDiskService {
@@ -69,12 +55,11 @@ impl MemberDiskService {
             .collect();
         Self {
             disks: RwLock::new(disks),
-            commit_gate: AsyncMutex::new(()),
             metadata,
             pool_nodes,
             virtual_disks,
             config,
-            tasks: Mutex::new(HashMap::new()),
+            operations: OperationTable::new(),
         }
     }
 
@@ -89,98 +74,50 @@ impl MemberDiskService {
         Ok((member.state(), member.shrinking()))
     }
 
-    fn reply(&self, disk: &DiskUuid) -> Result<MemberDiskReply, MemberDiskServiceError> {
-        let (state, _) = self.state(disk)?;
-        Ok(MemberDiskReply {
-            disk: disk.clone(),
-            state,
-        })
-    }
-
-    /// The sole SDB-first mutation boundary:
-    /// validate current object -> commit typed mutation -> publish in memory.
+    /// The only mutation boundary: validate the complete batch, commit it to
+    /// SDB, then publish the same mutations to the in-memory projection.
     pub(super) async fn commit(
         &self,
-        disk: &DiskUuid,
-        mutation: MemberDiskMutation,
-    ) -> Result<bool, MemberDiskServiceError> {
-        let _commit = self.commit_gate.lock().await;
-        let changed = {
+        mutations: Vec<(DiskUuid, MemberDiskMutation)>,
+    ) -> Result<(), MemberDiskServiceError> {
+        let commits = {
             let disks = self.disks.read().expect("MemberDisk table poisoned");
-            disks
-                .get(disk)
-                .ok_or_else(|| MemberDiskServiceError::UnknownDisk(disk.clone()))?
-                .validate(&mutation)?
+            let mut commits = Vec::new();
+            for (disk, mutation) in mutations {
+                let member = disks
+                    .get(&disk)
+                    .ok_or_else(|| MemberDiskServiceError::UnknownDisk(disk.clone()))?;
+                if member.validate(&mutation)? {
+                    commits.push(MemberDiskCommit { disk, mutation });
+                }
+            }
+            commits
         };
-        if !changed {
-            return Ok(false);
+
+        if commits.is_empty() {
+            return Ok(());
         }
 
         self.metadata
-            .commit(disk, &mutation)
+            .commit(commits.clone())
             .await
             .map_err(MemberDiskServiceError::Metadata)?;
 
-        self.disks
-            .write()
-            .expect("MemberDisk table poisoned")
-            .get_mut(disk)
-            .expect("validated MemberDisk disappeared")
-            .apply_committed(&mutation);
-        Ok(true)
-    }
-
-    fn begin_task(&self, command: &MemberDiskCommand, context: &CommandContext<DiskUuid>) {
-        let disk = command.disk().clone();
-        self.tasks.lock().expect("task table poisoned").insert(
-            disk.clone(),
-            DomainTask {
-                id: context.execution_id(),
-                kind: command.kind(),
-                disk,
-                progress: 0,
-                detail: "accepted".into(),
-                cancellation: context.cancellation().clone(),
-                failed: false,
-            },
-        );
-    }
-
-    pub(super) fn task_progress(&self, disk: &DiskUuid, progress: u8, detail: &'static str) {
-        if let Some(task) = self
-            .tasks
-            .lock()
-            .expect("task table poisoned")
-            .get_mut(disk)
-        {
-            task.progress = progress;
-            task.detail = detail.into();
+        let mut disks = self.disks.write().expect("MemberDisk table poisoned");
+        for commit in commits {
+            disks
+                .get_mut(&commit.disk)
+                .expect("committed MemberDisk disappeared")
+                .apply_committed(&commit.mutation);
         }
+        Ok(())
     }
 
-    fn finish_task(
-        &self,
-        disk: &DiskUuid,
-        result: &Result<MemberDiskReply, MemberDiskServiceError>,
-    ) {
-        let mut tasks = self.tasks.lock().expect("task table poisoned");
-        if result.is_ok() || matches!(result, Err(MemberDiskServiceError::Cancelled)) {
-            tasks.remove(disk);
-        } else if let Some(task) = tasks.get_mut(disk) {
-            task.failed = true;
-            task.detail = result.as_ref().unwrap_err().to_string();
+    fn validate_command(&self, command: &MemberDiskCommand) -> Result<(), MemberDiskServiceError> {
+        for disk in command.disks() {
+            self.state(disk)?;
         }
-    }
-
-    fn command_is_stable(&self, command: &MemberDiskCommand) -> bool {
-        let Ok((state, shrinking)) = self.state(command.disk()) else {
-            return false;
-        };
-        match command {
-            MemberDiskCommand::DiskDown { .. } => state == MemberDiskState::Removed,
-            MemberDiskCommand::DiskUp { .. } => state == MemberDiskState::UpActive && !shrinking,
-            MemberDiskCommand::Shrink { .. } => state == MemberDiskState::Removed,
-        }
+        Ok(())
     }
 }
 
@@ -190,47 +127,33 @@ impl Service for MemberDiskService {
     type QueryReply = MemberDiskQueryReply;
     type Command = MemberDiskCommand;
     type CommandReply = MemberDiskReply;
-    type Key = DiskUuid;
+    // MemberDisk commands are batches. Per-disk conflicts are managed by the
+    // domain's operation table, so the SDK has no single command key here.
+    type Key = ();
     type Error = MemberDiskServiceError;
 
     fn name(&self) -> &'static str {
         "member-disk"
     }
 
-    fn command_key(&self, command: &Self::Command) -> Option<Self::Key> {
-        Some(command.disk().clone())
+    // A command can contain several disks. Their overlap is therefore handled
+    // by MemberDisk's per-disk operation table, not by the SDK's single-key slot.
+    fn command_key(&self, _command: &Self::Command) -> Option<Self::Key> {
+        None
     }
 
     fn admit(
         &self,
         command: &Self::Command,
-        activity: CommandActivity<'_, Self::Command>,
+        _activity: CommandActivity<'_, Self::Command>,
     ) -> Result<CommandDecision<Self::CommandReply>, Self::Error> {
-        self.state(command.disk())?;
-
-        if matches!(activity, CommandActivity::Idle) && self.command_is_stable(command) {
-            return Ok(CommandDecision::Complete(self.reply(command.disk())?));
+        self.validate_command(command)?;
+        if command.disks().is_empty() {
+            return Ok(CommandDecision::Complete(MemberDiskReply {
+                outcomes: Vec::new(),
+            }));
         }
-
-        let CommandActivity::Running { latest, .. } = activity else {
-            return Ok(CommandDecision::Run);
-        };
-
-        if latest.kind() == command.kind() {
-            return Ok(CommandDecision::Join);
-        }
-
-        // Shrink is a durable removal target. UP waits behind it and becomes a
-        // rejoin after removal; DOWN preempts it because stopping IO is urgent.
-        if matches!(latest, MemberDiskCommand::Shrink { .. })
-            && matches!(command, MemberDiskCommand::DiskUp { .. })
-        {
-            return Ok(CommandDecision::Queue);
-        }
-
-        Ok(CommandDecision::Replace {
-            cause: format!("{} supersedes {}", command.kind(), latest.kind()),
-        })
+        Ok(CommandDecision::Run)
     }
 
     async fn handle_query(&self, query: Self::Query) -> Result<Self::QueryReply, Self::Error> {
@@ -251,43 +174,26 @@ impl Service for MemberDiskService {
     async fn handle_command(
         self: Arc<Self>,
         command: Self::Command,
-        context: CommandContext<Self::Key>,
+        context: ExecutionContext<Self::Key>,
     ) -> Result<Self::CommandReply, Self::Error> {
-        let disk = command.disk().clone();
-        self.begin_task(&command, &context);
-        context.milestone("business task registered");
-        let result = self.drive_to_stable(&command, &context).await;
-        self.finish_task(&disk, &result);
-        context.milestone(match &result {
-            Ok(_) => "business task completed",
-            Err(MemberDiskServiceError::Cancelled) => "business task cancelled",
-            Err(_) => "business task failed",
-        });
-        result
+        let reply = match command {
+            MemberDiskCommand::DiskDown { disks, observed_at } => {
+                self.run_disks(OperationKind::Offline, disks, Some(observed_at), &context)
+                    .await
+            }
+            MemberDiskCommand::DiskUp { disks } => {
+                self.run_disks(OperationKind::Online, disks, None, &context)
+                    .await
+            }
+            MemberDiskCommand::Shrink { disks } => {
+                self.run_disks(OperationKind::Shrink, disks, None, &context)
+                    .await
+            }
+        };
+        Ok(reply)
     }
 
     fn task_snapshots(&self) -> Vec<TaskSnapshot> {
-        let mut snapshots: Vec<_> = self
-            .tasks
-            .lock()
-            .expect("task table poisoned")
-            .values()
-            .map(|task| TaskSnapshot {
-                id: task.id.to_string(),
-                kind: task.kind.into(),
-                subject: task.disk.to_string(),
-                state: if task.failed {
-                    TaskState::Failed
-                } else if task.cancellation.is_cancelled() {
-                    TaskState::Cancelling
-                } else {
-                    TaskState::Running
-                },
-                progress: Some(task.progress),
-                detail: Some(task.detail.clone()),
-            })
-            .collect();
-        snapshots.sort_by(|left, right| left.id.cmp(&right.id));
-        snapshots
+        self.operations.snapshots()
     }
 }

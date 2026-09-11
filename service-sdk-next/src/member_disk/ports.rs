@@ -1,4 +1,4 @@
-use super::{DiskUuid, MemberDiskMutation};
+use super::{DiskStateChange, DiskUuid, MemberDiskCommit};
 use async_trait::async_trait;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -14,35 +14,33 @@ impl fmt::Display for PortError {
 
 impl std::error::Error for PortError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskOpenResult {
+    pub disk: DiskUuid,
+    pub result: Result<(), PortError>,
+}
+
 /// SDB-facing boundary. A successful return means the mutation is durable.
 #[async_trait]
 pub trait MemberDiskMetadata: Send + Sync + 'static {
-    async fn commit(&self, disk: &DiskUuid, mutation: &MemberDiskMutation)
-    -> Result<(), PortError>;
+    async fn commit(&self, commits: Vec<MemberDiskCommit>) -> Result<(), PortError>;
 }
 
 /// Capability supplied by the PoolNode domain.
 #[async_trait]
 pub trait PoolNodes: Send + Sync + 'static {
-    /// Mandatory safety action. The MemberDisk service retries failures.
-    async fn set_disk_down(&self, disk: &DiskUuid) -> Result<(), PortError>;
+    /// Opens all supplied disks in one network request and returns one result
+    /// per disk. This is phase one of the online workflow.
+    async fn open_disks(&self, disks: Vec<DiskUuid>) -> Result<Vec<DiskOpenResult>, PortError>;
 
-    /// Online is two-stage: open first, then publish UP.
-    async fn open_disk(&self, disk: &DiskUuid, cancel: &CancellationToken)
-    -> Result<(), PortError>;
-
-    async fn publish_disk_up(
-        &self,
-        disk: &DiskUuid,
-        cancel: &CancellationToken,
-    ) -> Result<(), PortError>;
+    /// Pushes the supplied IO states to all currently serviceable Pool nodes
+    /// in one network request. MemberDisk decides the contents of the batch.
+    async fn push_disk_states(&self, changes: Vec<DiskStateChange>) -> Result<(), PortError>;
 }
 
 /// Capability supplied by the VirtualDisk domain.
 #[async_trait]
 pub trait VirtualDisks: Send + Sync + 'static {
-    async fn has_references(&self, disk: &DiskUuid) -> Result<bool, PortError>;
-
     /// Returns only after in-flight BG work reaches a stable boundary.
     async fn evacuate(&self, disk: &DiskUuid, cancel: &CancellationToken) -> Result<(), PortError>;
 }

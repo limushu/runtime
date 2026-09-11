@@ -31,6 +31,13 @@ pub enum DiskIoState {
     Down,
 }
 
+/// One MemberDisk-domain fact carried by a PoolNode broadcast packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskStateChange {
+    pub disk: DiskUuid,
+    pub state: DiskIoState,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberDiskState {
     UpActive,
@@ -51,32 +58,32 @@ pub enum MemberDiskMutation {
     Rejoin,
 }
 
+/// One typed SDB update. The metadata port can commit several independent
+/// MemberDisk updates in one request while preserving SDB-first publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDiskCommit {
+    pub disk: DiskUuid,
+    pub mutation: MemberDiskMutation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberDiskCommand {
     DiskDown {
-        disk: DiskUuid,
+        disks: Vec<DiskUuid>,
         observed_at: EpochMillis,
     },
     DiskUp {
-        disk: DiskUuid,
+        disks: Vec<DiskUuid>,
     },
     Shrink {
-        disk: DiskUuid,
+        disks: Vec<DiskUuid>,
     },
 }
 
 impl MemberDiskCommand {
-    pub fn disk(&self) -> &DiskUuid {
+    pub fn disks(&self) -> &[DiskUuid] {
         match self {
-            Self::DiskDown { disk, .. } | Self::DiskUp { disk } | Self::Shrink { disk } => disk,
-        }
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::DiskDown { .. } => "disk-down",
-            Self::DiskUp { .. } => "disk-up",
-            Self::Shrink { .. } => "shrink",
+            Self::DiskDown { disks, .. } | Self::DiskUp { disks } | Self::Shrink { disks } => disks,
         }
     }
 }
@@ -89,8 +96,19 @@ pub enum MemberDiskQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDiskReply {
+    pub outcomes: Vec<MemberDiskOutcome>,
+}
+
+impl MemberDiskReply {
+    pub fn outcome(&self, disk: &DiskUuid) -> Option<&MemberDiskOutcome> {
+        self.outcomes.iter().find(|outcome| &outcome.disk == disk)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDiskOutcome {
     pub disk: DiskUuid,
-    pub state: MemberDiskState,
+    pub result: Result<MemberDiskState, MemberDiskServiceError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
