@@ -1,6 +1,12 @@
 # Service Runtime：生命周期、任务与观测
 
-状态：`B0.7 已实现`。
+状态：`B0.7 历史设计`。
+
+> 2026-09-14 实现基线已经切换到
+> [`service-sdk-next`](../service-sdk-next/README.md)。本章保留早期设计推导，涉及
+> `ManagedService`、`OperationContext`、`TaskAttempt` 和 `ObjectTaskCoordinator` 的代码接口
+> 不再代表当前实现。当前基线采用 `Command -> Request -> Waiting -> Ready -> Action ->
+> Future -> Running`，以更小的 Runtime 接口保留同样的状态所有权、协作取消和观测原则。
 
 本章定义 Pool 内领域 Service 共用的运行组件。它解决的是“服务如何运行和被管理”，而不是
 “某个业务下一步应该做什么”。MemberDisk 是第一个适配者，Node、VD、BG 可以复用同一

@@ -1,14 +1,19 @@
-use super::MemberDiskServiceError;
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-pub type EpochMillis = u64;
+use super::MemberDiskError;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DiskUuid(String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DiskUuid(Arc<str>);
 
 impl DiskUuid {
-    pub fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
+    }
+}
+
+impl From<&str> for DiskUuid {
+    fn from(value: &str) -> Self {
+        Self::new(value)
     }
 }
 
@@ -18,24 +23,16 @@ impl fmt::Display for DiskUuid {
     }
 }
 
-/// Construction data. The live MemberDisk object remains private to its service.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskSeed {
-    pub uuid: DiskUuid,
-    pub pool_id: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiskIoState {
+pub enum IoState {
     Up,
     Down,
 }
 
-/// One MemberDisk-domain fact carried by a PoolNode broadcast packet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiskStateChange {
-    pub disk: DiskUuid,
-    pub state: DiskIoState,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationState {
+    Active,
+    Inactive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,174 +44,189 @@ pub enum MemberDiskState {
     Removed,
 }
 
-/// The only durable field changes emitted by the MemberDisk domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AllocatedBlock {
+    pub disk: DiskUuid,
+    pub block: BlockId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskMutation {
-    SetIo(DiskIoState),
-    RequestShrink,
+pub enum MemberDiskChange {
+    SetIo(IoState),
     DisableAllocation,
-    CompleteOnline,
     Remove,
-    Rejoin,
-}
-
-/// One typed SDB update. The metadata port can commit several independent
-/// MemberDisk updates in one request while preserving SDB-first publication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskCommit {
-    pub disk: DiskUuid,
-    pub mutation: MemberDiskMutation,
+    BringOnline,
+    Allocate(Vec<BlockId>),
+    Release(Vec<BlockId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskCommand {
-    DiskDown {
-        disks: Vec<DiskUuid>,
-        observed_at: EpochMillis,
-    },
-    DiskUp {
-        disks: Vec<DiskUuid>,
-    },
-    Shrink {
-        disks: Vec<DiskUuid>,
-    },
-}
-
-impl MemberDiskCommand {
-    pub fn disks(&self) -> &[DiskUuid] {
-        match self {
-            Self::DiskDown { disks, .. } | Self::DiskUp { disks } | Self::Shrink { disks } => disks,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum MemberDiskQuery {
-    Get(DiskUuid),
-    List,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskReply {
-    pub outcomes: Vec<MemberDiskOutcome>,
-}
-
-impl MemberDiskReply {
-    pub fn outcome(&self, disk: &DiskUuid) -> Option<&MemberDiskOutcome> {
-        self.outcomes.iter().find(|outcome| &outcome.disk == disk)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskOutcome {
-    pub disk: DiskUuid,
-    pub result: Result<MemberDiskState, MemberDiskServiceError>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskQueryReply {
-    One(MemberDiskView),
-    List(Vec<MemberDiskView>),
-}
-
-/// Read-only DTO returned by Query. It is not the live domain object.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskView {
-    pub uuid: DiskUuid,
-    pub pool_id: String,
-    pub state: MemberDiskState,
-    pub shrink_requested: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct MemberDisk {
+pub struct MemberDisk {
     uuid: DiskUuid,
-    pool_id: String,
-    io: DiskIoState,
-    allocation_active: bool,
+    pool: Arc<str>,
+    io: IoState,
+    allocation: AllocationState,
     removed: bool,
-    shrink_requested: bool,
+    blocks: Vec<bool>,
 }
 
 impl MemberDisk {
-    pub(super) fn from_seed(seed: MemberDiskSeed) -> Self {
+    pub fn new(uuid: DiskUuid, pool: impl Into<Arc<str>>, block_count: u32) -> Self {
         Self {
-            uuid: seed.uuid,
-            pool_id: seed.pool_id,
-            io: DiskIoState::Up,
-            allocation_active: true,
+            uuid,
+            pool: pool.into(),
+            io: IoState::Up,
+            allocation: AllocationState::Active,
             removed: false,
-            shrink_requested: false,
+            blocks: vec![false; block_count as usize],
         }
     }
 
-    pub(super) fn state(&self) -> MemberDiskState {
+    pub fn uuid(&self) -> &DiskUuid {
+        &self.uuid
+    }
+
+    pub fn pool(&self) -> &str {
+        &self.pool
+    }
+
+    pub fn state(&self) -> MemberDiskState {
         if self.removed {
             return MemberDiskState::Removed;
         }
-        match (self.io, self.allocation_active) {
-            (DiskIoState::Up, true) => MemberDiskState::UpActive,
-            (DiskIoState::Up, false) => MemberDiskState::UpInactive,
-            (DiskIoState::Down, true) => MemberDiskState::DownActive,
-            (DiskIoState::Down, false) => MemberDiskState::DownInactive,
+
+        match (self.io, self.allocation) {
+            (IoState::Up, AllocationState::Active) => MemberDiskState::UpActive,
+            (IoState::Up, AllocationState::Inactive) => MemberDiskState::UpInactive,
+            (IoState::Down, AllocationState::Active) => MemberDiskState::DownActive,
+            (IoState::Down, AllocationState::Inactive) => MemberDiskState::DownInactive,
         }
     }
 
-    pub(super) fn shrinking(&self) -> bool {
-        self.shrink_requested
+    pub fn free_blocks(&self) -> usize {
+        self.blocks.iter().filter(|allocated| !**allocated).count()
     }
 
-    pub(super) fn view(&self) -> MemberDiskView {
-        MemberDiskView {
-            uuid: self.uuid.clone(),
-            pool_id: self.pool_id.clone(),
-            state: self.state(),
-            shrink_requested: self.shrink_requested,
+    pub fn allocated_blocks(&self) -> impl Iterator<Item = BlockId> + '_ {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, allocated)| **allocated)
+            .map(|(index, _)| BlockId(index as u32))
+    }
+
+    pub(crate) fn first_free_blocks(&self, count: usize) -> Vec<BlockId> {
+        if self.state() != MemberDiskState::UpActive {
+            return Vec::new();
         }
+
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, allocated)| !**allocated)
+            .take(count)
+            .map(|(index, _)| BlockId(index as u32))
+            .collect()
     }
 
-    pub(super) fn validate(
-        &self,
-        mutation: &MemberDiskMutation,
-    ) -> Result<bool, MemberDiskServiceError> {
-        use MemberDiskMutation::*;
-        match mutation {
-            Rejoin => Ok(self.removed),
-            RequestShrink if self.removed => Ok(false),
-            _ if self.removed => Err(MemberDiskServiceError::InvalidState(format!(
-                "MemberDisk {} has been removed",
-                self.uuid
-            ))),
-            SetIo(io) => Ok(self.io != *io),
-            RequestShrink => Ok(!self.shrink_requested),
-            DisableAllocation => Ok(self.allocation_active),
-            CompleteOnline => Ok(self.io != DiskIoState::Up || !self.allocation_active),
-            Remove if self.allocation_active => Err(MemberDiskServiceError::InvalidState(
-                "allocation must be disabled before removal".into(),
-            )),
-            Remove => Ok(true),
-        }
-    }
-
-    pub(super) fn apply_committed(&mut self, mutation: &MemberDiskMutation) {
-        use MemberDiskMutation::*;
-        match mutation {
-            SetIo(io) => self.io = *io,
-            RequestShrink => self.shrink_requested = true,
-            DisableAllocation => self.allocation_active = false,
-            CompleteOnline => {
-                self.io = DiskIoState::Up;
-                self.allocation_active = true;
+    pub(crate) fn validate(&self, change: &MemberDiskChange) -> Result<(), MemberDiskError> {
+        match change {
+            MemberDiskChange::SetIo(_) => {
+                if self.removed {
+                    return Err(MemberDiskError::InvalidState {
+                        disk: self.uuid.clone(),
+                        reason: "removed disks must use BringOnline",
+                    });
+                }
             }
-            Remove => {
-                self.io = DiskIoState::Down;
+            MemberDiskChange::DisableAllocation => {
+                if self.removed {
+                    return Err(MemberDiskError::InvalidState {
+                        disk: self.uuid.clone(),
+                        reason: "a removed disk cannot change allocation state",
+                    });
+                }
+            }
+            MemberDiskChange::Remove => {
+                if self.allocation != AllocationState::Inactive {
+                    return Err(MemberDiskError::InvalidState {
+                        disk: self.uuid.clone(),
+                        reason: "allocation must be disabled before removal",
+                    });
+                }
+            }
+            MemberDiskChange::BringOnline => {}
+            MemberDiskChange::Allocate(blocks) => {
+                if self.state() != MemberDiskState::UpActive {
+                    return Err(MemberDiskError::InvalidState {
+                        disk: self.uuid.clone(),
+                        reason: "only UP/ACTIVE disks can allocate blocks",
+                    });
+                }
+                for block in blocks {
+                    match self.blocks.get(block.0 as usize) {
+                        Some(false) => {}
+                        Some(true) => {
+                            return Err(MemberDiskError::InvalidState {
+                                disk: self.uuid.clone(),
+                                reason: "block is already allocated",
+                            });
+                        }
+                        None => return Err(MemberDiskError::InvalidRequest("unknown block")),
+                    }
+                }
+            }
+            MemberDiskChange::Release(blocks) => {
+                for block in blocks {
+                    match self.blocks.get(block.0 as usize) {
+                        Some(true) => {}
+                        Some(false) => {
+                            return Err(MemberDiskError::InvalidState {
+                                disk: self.uuid.clone(),
+                                reason: "block is already free",
+                            });
+                        }
+                        None => return Err(MemberDiskError::InvalidRequest("unknown block")),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn apply_committed(&mut self, change: MemberDiskChange) {
+        match change {
+            MemberDiskChange::SetIo(io) => self.io = io,
+            MemberDiskChange::DisableAllocation => {
+                self.allocation = AllocationState::Inactive;
+            }
+            MemberDiskChange::Remove => {
+                self.io = IoState::Down;
+                self.allocation = AllocationState::Inactive;
                 self.removed = true;
+                // VirtualDisks::evacuate has already removed every BG
+                // reference. Publishing Remove therefore retires the old BLK
+                // ownership as one committed domain change.
+                self.blocks.fill(false);
             }
-            Rejoin => {
-                self.io = DiskIoState::Up;
-                self.allocation_active = true;
+            MemberDiskChange::BringOnline => {
+                self.io = IoState::Up;
+                self.allocation = AllocationState::Active;
                 self.removed = false;
-                self.shrink_requested = false;
+            }
+            MemberDiskChange::Allocate(blocks) => {
+                for block in blocks {
+                    self.blocks[block.0 as usize] = true;
+                }
+            }
+            MemberDiskChange::Release(blocks) => {
+                for block in blocks {
+                    self.blocks[block.0 as usize] = false;
+                }
             }
         }
     }
