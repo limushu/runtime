@@ -33,7 +33,7 @@ impl<E: fmt::Debug + fmt::Display> std::error::Error for CallError<E> {}
 /// Reply contract selected by the caller of a command.
 ///
 /// `submit` waits only for acceptance. `call` waits for the final business
-/// result. The sender lives in the command record, never in child requests.
+/// result. Workflow hosts keep the sender in a reply-only batch record.
 pub enum CommandReply<R, E> {
     Accepted(Option<oneshot::Sender<Result<CommandId, CallError<E>>>>),
     Completed(Option<oneshot::Sender<Result<R, CallError<E>>>>),

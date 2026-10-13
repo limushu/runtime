@@ -1,7 +1,7 @@
 //! A small runtime for stateful, in-process services.
 //!
-//! The runtime owns lifecycle and future polling. A service owns its data,
-//! request queues and business policy.
+//! Runtime owns execution, cancellation and resource admission. Workflows are
+//! ordinary async functions; activities protect domain state and provider effects.
 
 pub mod member_disk;
 pub mod runtime;

@@ -1,193 +1,117 @@
 # Service SDK Next
 
-这是一次从业务纵切面反推公共运行机制的实现。目标不是制造通用工作流引擎，而是让领域
-Service 保有业务决定权，同时复用生命周期、三通道、Future 驱动和强制回收。
+当前实现：本地 **Workflow + Activity + Runtime**。业务顺序写成普通 async 函数，
+Activity 通过显式 provider 端口完成副作用，Runtime 管理执行和取消。
+不引入 Temporal 服务，不提供持久化历史、确定性重放或切主恢复。
 
-## 一条主线
+本地独立实验不包含在此次重构提交中，也不构成本库的持久化执行保证。
+
+## 先读流程
+
+从 [MemberDisk workflows](src/member_disk/workflows.rs) 开始：
 
 ```text
-Command
-  │ 保留 CommandId、reply、命令级 cancel
-  ▼
-拆为 Request ────────────────┐
-  │                          │ 同一对象可以排队多个 Request
-  ▼                          │ 不覆盖、不静默合并
-Waiting ── admit ──> Ready   │
-                    │         │
-                    │ 状态机只决定下一项 Action
-                    ▼         │
-             按 Action 汇聚   │  是否批量由 MemberDisk 决定
-                    │         │  Runtime 不认识 Action 或批次
-                    ▼         │
-                 Future       │
-                    │         │
-                    ▼         │
-                 Running      │
-                    │         │
-            completion/result │
-                    ├─────────┘ 未到目标：回到 Ready
-                    └──────────> Finished：聚合到原 Command reply
+离线：关 IO → 等恢复窗口 → 禁止分配 → 排空 → 移除
+上线：校验/打开 → 发布 UP → 提交并发布成员状态
+缩容：禁止分配 → 排空 → 移除
+空间：预校验整份计划 → 按盘提交 → 汇总已提交结果
 ```
 
-这条路径没有旁路。磁盘事件、缩容、申请 BLK 和释放 BLK 都先成为 Command，再按相同的
-Request 生命周期推进。Query 不修改状态，直接读取服务拥有的已提交内存视图。
+Workflow 用普通条件分支读取已提交领域状态，使用
+`ctx.activity("name", typed_async_call()).await` 表达步骤。
+没有 RequestTable、RequestPhase、Action 枚举、执行转发表或逐步 Completion 回调。
+完成一个 Activity 后，返回值直接交给调用它的 Workflow。
 
-## 边界
+## 三个边界
 
-| 组件 | 只负责什么 |
+| 文件 | 职责 |
 | --- | --- |
-| Runtime | 控制、查询、命令三通道；生命周期；单根 Tokio task；poll 业务 Future；强制 abort |
-| MemberDiskService | 核心元数据、Command/Request 容器、准入、冲突策略、Action 汇聚和完成解释 |
-| State machine | `已提交 MemberDisk 状态 + 当前意图 -> 下一项 Action / Done` |
-| Actions | 把一种 Action 实现为普通 `async fn`；完成网络和 SDB 边界后返回事实 |
-| CommandTable | 保存原始命令、聚合子 Request 结果、只在全部结束后回复调用者 |
-| RequestTable | 保存 Waiting/Ready/Running/Retrying/Cancelling 和对象执行占用 |
+| [workflows.rs](src/member_disk/workflows.rs) | 离线、上线、缩容、空间操作的顺序和冲突策略 |
+| [activities.rs](src/member_disk/activities.rs) | 领域预校验、provider 调用、SDB 确认、内存发布 |
+| [runtime/workflow.rs](src/runtime/workflow.rs) | 唯一执行目录、资源准入、协作取消、Pause gate、结果与批量回复 |
 
-Runtime 的业务接口故意很小：
+[service.rs](src/member_disk/service.rs) 是薄适配层：把外部命令映射为 Workflow，
+提供查询，把领域冲突策略交给 Runtime。MemberDisk/VD 仍拥有业务权威状态；
+Workflow 的 Waiting/Running/Completed 等只描述执行，不是第二套磁盘状态机。
 
-```rust
-pub trait Service {
-    fn query(&self, query: Self::Query) -> Result<Self::QueryReply, Self::Error>;
-    fn receive_command(&mut self, command: IncomingCommand<...>);
-    fn admit(&mut self);
-    fn start_ready(&mut self, runs: &mut NewRuns<Self::Completion>);
-    fn finish_running(&mut self, completion: Self::Completion);
-    fn cancel_all(&mut self);
-    fn is_idle(&self) -> bool;
-    fn snapshot(&self) -> Self::Snapshot;
-}
-```
+原有低层 `Service` hooks 保留用于宿主适配和独立示例，不再要求业务为每个
+Activity 实现 admit/start/finish 循环。整个服务仍只有一个根 Tokio task，
+由 FuturesUnordered 并发 poll；没有每盘 task，也没有另一个 WorkflowScheduler。
 
-`NewRuns::push(async_fn(...))` 隐藏 pin 和类型擦除。框架只得到一个会产生 Completion 的
-Future，不知道业务是否组批，也不参与 Action 选择。
+## 调用与观测
 
-## 一轮如何运行
+`MemberDiskService::start` 仍返回 `client / control / observer / task`。
 
-运行循环的固定顺序是：
+- `client.call(command)` 等待最终业务结果；批量磁盘调用按原输入顺序返回每项结果。
+- `client.submit(command)` 等待内存接收确认，不代表持久化或已经执行。
+- `query(Get/List)` 读取已提交领域视图。
+- `query(Work)` 和 observer 返回 `WorkflowSnapshot`，包含执行 ID、command ID、
+  磁盘、状态、当前 Activity 和终态结果；普通终态保留最近 256 项。
+- `query(InFlightCommands)` 从同一执行目录派生批量进度，没有独立命令状态机。
+- 调用方丢弃回复等待，不会撤销已接收操作。
 
-1. 有界接收当前已经到达的 Query 与 Command，避免持续输入饿死执行；
-2. MemberDisk 把 Command 拆成 Request，并全部追加到 Waiting；
-3. `admit` 依次检查 Waiting：放行、继续等待、请求当前工作取消，或明确结束；
-4. 状态机为 Ready Request 计算下一项 Action；
-5. MemberDisk 按 Action 汇聚 Request，并选择批量或逐个启动普通 Future；
-6. Runtime 并发 poll 所有 Future；Completion 回来后，MemberDisk 更新已提交事实并决定
-   Request 回到 Ready、Retrying，还是 Finished；
-7. 对象位置释放后，原来阻塞的 Request 在下一轮再次经过同一个 `admit`。
+API 迁移：`RequestSnapshot/RequestStatus` 替换为 `WorkflowSnapshot/WorkflowStatus`；
+快照的 `requests` 字段替换为 `workflows`。`Work` 查询现在包含保留的终态，
+判断在途执行使用 `result.is_none()`。
 
-控制通道在 `tokio::select!` 中优先。每轮主动收包有明确上限。Ready 中已有工作时无需等待
-下一条 Command 才能启动。
+## 并发和取消
 
-## MemberDisk 状态机
+- 同盘最多一个运行 Workflow；重复和相同意图排队，不覆盖、不静默合并。
+- 相反意图请求旧执行取消，等旧 Activity 停稳后才释放占用。
+- 已知盘的 DOWN 取消所有在途 Shrink，包括其他盘；这是显式领域策略。
+- Allocate/Release 仍与所有磁盘流程互斥；独立磁盘可以并发。
+- Activity 不通过 select/drop 中断 provider Future。取消在步骤边界检查；
+  长排空通过 token 请求 provider 停稳。
+- DOWN 广播与元数据边界不可中断；只对 provider 确认可重试的失败继续重试。
+- 最终 Activity 已提交成功时，晚到的取消不把成功改报为取消。
+- 首次关盘的并发调用仍由 Activity 内部合并广播/提交；不为组批重建通用 Action 层。
+  上线和禁止分配当前逐盘执行，不承诺旧实现的全流程组批性能。
 
-MemberDisk 只保存业务权威状态，不保存 DiskMap 的实时物理副本：
-
-```text
-UA = Up + AllocationActive
-UI = Up + AllocationInactive
-DA = Down + AllocationActive
-DI = Down + AllocationInactive
-Removed = 身份仍保留，但不再服务和分配
-```
-
-状态决策集中在 `state_machine.rs`。它是纯函数，没有网络、锁、队列或 Future：
-
-| 意图 | UA/UI | DA | DI | Removed |
-| --- | --- | --- | --- | --- |
-| Offline | CloseIo | 等恢复窗口 / DisableAllocation | Evacuate | Done |
-| Online | UA: Done；UI: BringOnline | BringOnline | BringOnline | BringOnline（rejoin） |
-| Shrink | DisableAllocation / Evacuate | DisableAllocation | Evacuate | Done |
-
-状态机只说“下一步是什么”。`actions.rs` 才实现 CloseIo、BringOnline、Evacuate 等动作。
-一个动作成功后，服务使用最新已提交对象再次决策，不用 `DownApplied` 之类的内部事件把
-`await` 已经明确知道的结果重新绕回状态机。
-
-## 准入与冲突
-
-- 同一磁盘同时最多一个 current Request；后续请求完整保存在 Waiting 中。
-- 相同意图排队，不静默 Join，因此每个外部 Command 都有自己的确定结果。
-- 不同意图到达时，请求 current Request 协作取消；旧 Future 到稳定边界返回后才释放磁盘。
-- 一个已知磁盘的 DOWN 会取消所有在途 Shrink Command，包括不关联该磁盘的缩容。这是
-  MemberDisk 的全局业务规则，不在 Runtime 中。
-- Allocate/Release 第一阶段与所有磁盘状态工作串行，先保证位图安全；后续可以在保持相同
-  不变量的前提下缩小到 Tier/Partition 粒度。
-
-取消 token 形成 `service -> command -> request` 的树。Command 可以整体取消，单盘冲突也能
-只取消一个 Request。取消只是请求，不会任意 drop Future：
-
-- DOWN 发布和对应元数据提交是不可中断的安全边界；
-- 恢复等待和 VDM 排空接收 Request token，在稳定边界返回；
-- 如果动作在取消到达前已经提交了最终目标状态，最终事实优先，Request 正常完成；
-- `ServiceTask::abort()` 才会强制 drop 本服务拥有的全部 Future。
-
-## 批量是业务选择
-
-外部批量磁盘 Command 先拆成单盘 Request，冲突始终按对象判断。之后 Ready Request 可以被
-重新汇聚：CloseIo、BringOnline、DisableAllocation 使用批量网络/SDB 操作；Evacuate 和恢复
-等待逐盘运行。另一个 Service 可以采用完全不同的方式，Runtime 不需要修改。
-
-因此批量不是框架概念，也不损害单盘取消、重试和结果关联。
-
-## 元数据规则
-
-Action 只返回 SDB 已经确认的 `CommittedChange`。根 Service 按固定次序处理：
-
-```text
-业务预校验 -> 提交 SDB -> Completion -> 发布到内存对象 -> 再次状态决策
-```
-
-Query 只能看到服务已经发布的提交视图。锁不会跨 `await`，因为核心元数据只在单根 Service
-task 中访问。DOWN 的必达批次会等所有 SDB 项都确认后一次返回 Completion；重试期间内存
-可能暂时落后于已经成功的部分记录，但不会领先于 SDB，切主仍以 SDB 重建。
-
-Allocate/Release 可能跨多个 MemberDisk 记录，又没有跨记录事务。本实现逐盘推进，并把已
-成功部分记录在当前 Request 上：后续失败只重试未提交余量，不会重复使用已经分配的 BLK。
-测试覆盖了“第一盘成功、第二盘失败一次、仅第二盘重试”的情况。
-
-## 生命周期与句柄
-
-`MemberDiskService::start` 返回一个完整 Service 套件：
-
-- `client`：`submit` 等接受确认，`call` 等最终结果，`query` 直接查询；
-- `control`：Pause、Resume、Drain、Stop；
-- `observer`：watch Runtime + 业务快照；
-- `task`：唯一根 Tokio task 的所有权，可 `join` 或强制 `abort`。
-
-| 状态 | 新 Command | 已启动 Future | 新 Action |
-| --- | --- | --- | --- |
-| Running | 接受 | 继续 poll | 可以启动 |
-| Paused | 拒绝 | 继续安全收敛 | 不启动 |
-| Draining | 拒绝 | 继续 poll | 已接收工作可以继续启动 |
-| Stopping | 拒绝 | 发协作取消并继续 poll | 只推进稳定退出 |
-| Stopped | 拒绝 | 无 | 无 |
-
-Drop/abort `ServiceTask` 是最终故障隔离手段；Drain/Stop 则等所有已接收工作得到明确结果。
-
-## 文件导航
-
-| 文件 | 阅读问题 |
+| 控制 | 已接收执行 |
 | --- | --- |
-| `src/runtime/mod.rs` | 公共循环如何安排三通道、生命周期与 Future？ |
-| `src/runtime/api.rs` | client/control/observer/task 如何对外暴露？ |
-| `src/runtime/runs.rs` | 普通 Future 如何被隐藏 pin 并统一 poll？ |
-| `src/member_disk/model.rs` | MemberDisk 拥有哪些核心数据和合法修改？ |
-| `src/member_disk/protocol.rs` | 外部 Command、Query、Reply 与观测快照是什么？ |
-| `src/member_disk/commands.rs` | 原始 Command 如何保留、取消、聚合和回复？ |
-| `src/member_disk/requests.rs` | 每个 Request 如何排队、占用对象、重试和完成？ |
-| `src/member_disk/state_machine.rs` | 当前状态与意图如何决定下一项 Action？ |
-| `src/member_disk/actions.rs` | 每项 Action 实际执行哪些网络与持久化步骤？ |
-| `src/member_disk/service.rs` | 上述组件如何组成一个完整领域 Service？ |
-| `src/member_disk/tests.rs` | 批量、排队、分层取消、生命周期和部分提交如何验证？ |
-| `examples/member_disk.rs` | 调用方如何启动服务并执行业务？ |
+| Pause | 拒绝新命令；已启动 Activity 停稳；不开始新 Workflow/Activity |
+| Resume | 继续执行 |
+| Drain | 拒绝新命令；恢复 Pause gate 并完成已接收工作 |
+| Stop | 拒绝新命令；取消等待项，等运行 Activity 稳定返回 |
+| Abort / drop task | 强制丢弃本地 Future；不能证明外部副作用停止 |
 
-## 验证
+Stop 不是超时强杀：必达边界或 provider 不返回时可能一直等待。
+已完成但需要恢复的执行不阻止停止服务，却持续阻塞该服务实例中的相关资源。
 
-Windows 当前环境缺少 MSVC linker，使用已安装的 GNU Rust toolchain：
+## 提交和错误契约
+
+`预校验 → SDB 确认 → 发布内存` 在 Activity 内完成。共享领域目录只在短同步
+临界区读写，锁不跨 await；Runtime 的资源占用保护异步提交期间的互斥。
+
+元数据和节点端口新增 `is_retryable`，默认 false。只有 provider 能证明
+**结果已知、可安全重试**时才覆盖它。超时、结果不明和错误响应数量进入
+`NeedsRecovery`；panic 被隔离，同样保留资源阻塞。不自动重跑整条 Workflow。
+
+BLK 计划先整体校验，再逐盘提交。重试只针对未提交的盘。部分成功后失败或取消，
+返回 `PartialSpace { allocated, committed, cause }`，明确报告已提交的分配/释放；
+调用方必须据此对账，不能假设失败代表零副作用。
+
+VD 排空成功必须建立到移除为止有效的引用屏障；取消返回必须代表动作停稳。
+这仍是生产 provider 的外部契约，本地内存替身不证明真实存储协议成立。
+需要恢复的资源只能经外部对账后重建服务；没有自动解锁接口。
+终态缓存有界，但待执行数量、大批量输入和恢复阻塞记录仍需生产级限额。
+
+## 验收和运行
+
+[范围、验收条件与验证记录](../docs/proposals/2026-10-13-local-workflows.md)。
+
+```sh
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo run --example member_disk
+```
+
+本机 GNU 工具链需要已有 ASCII sysroot 路径：
 
 ```powershell
-$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER='rust-lld.exe'
+$env:RUSTFLAGS = '--sysroot C:\rustup-ascii\toolchains\stable-x86_64-pc-windows-gnu'
 cargo +stable-x86_64-pc-windows-gnu test --all-targets
-cargo +stable-x86_64-pc-windows-gnu clippy --all-targets -- -D warnings
-cargo +stable-x86_64-pc-windows-gnu run --example member_disk
 ```
 
-当前验证：8 项契约测试通过，所有 target 编译通过，Clippy `-D warnings` 通过。
+仅借鉴 [Temporal Workflow](https://docs.temporal.io/workflow-execution) 与
+[Activity](https://docs.temporal.io/activities) 的职责边界，不声称兼容其 SDK 或耐久性保证。

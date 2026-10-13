@@ -2,11 +2,12 @@
 
 状态：`B0.7 历史设计`。
 
-> 2026-09-14 实现基线已经切换到
+> 2026-10-13 实现基线已经切换到本地 Workflow + Activity：
 > [`service-sdk-next`](../service-sdk-next/README.md)。本章保留早期设计推导，涉及
 > `ManagedService`、`OperationContext`、`TaskAttempt` 和 `ObjectTaskCoordinator` 的代码接口
-> 不再代表当前实现。当前基线采用 `Command -> Request -> Waiting -> Ready -> Action ->
-> Future -> Running`，以更小的 Runtime 接口保留同样的状态所有权、协作取消和观测原则。
+> 不再代表当前实现。2026-09-14 的 Command/Request/Action 流水线也已移除。
+> 当前 Workflow 直接 await Activity，Runtime 统一管理执行目录、资源占用和取消。
+> 参见[范围与验收](proposals/2026-10-13-local-workflows.md)；尚无持久化重放能力。
 
 本章定义 Pool 内领域 Service 共用的运行组件。它解决的是“服务如何运行和被管理”，而不是
 “某个业务下一步应该做什么”。MemberDisk 是第一个适配者，Node、VD、BG 可以复用同一

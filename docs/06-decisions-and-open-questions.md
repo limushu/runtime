@@ -1,5 +1,15 @@
 # 决策与待决问题
 
+## 2026-10-13 实现调整
+
+用户已批准在 service-sdk-next 中以本地 Workflow + Activity 替换请求流水线。
+Workflow 表达过程，Activity 保护领域提交，Runtime 统一执行目录与资源占用；
+旧 CommandTable/RequestTable/Action 分发不再是当前实现。既有领域安全不变量保留。
+这不确认切主恢复或持久化重放设计。独立 ProcessManager 与 temporal_process 示例保留，
+但不作为正式库能力。[范围、验收和证据](proposals/2026-10-13-local-workflows.md)。
+
+下文为既有领域决策和历史运行时讨论；涉及具体执行 API 时以上述新基线为准。
+
 ## 已确认决策
 
 ### D-001 中心化 Monitor

@@ -1,6 +1,7 @@
 mod api;
 mod lifecycle;
 mod runs;
+pub mod workflow;
 
 pub use api::{
     CallError, CommandId, CommandReply, ControlError, IncomingCommand, RuntimeSnapshot,
@@ -21,8 +22,9 @@ use tokio::{
 
 /// Business hooks invoked by the fixed service runtime.
 ///
-/// The service owns all domain state and request queues. The runtime only
-/// orders these hooks and polls the futures produced by `start_ready`.
+/// Low-level host adapter retained for custom services and examples. Workflow
+/// hosts delegate execution bookkeeping to `workflow::Workflows`; business
+/// steps themselves are ordinary async functions, not per-step callbacks.
 pub trait Service: Send + 'static {
     type Command: Send + 'static;
     type CommandReply: Send + 'static;
@@ -55,6 +57,12 @@ pub trait Service: Send + 'static {
     }
 
     fn snapshot(&self) -> Self::Snapshot;
+
+    fn lifecycle_changed(&mut self, _lifecycle: Lifecycle) {}
+
+    fn progress_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +167,7 @@ async fn run_service<S: Service>(
     let mut lifecycle = Lifecycle::Running;
     let mut driver = RunDriver::default();
     let mut shutdown_waiters: Vec<oneshot::Sender<Result<(), ControlError>>> = Vec::new();
+    let (mut controls_open, mut queries_open, mut commands_open) = (true, true, true);
 
     loop {
         // Control is checked before bounded business draining as well as first
@@ -169,6 +178,7 @@ async fn run_service<S: Service>(
         }
 
         drain_queries(&service, &mut query_rx, config.queries_per_round);
+        service.lifecycle_changed(lifecycle);
         drain_commands(
             &mut service,
             &mut command_rx,
@@ -200,12 +210,14 @@ async fn run_service<S: Service>(
         }
 
         let wakeup = service.next_wakeup();
+        let progress = service.progress_notify();
 
         tokio::select! {
             biased;
 
-            control = control_rx.recv() => {
+            control = control_rx.recv(), if controls_open => {
                 let Some(control) = control else {
+                    controls_open = false;
                     if lifecycle != Lifecycle::Stopping {
                         lifecycle = Lifecycle::Draining;
                     }
@@ -219,21 +231,32 @@ async fn run_service<S: Service>(
                 );
             }
 
+            _ = async {
+                match progress {
+                    Some(notify) => notify.notified().await,
+                    None => pending::<()>().await,
+                }
+            } => {}
+
             completion = driver.next(), if !driver.is_empty() => {
                 if let Some(completion) = completion {
                     service.finish_running(completion);
                 }
             }
 
-            query = query_rx.recv() => {
+            query = query_rx.recv(), if queries_open => {
                 if let Some(query) = query {
                     answer_query(&service, query);
+                } else {
+                    queries_open = false;
                 }
             }
 
-            command = command_rx.recv() => {
+            command = command_rx.recv(), if commands_open => {
                 if let Some(command) = command {
                     receive_or_reject(&mut service, lifecycle, command);
+                } else {
+                    commands_open = false;
                 }
             }
 

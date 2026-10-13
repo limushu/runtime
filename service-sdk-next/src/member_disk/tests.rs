@@ -9,10 +9,7 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::{
-    Activity, CallError, CommandId, CommandReply, IncomingCommand, Lifecycle, NewRuns, Service,
-    ServiceConfig,
-};
+use crate::runtime::{Activity, CallError, Lifecycle, ServiceConfig};
 
 use super::*;
 
@@ -38,6 +35,9 @@ struct FailSecondCommitOnce {
 
 #[async_trait]
 impl MemberDiskMetadata for FailSecondCommitOnce {
+    fn is_retryable(&self, _error: &PortError) -> bool {
+        true
+    }
     async fn commit(&self, changes: Vec<MemberDiskCommit>) -> Vec<Result<(), PortError>> {
         let call = self.calls.fetch_add(1, Ordering::Relaxed);
         self.commits.lock().unwrap().push(changes.clone());
@@ -310,7 +310,7 @@ async fn every_request_remains_visible_while_one_disk_is_cancelling() {
     assert_eq!(work.len(), 4, "no command may be overwritten silently");
     assert!(
         work.iter()
-            .any(|request| { matches!(request.status, RequestStatus::Cancelling { .. }) })
+            .any(|workflow| { matches!(workflow.status, WorkflowStatus::Cancelling) })
     );
 
     evacuation.settle.notify_one();
@@ -443,14 +443,15 @@ async fn aborting_the_root_task_drops_owned_work_and_closes_the_reply() {
 }
 
 #[tokio::test]
-async fn synchronous_completion_keeps_advancing_waiting_requests() {
+async fn immediate_workflows_keep_advancing_without_another_command() {
     let ports = Arc::new(TestPorts::default());
-    let mut service = service(
+    let instance = service(
         vec![disk("a")],
         ports,
         Arc::new(ImmediateEvacuation),
         Duration::ZERO,
-    );
+    )
+    .start(ServiceConfig::default());
     let up = || {
         MemberDiskCommand::ApplyEvents(vec![DiskEvent {
             disk: "a".into(),
@@ -458,26 +459,603 @@ async fn synchronous_completion_keeps_advancing_waiting_requests() {
             observed_at: now_millis(),
         }])
     };
-    let (first_reply, first_result) = tokio::sync::oneshot::channel();
-    let (second_reply, second_result) = tokio::sync::oneshot::channel();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(instance.client.call(up()), instance.client.call(up()))
+    })
+    .await
+    .unwrap();
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
+}
 
-    service.receive_command(IncomingCommand {
-        id: CommandId(1),
-        payload: up(),
-        reply: CommandReply::Completed(Some(first_reply)),
+fn event(id: &str, state: PhysicalState) -> MemberDiskCommand {
+    MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+        disk: id.into(),
+        state,
+        observed_at: now_millis(),
+    }])
+}
+
+fn outcomes(reply: MemberDiskReply) -> Vec<DiskOutcome> {
+    match reply {
+        MemberDiskReply::Disks(disks) => disks,
+        _ => panic!("expected disk outcomes"),
+    }
+}
+
+#[derive(Default)]
+struct ControlledMetadata {
+    started: Notify,
+    finish: Notify,
+    calls: AtomicUsize,
+    mode: usize,
+}
+
+#[async_trait]
+impl MemberDiskMetadata for ControlledMetadata {
+    fn is_retryable(&self, _: &PortError) -> bool {
+        self.mode == 3
+    }
+    async fn commit(&self, changes: Vec<MemberDiskCommit>) -> Vec<Result<(), PortError>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode == 0 && call == 0 {
+            self.started.notify_one();
+            self.finish.notified().await;
+        }
+        if self.mode == 1 {
+            return Vec::new();
+        }
+        if self.mode == 2 {
+            panic!("simulated uncertain provider panic");
+        }
+        changes
+            .into_iter()
+            .map(|_| {
+                if (self.mode == 3 && call > 0) || self.mode == 4 {
+                    Err(PortError("write failed".into()))
+                } else {
+                    Ok(())
+                }
+            })
+            .collect()
+    }
+}
+
+fn with_metadata(
+    metadata: Arc<dyn MemberDiskMetadata>,
+) -> crate::runtime::ServiceInstance<MemberDiskService> {
+    MemberDiskService::new(
+        vec![
+            MemberDisk::new("a".into(), "pool-1", 2),
+            MemberDisk::new("b".into(), "pool-1", 2),
+        ],
+        metadata,
+        Arc::new(TestPorts::default()),
+        Arc::new(ImmediateEvacuation),
+        MemberDiskConfig {
+            recovery_window: Duration::ZERO,
+            retry_delay: Duration::from_millis(1),
+            max_retries: 1,
+        },
+    )
+    .unwrap()
+    .start(ServiceConfig::default())
+}
+
+#[tokio::test]
+async fn pause_stops_next_activity_not_the_commit_in_progress() {
+    let metadata = Arc::new(ControlledMetadata::default());
+    let instance = with_metadata(metadata.clone());
+    instance
+        .client
+        .submit(event("a", PhysicalState::Down))
+        .await
+        .unwrap();
+    metadata.started.notified().await;
+    instance.control.pause().await.unwrap();
+    let MemberDiskQueryReply::Disk(Some(before)) = instance
+        .client
+        .query(MemberDiskQuery::Get("a".into()))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        before.state(),
+        MemberDiskState::UpActive,
+        "unconfirmed commit must not be published"
+    );
+    metadata.finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let MemberDiskQueryReply::Disk(Some(member)) = instance
+                .client
+                .query(MemberDiskQuery::Get("a".into()))
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            if member.state() == MemberDiskState::DownActive {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        metadata.calls.load(Ordering::SeqCst),
+        1,
+        "no next activity while paused"
+    );
+    instance.control.drain().await.unwrap();
+    assert!(
+        instance
+            .observer
+            .snapshot()
+            .service
+            .workflows
+            .iter()
+            .any(|w| w.status == WorkflowStatus::Completed)
+    );
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_commit_blocks_disk_but_other_disks_can_complete() {
+    let metadata = Arc::new(ControlledMetadata {
+        mode: 1,
+        ..Default::default()
     });
-    service.receive_command(IncomingCommand {
-        id: CommandId(2),
-        payload: up(),
-        reply: CommandReply::Completed(Some(second_reply)),
+    let instance = with_metadata(metadata.clone());
+    let failed = outcomes(
+        instance
+            .client
+            .call(event("a", PhysicalState::Down))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        failed[0].result,
+        Err(MemberDiskError::NeedsRecovery(_))
+    ));
+    let blocked = outcomes(
+        instance
+            .client
+            .call(event("a", PhysicalState::Up))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        blocked[0].result,
+        Err(MemberDiskError::NeedsRecovery(_))
+    ));
+    assert_eq!(
+        metadata.calls.load(Ordering::SeqCst),
+        1,
+        "uncertain resource must not be retried"
+    );
+    assert!(matches!(
+        instance
+            .client
+            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 1 }))
+            .await,
+        Err(CallError::Business(MemberDiskError::NeedsRecovery(_)))
+    ));
+    let other = outcomes(
+        instance
+            .client
+            .call(event("b", PhysicalState::Up))
+            .await
+            .unwrap(),
+    );
+    assert!(other[0].result.is_ok());
+    instance.control.stop().await.unwrap();
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn provider_panic_isolated_and_retains_resource_block() {
+    let metadata = Arc::new(ControlledMetadata {
+        mode: 2,
+        ..Default::default()
     });
-    service.admit();
+    let instance = with_metadata(metadata.clone());
+    let failed = outcomes(
+        instance
+            .client
+            .call(event("a", PhysicalState::Down))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        failed[0].result,
+        Err(MemberDiskError::NeedsRecovery(_))
+    ));
+    let blocked = outcomes(
+        instance
+            .client
+            .call(event("a", PhysicalState::Up))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        blocked[0].result,
+        Err(MemberDiskError::NeedsRecovery(_))
+    ));
+    assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+    assert!(instance.client.query(MemberDiskQuery::List).await.is_ok());
+    instance.control.stop().await.unwrap();
+    instance.join().await.unwrap();
+}
 
-    let mut runs = NewRuns::default();
-    service.start_ready(&mut runs);
+#[tokio::test]
+async fn partial_allocation_failure_returns_committed_blocks() {
+    let metadata = Arc::new(ControlledMetadata {
+        mode: 3,
+        ..Default::default()
+    });
+    let instance = with_metadata(metadata.clone());
+    let error = instance
+        .client
+        .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 3 }))
+        .await
+        .unwrap_err();
+    let CallError::Business(MemberDiskError::PartialSpace {
+        allocated,
+        committed,
+        cause,
+    }) = error
+    else {
+        panic!("partial progress lost")
+    };
+    assert!(allocated);
+    assert_eq!(committed.len(), 2);
+    assert!(committed.iter().all(|b| b.disk == DiskUuid::from("a")));
+    assert!(matches!(*cause, MemberDiskError::Metadata(_)));
+    assert_eq!(metadata.calls.load(Ordering::SeqCst), 3);
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
+}
 
-    assert!(runs.is_empty());
-    assert!(service.is_idle());
-    assert!(first_result.await.unwrap().is_ok());
-    assert!(second_result.await.unwrap().is_ok());
+#[tokio::test]
+async fn unclassified_metadata_error_is_not_retried() {
+    let metadata = Arc::new(ControlledMetadata {
+        mode: 4,
+        ..Default::default()
+    });
+    let instance = with_metadata(metadata.clone());
+    let failed = outcomes(
+        instance
+            .client
+            .call(MemberDiskCommand::Shrink(vec!["a".into()]))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        failed[0].result,
+        Err(MemberDiskError::NeedsRecovery(_))
+    ));
+    assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+    instance.control.stop().await.unwrap();
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_preserves_input_order_duplicate_commands_and_unknown_disks() {
+    let instance = with_metadata(Arc::new(TestPorts::default()));
+    let command = MemberDiskCommand::ApplyEvents(
+        ["b", "missing", "a", "b"]
+            .into_iter()
+            .map(|id| DiskEvent {
+                disk: id.into(),
+                state: PhysicalState::Up,
+                observed_at: now_millis(),
+            })
+            .collect(),
+    );
+    let result = outcomes(instance.client.call(command).await.unwrap());
+    assert_eq!(
+        result
+            .iter()
+            .map(|o| o.disk.to_string())
+            .collect::<Vec<_>>(),
+        vec!["b", "missing", "a", "b"]
+    );
+    assert!(matches!(
+        result[1].result,
+        Err(MemberDiskError::UnknownDisk(_))
+    ));
+    assert!(result[0].result.is_ok() && result[2].result.is_ok() && result[3].result.is_ok());
+    let MemberDiskQueryReply::Work(work) =
+        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(work.len(), 4);
+    assert!(work.iter().all(|w| w.result.is_some()));
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_space_preflight_counts_only_eligible_members() {
+    let metadata = Arc::new(TestPorts::default());
+    let mut inactive = MemberDisk::new("b".into(), "pool-1", 100);
+    inactive.apply_committed(MemberDiskChange::DisableAllocation);
+    let instance = service(
+        vec![MemberDisk::new("a".into(), "pool-1", 1), inactive],
+        metadata.clone(),
+        Arc::new(ImmediateEvacuation),
+        Duration::ZERO,
+    )
+    .start(ServiceConfig::default());
+    assert!(matches!(
+        instance
+            .client
+            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 2 }))
+            .await,
+        Err(CallError::Business(MemberDiskError::NoSpace))
+    ));
+    assert!(metadata.commits.lock().unwrap().is_empty());
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_waits_for_final_commit_and_preserves_success() {
+    let metadata = Arc::new(ControlledMetadata::default());
+    let instance = with_metadata(metadata.clone());
+    let client = instance.client.clone();
+    let allocate = tokio::spawn(async move {
+        client
+            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 1 }))
+            .await
+    });
+    metadata.started.notified().await;
+    let control = instance.control.clone();
+    let stop = tokio::spawn(async move { control.stop().await });
+    let mut observer = instance.observer.clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while observer.snapshot().lifecycle != Lifecycle::Stopping {
+            observer.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !stop.is_finished(),
+        "stop must wait for the in-flight write"
+    );
+    metadata.finish.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(2), allocate)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, MemberDiskReply::Allocated(blocks) if blocks.len() == 1));
+    stop.await.unwrap().unwrap();
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_down_cannot_cancel_an_active_allocation() {
+    let metadata = Arc::new(ControlledMetadata::default());
+    let instance = with_metadata(metadata.clone());
+    let client = instance.client.clone();
+    let allocate = tokio::spawn(async move {
+        client
+            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 3 }))
+            .await
+    });
+    metadata.started.notified().await;
+    let unknown = outcomes(
+        instance
+            .client
+            .call(event("missing", PhysicalState::Down))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        unknown[0].result,
+        Err(MemberDiskError::UnknownDisk(_))
+    ));
+    metadata.finish.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(2), allocate)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, MemberDiskReply::Allocated(blocks) if blocks.len() == 3));
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropped_channels_do_not_starve_owned_work() {
+    let metadata = Arc::new(ControlledMetadata::default());
+    let instance = with_metadata(metadata.clone());
+    instance
+        .client
+        .submit(MemberDiskCommand::Allocate(AllocateBlocks { count: 1 }))
+        .await
+        .unwrap();
+    metadata.started.notified().await;
+    let crate::runtime::ServiceInstance {
+        client,
+        control,
+        observer,
+        mut task,
+    } = instance;
+    drop(client);
+    drop(control);
+    metadata.finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), task.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observer.snapshot().lifecycle, Lifecycle::Stopped);
+    assert_eq!(
+        observer.snapshot().service.workflows[0].status,
+        WorkflowStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn release_reports_partial_progress_and_rejects_invalid_plan_before_writes() {
+    let metadata = Arc::new(ControlledMetadata {
+        mode: 3,
+        ..Default::default()
+    });
+    let mut a = MemberDisk::new("a".into(), "pool-1", 2);
+    let mut b = MemberDisk::new("b".into(), "pool-1", 2);
+    a.apply_committed(MemberDiskChange::Allocate(vec![BlockId(0)]));
+    b.apply_committed(MemberDiskChange::Allocate(vec![BlockId(0)]));
+    let instance = MemberDiskService::new(
+        vec![a, b],
+        metadata.clone(),
+        Arc::new(TestPorts::default()),
+        Arc::new(ImmediateEvacuation),
+        MemberDiskConfig {
+            retry_delay: Duration::from_millis(1),
+            max_retries: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .start(ServiceConfig::default());
+    let block = |id: &str| AllocatedBlock {
+        disk: id.into(),
+        block: BlockId(0),
+    };
+    let invalid = instance
+        .client
+        .call(MemberDiskCommand::Release(ReleaseBlocks {
+            blocks: vec![block("a"), block("missing")],
+        }))
+        .await;
+    assert!(matches!(
+        invalid,
+        Err(CallError::Business(MemberDiskError::UnknownDisk(_)))
+    ));
+    assert_eq!(metadata.calls.load(Ordering::SeqCst), 0);
+    let result = instance
+        .client
+        .call(MemberDiskCommand::Release(ReleaseBlocks {
+            blocks: vec![block("a"), block("b")],
+        }))
+        .await;
+    assert!(
+        matches!(result, Err(CallError::Business(MemberDiskError::PartialSpace { allocated: false, committed, .. })) if committed == vec![block("a")])
+    );
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
+}
+
+struct PerDiskEvacuation(Arc<StableCancellation>);
+
+#[async_trait]
+impl VirtualDisks for PerDiskEvacuation {
+    async fn evacuate(&self, disk: &DiskUuid, cancel: &CancellationToken) -> Result<(), PortError> {
+        if *disk == DiskUuid::from("a") {
+            self.0.evacuate(disk, cancel).await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn another_disk_progresses_while_conflicting_work_waits_for_stable_cancel() {
+    let gate = Arc::new(StableCancellation::default());
+    let instance = service(
+        vec![disk("a"), disk("b")],
+        Arc::new(TestPorts::default()),
+        Arc::new(PerDiskEvacuation(gate.clone())),
+        Duration::ZERO,
+    )
+    .start(ServiceConfig::default());
+    let first = instance
+        .client
+        .submit(event("a", PhysicalState::Down))
+        .await
+        .unwrap();
+    gate.started.notified().await;
+    instance
+        .client
+        .submit(event("a", PhysicalState::Up))
+        .await
+        .unwrap();
+    let other = tokio::time::timeout(
+        Duration::from_secs(2),
+        instance.client.call(event("b", PhysicalState::Down)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        outcomes(other)[0].result.as_ref().unwrap().state(),
+        MemberDiskState::Removed
+    );
+    let MemberDiskQueryReply::Work(work) =
+        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        work.iter().find(|w| w.command_id == first).unwrap().status,
+        WorkflowStatus::Cancelling
+    );
+    assert!(
+        work.iter()
+            .any(|w| w.disk == Some("a".into()) && w.status == WorkflowStatus::Waiting)
+    );
+    gate.settle.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), instance.control.drain())
+        .await
+        .unwrap()
+        .unwrap();
+    let work = instance.observer.snapshot().service.workflows;
+    assert_eq!(
+        work.iter().find(|w| w.command_id == first).unwrap().result,
+        Some(Err(MemberDiskError::Cancelled))
+    );
+    assert!(
+        work.iter()
+            .any(|w| w.disk == Some("a".into()) && w.status == WorkflowStatus::Completed)
+    );
+    instance.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_history_is_bounded_without_losing_large_batch_results() {
+    let instance = with_metadata(Arc::new(TestPorts::default()));
+    let events = (0..270)
+        .map(|_| DiskEvent {
+            disk: "a".into(),
+            state: PhysicalState::Up,
+            observed_at: now_millis(),
+        })
+        .collect();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        instance.client.call(MemberDiskCommand::ApplyEvents(events)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcomes(result).len(), 270);
+    let MemberDiskQueryReply::Work(work) =
+        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(work.len(), 256);
+    assert!(work.iter().all(|w| w.status == WorkflowStatus::Completed));
+    instance.control.drain().await.unwrap();
+    instance.join().await.unwrap();
 }

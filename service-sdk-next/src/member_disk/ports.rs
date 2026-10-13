@@ -35,11 +35,21 @@ pub struct DiskOpenResult {
 
 #[async_trait]
 pub trait MemberDiskMetadata: Send + Sync + 'static {
+    /// Opt in only for a definitely uncommitted, safely retryable failure.
+    /// All other errors are treated as uncertain and block the resource.
+    fn is_retryable(&self, _error: &PortError) -> bool {
+        false
+    }
+
     async fn commit(&self, changes: Vec<MemberDiskCommit>) -> Vec<Result<(), PortError>>;
 }
 
 #[async_trait]
 pub trait PoolNodes: Send + Sync + 'static {
+    fn is_retryable(&self, _error: &PortError) -> bool {
+        false
+    }
+
     async fn open_disks(&self, disks: Vec<DiskUuid>) -> Result<Vec<DiskOpenResult>, PortError>;
 
     async fn push_disk_states(&self, changes: Vec<DiskStateChange>) -> Result<(), PortError>;
@@ -47,6 +57,8 @@ pub trait PoolNodes: Send + Sync + 'static {
 
 #[async_trait]
 pub trait VirtualDisks: Send + Sync + 'static {
-    /// Returns only after any cancellation has reached a stable business boundary.
+    /// Returns only after cancellation has reached a stable business boundary.
+    /// Success must establish a reference barrier that remains valid until
+    /// member removal; a transient observation of zero references is insufficient.
     async fn evacuate(&self, disk: &DiskUuid, cancel: &CancellationToken) -> Result<(), PortError>;
 }

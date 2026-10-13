@@ -89,7 +89,7 @@ pub enum MemberDiskQueryReply {
     Disk(Option<MemberDisk>),
     Disks(Vec<MemberDisk>),
     Commands(Vec<CommandSnapshot>),
-    Work(Vec<RequestSnapshot>),
+    Work(Vec<WorkflowSnapshot>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,29 +104,21 @@ pub struct CommandSnapshot {
     pub id: CommandId,
     pub kind: CommandKind,
     pub status: CommandStatus,
-    pub requests: usize,
+    pub workflows: usize,
     pub finished: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestStatus {
-    Waiting,
-    Ready,
-    Running { action: &'static str },
-    Retrying { action: &'static str },
-    Cancelling { action: Option<&'static str> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestSnapshot {
+pub struct WorkflowSnapshot {
     pub id: u64,
     pub command_id: CommandId,
     pub disk: Option<DiskUuid>,
-    pub status: RequestStatus,
+    pub status: super::WorkflowStatus,
+    pub result: Option<Result<MemberDiskReply, MemberDiskError>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDiskSnapshot {
     pub commands: Vec<CommandSnapshot>,
-    pub requests: Vec<RequestSnapshot>,
+    pub workflows: Vec<WorkflowSnapshot>,
 }
