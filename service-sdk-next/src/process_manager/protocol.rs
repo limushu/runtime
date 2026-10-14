@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use crate::runtime::CommandId;
 
-use super::{AllocatedBlock, DiskUuid, MemberDisk, MemberDiskError};
+use crate::member_disk::{AllocatedBlock, DiskUuid, MemberDisk, MemberDiskError};
 
 pub type EpochMillis = u64;
 
@@ -37,7 +37,7 @@ pub struct ReleaseBlocks {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskCommand {
+pub enum ProcessCommand {
     ApplyEvents(Vec<DiskEvent>),
     Shrink(Vec<DiskUuid>),
     Allocate(AllocateBlocks),
@@ -52,7 +52,7 @@ pub enum CommandKind {
     Release,
 }
 
-impl MemberDiskCommand {
+impl ProcessCommand {
     pub(crate) fn kind(&self) -> CommandKind {
         match self {
             Self::ApplyEvents(_) => CommandKind::DiskEvents,
@@ -70,14 +70,14 @@ pub struct DiskOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskReply {
+pub enum ProcessReply {
     Disks(Vec<DiskOutcome>),
     Allocated(Vec<AllocatedBlock>),
     Released,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskQuery {
+pub enum ProcessQuery {
     Get(DiskUuid),
     List,
     InFlightCommands,
@@ -85,7 +85,7 @@ pub enum MemberDiskQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberDiskQueryReply {
+pub enum ProcessQueryReply {
     Disk(Option<MemberDisk>),
     Disks(Vec<MemberDisk>),
     Commands(Vec<CommandSnapshot>),
@@ -114,11 +114,14 @@ pub struct WorkflowSnapshot {
     pub command_id: CommandId,
     pub disk: Option<DiskUuid>,
     pub status: super::WorkflowStatus,
-    pub result: Option<Result<MemberDiskReply, MemberDiskError>>,
+    pub result: Option<Result<ProcessReply, MemberDiskError>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDiskSnapshot {
+pub struct ProcessSnapshot {
+    pub pool: String,
+    pub disk_blocked: Vec<Option<DiskUuid>>,
+    pub vd_blocked: Vec<Option<DiskUuid>>,
     pub commands: Vec<CommandSnapshot>,
     pub workflows: Vec<WorkflowSnapshot>,
 }

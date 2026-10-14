@@ -149,6 +149,12 @@ impl<I: Clone + Send + 'static, O: Clone + Send + 'static, E: WorkflowFailure, R
     pub fn changed(&self) -> Arc<Notify> {
         self.changed.clone()
     }
+    pub fn with_notify(changed: Arc<Notify>) -> Self {
+        Self {
+            changed,
+            ..Self::default()
+        }
+    }
     pub fn lifecycle(&self, state: Lifecycle) {
         self.enabled.send_if_modified(|value| {
             let enabled = matches!(state, Lifecycle::Running | Lifecycle::Draining);

@@ -1,5 +1,15 @@
 //! Read the business sequence here. No queues, Action enum or completion callbacks.
-use super::{activities::Activities, *};
+use super::*;
+use crate::vd::VdService;
+use std::time::Duration;
+
+/// Activity adapter: typed calls only. All mutable state belongs to domains.
+#[derive(Clone)]
+pub(crate) struct Activities {
+    pub disk: DiskService,
+    pub vd: VdService,
+    pub recovery_window: Duration,
+}
 use crate::runtime::workflow::WorkflowContext;
 
 #[derive(Debug, Clone)]
@@ -43,7 +53,7 @@ impl DiskWorkflow {
         }
         match (self.disk(), other.disk()) {
             (Some(a), Some(b)) => a == b,
-            _ => true,
+            _ => false,
         }
     }
     pub fn preempts(&self, other: &Self) -> bool {
@@ -57,7 +67,7 @@ pub(crate) async fn run(
     input: DiskWorkflow,
     a: Activities,
     ctx: WorkflowContext,
-) -> Result<MemberDiskReply, MemberDiskError> {
+) -> Result<ProcessReply, MemberDiskError> {
     ctx.checkpoint::<MemberDiskError>().await?;
     match input {
         DiskWorkflow::Unknown { disk, .. } => Err(MemberDiskError::UnknownDisk(disk)),
@@ -66,9 +76,12 @@ pub(crate) async fn run(
             disk_reply(&a, disk)
         }
         DiskWorkflow::Online(disk) => {
-            if a.get(&disk)?.state() != MemberDiskState::UpActive {
-                ctx.activity("bring-online", a.bring_online(&disk, &ctx))
-                    .await?;
+            if a.disk.get(&disk)?.state() != MemberDiskState::UpActive {
+                ctx.activity(
+                    "bring-online",
+                    a.disk.bring_online(&disk, ctx.cancellation()),
+                )
+                .await?;
             }
             disk_reply(&a, disk)
         }
@@ -76,8 +89,14 @@ pub(crate) async fn run(
             retire(&a, &ctx, &disk).await?;
             disk_reply(&a, disk)
         }
-        DiskWorkflow::Allocate(count) => space(&a, &ctx, a.allocation_plan(count)?, true).await,
-        DiskWorkflow::Release(blocks) => space(&a, &ctx, a.release_plan(blocks)?, false).await,
+        DiskWorkflow::Allocate(count) => ctx
+            .activity("allocate", a.disk.allocate(count, ctx.cancellation()))
+            .await
+            .map(ProcessReply::Allocated),
+        DiskWorkflow::Release(blocks) => ctx
+            .activity("release", a.disk.release(blocks, ctx.cancellation()))
+            .await
+            .map(|()| ProcessReply::Released),
     }
 }
 
@@ -88,14 +107,15 @@ async fn offline(
     observed_at: EpochMillis,
 ) -> Result<(), MemberDiskError> {
     use MemberDiskState::*;
-    if a.get(disk)?.state() == Removed {
+    if a.disk.get(disk)?.state() == Removed {
         return Ok(());
     }
-    if matches!(a.get(disk)?.state(), UpActive | UpInactive) {
-        ctx.activity("close-io", a.close_io(disk)).await?;
+    if matches!(a.disk.get(disk)?.state(), UpActive | UpInactive) {
+        ctx.activity("close-io", a.disk.close_io(disk, ctx.cancellation()))
+            .await?;
     }
-    if a.get(disk)?.state() == DownActive {
-        let deadline = observed_at.saturating_add(a.recovery_window().as_millis() as u64);
+    if a.disk.get(disk)?.state() == DownActive {
+        let deadline = observed_at.saturating_add(a.recovery_window.as_millis() as u64);
         ctx.activity(
             "recovery-window",
             ctx.sleep::<MemberDiskError>(std::time::Duration::from_millis(
@@ -113,62 +133,33 @@ async fn retire(
     disk: &DiskUuid,
 ) -> Result<(), MemberDiskError> {
     use MemberDiskState::*;
-    if a.get(disk)?.state() == Removed {
+    if a.disk.get(disk)?.state() == Removed {
         return Ok(());
     }
-    if matches!(a.get(disk)?.state(), UpActive | DownActive) {
-        ctx.activity("disable-allocation", a.disable_allocation(disk, ctx))
-            .await?;
+    if matches!(a.disk.get(disk)?.state(), UpActive | DownActive) {
+        ctx.activity(
+            "disable-allocation",
+            a.disk.disable_allocation(disk, ctx.cancellation()),
+        )
+        .await?;
     }
-    ctx.activity("evacuate", a.evacuate(disk, ctx)).await?;
-    ctx.activity("remove", a.remove(disk, ctx)).await
+    let ticket = ctx
+        .activity(
+            "prepare-drain",
+            a.disk.prepare_drain(disk, ctx.cancellation()),
+        )
+        .await?;
+    let proof = ctx
+        .activity("evacuate", a.vd.evacuate(ticket, ctx.cancellation()))
+        .await?;
+    ctx.activity("remove", a.disk.remove(proof, ctx.cancellation()))
+        .await
 }
 
-fn disk_reply(a: &Activities, disk: DiskUuid) -> Result<MemberDiskReply, MemberDiskError> {
-    let member = a.get(&disk)?;
-    Ok(MemberDiskReply::Disks(vec![DiskOutcome {
+fn disk_reply(a: &Activities, disk: DiskUuid) -> Result<ProcessReply, MemberDiskError> {
+    let member = a.disk.get(&disk)?;
+    Ok(ProcessReply::Disks(vec![DiskOutcome {
         disk,
         result: Ok(member),
     }]))
-}
-
-async fn space(
-    a: &Activities,
-    ctx: &WorkflowContext,
-    plan: Vec<MemberDiskCommit>,
-    allocating: bool,
-) -> Result<MemberDiskReply, MemberDiskError> {
-    let mut committed = Vec::new();
-    for commit in plan {
-        let result = ctx
-            .activity(
-                if allocating { "allocate" } else { "release" },
-                a.commit(&commit.disk, commit.change.clone(), ctx, false),
-            )
-            .await;
-        if let Err(cause) = result {
-            return if committed.is_empty() {
-                Err(cause)
-            } else {
-                Err(MemberDiskError::PartialSpace {
-                    allocated: allocating,
-                    committed,
-                    cause: Box::new(cause),
-                })
-            };
-        }
-        let blocks = match commit.change {
-            MemberDiskChange::Allocate(b) | MemberDiskChange::Release(b) => b,
-            _ => unreachable!(),
-        };
-        committed.extend(blocks.into_iter().map(|block| AllocatedBlock {
-            disk: commit.disk.clone(),
-            block,
-        }));
-    }
-    Ok(if allocating {
-        MemberDiskReply::Allocated(committed)
-    } else {
-        MemberDiskReply::Released
-    })
 }

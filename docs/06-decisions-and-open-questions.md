@@ -1,5 +1,15 @@
 # 决策与待决问题
 
+## 2026-10-14 ProcessManager 正式接入
+
+PoolManager 拥有并路由独立 Pool 根任务；每个 Pool 的 ProcessManager 管理完整操作，
+具名 Workflow 调用 DiskService/VdService 能力。流程冲突归应用，资源冲突归领域，
+Runtime 复用执行机制。DiskService 不再持有流程目录，Activity 也不再拥有目录。
+全局空间占用仅覆盖实际分配/释放或磁盘修改，不覆盖恢复等待或 VD 排空全过程。
+排空凭据增加 Pool 实例、盘和提交版本校验；生产引用屏障仍为 provider 契约。
+详见[当前范围与证据](proposals/2026-10-14-pool-process-manager.md)。
+后续章节中的具体旧接口是历史记录，不代表 Node/BG/持久化恢复已经实现。
+
 ## 2026-10-13 实现调整
 
 用户已批准在 service-sdk-next 中以本地 Workflow + Activity 替换请求流水线。

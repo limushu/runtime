@@ -7,7 +7,8 @@
 > `ManagedService`、`OperationContext`、`TaskAttempt` 和 `ObjectTaskCoordinator` 的代码接口
 > 不再代表当前实现。2026-09-14 的 Command/Request/Action 流水线也已移除。
 > 当前 Workflow 直接 await Activity，Runtime 统一管理执行目录、资源占用和取消。
-> 参见[范围与验收](proposals/2026-10-13-local-workflows.md)；尚无持久化重放能力。
+> 2026-10-14：每 Pool 的 ProcessManager 拥有流程目录，DiskService 拥有资源预约；
+> 二者共用 Pool 根 Runtime。参见[当前范围与验收](proposals/2026-10-14-pool-process-manager.md)；尚无持久化重放能力。
 
 本章定义 Pool 内领域 Service 共用的运行组件。它解决的是“服务如何运行和被管理”，而不是
 “某个业务下一步应该做什么”。MemberDisk 是第一个适配者，Node、VD、BG 可以复用同一

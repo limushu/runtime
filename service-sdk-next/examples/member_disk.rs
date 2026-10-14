@@ -1,5 +1,10 @@
 use async_trait::async_trait;
-use service_sdk_next::{member_disk::*, runtime::ServiceConfig};
+use service_sdk_next::{
+    member_disk::*,
+    pool::{Pool, PoolConfig},
+    process_manager::*,
+    runtime::ServiceConfig,
+};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -47,7 +52,8 @@ impl VirtualDisks for DemoPorts {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let ports = Arc::new(DemoPorts);
-    let service = MemberDiskService::new(
+    let service = Pool::new(
+        "pool-1",
         vec![
             MemberDisk::new("disk-a".into(), "pool-1", 32),
             MemberDisk::new("disk-b".into(), "pool-1", 32),
@@ -55,9 +61,9 @@ async fn main() {
         ports.clone(),
         ports.clone(),
         ports,
-        MemberDiskConfig {
+        PoolConfig {
             recovery_window: Duration::ZERO,
-            ..MemberDiskConfig::default()
+            ..PoolConfig::default()
         },
     )
     .unwrap()
@@ -65,14 +71,14 @@ async fn main() {
 
     let allocation = service
         .client
-        .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 4 }))
+        .call(ProcessCommand::Allocate(AllocateBlocks { count: 4 }))
         .await
         .unwrap();
     println!("ALLOCATED {allocation:?}");
 
     let offline = service
         .client
-        .call(MemberDiskCommand::ApplyEvents(vec![
+        .call(ProcessCommand::ApplyEvents(vec![
             DiskEvent {
                 disk: "disk-a".into(),
                 state: PhysicalState::Down,

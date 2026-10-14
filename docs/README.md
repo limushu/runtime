@@ -2,9 +2,9 @@
 
 版本：`Baseline B0.7`
 
-状态：理论基线 + MemberDisk 本地 Workflow/Activity 纵切面。PoolManager、Pool 装配和其他领域仍待实现。
+状态：理论基线 + Pool/ProcessManager + MemberDisk 纵切面。完整 VD/BG、Node 领域仍待实现。
 
-当前实现以 [2026-10-13 重构范围](proposals/2026-10-13-local-workflows.md) 和
+当前实现以 [2026-10-14 分层范围](proposals/2026-10-14-pool-process-manager.md) 和
 [service-sdk-next](../service-sdk-next/README.md) 为准，早期 Runtime 章节保留历史推导。
 
 ## 目的
@@ -70,13 +70,13 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **当前实现：** 命令映射为普通 async Workflow；Query 直接读取已提交领域视图，不创建 Workflow。
 - **已确认：** MemberDisk 决策元数据、DiskMap 输入事实、派生运行状态和在途意图是不同信息，不得用单一状态枚举替代完整实体。
 - **当前实现：** Workflow 直接 await 类型化 Activity；已移除 CommandTable、RequestTable、RequestPhase 和 Action 枚举分发。
-- **当前实现：** Runtime 的单一执行目录拥有排队、资源占用、取消与终态；批量命令只关联结果，进度从执行目录派生。
-- **当前实现：** 每个服务一个根 Tokio task，并发 poll Workflow Future；无每盘 task。Pause 在 Activity 边界生效，Stop 等待稳定退出。
-- **当前实现：** MemberDisk Activity 私有持有领域目录，按“预校验 -> SDB 确认 -> 发布内存”修改，锁不跨 await。
-- **当前实现：** 同盘互斥、全局空间操作互斥、DOWN 取消所有 Shrink；准入机制属于 Runtime，冲突优先级属于业务策略。
+- **当前实现：** 每个 Pool 的 ProcessManager 拥有流程目录、生命周期冲突策略和结果；Runtime 提供机械执行，领域保护实际资源。
+- **当前实现：** PoolManager 持有各 Pool 根任务并按 ID 路由；每 Pool 一个独立根 task。Workflow/领域 async 调用共用 Future driver，无每盘 task。
+- **当前实现：** DiskService 私有持有目录并独立保护资源，按“预校验 -> SDB 确认 -> 发布内存”修改；目录锁不跨 await，资源预约跨 await。
+- **当前实现：** 同盘流程准入和 DOWN 取消本 Pool Shrink 由 ProcessManager 决定；领域负责同盘修改与空间操作互斥，长流程等待不占全局空间锁。
 - **当前实现：** 元数据错误默认按结果不明处理；只有 provider 确认可重试才重试。panic 或不明提交阻塞相关资源；未执行的等待项不会扩大阻塞范围。
 - **当前实现：** BLK 分配/释放按盘提交，只重试未提交部分；失败或取消返回已提交进度。当前示例未实现 Tier/故障域筛选。
-- **当前实现：** VD 排空成功须由 provider 保证引用屏障持续到移除；生产存储协议、fencing 和切主恢复尚未实现。
+- **当前实现：** VdService 输出绑定 Pool 实例、盘和领域版本的排空凭据；生产 provider 仍须保证持续引用屏障。完整 BG/Node、fencing 和切主恢复未实现。
 - **当前实现：** 普通执行终态保留最近 256 项，恢复阻塞不淘汰；无持久化历史或重放。独立持久化示例不改变该边界。
 - **待决：** Tier、PoolCore、Rebuild 的最终服务粒度，以及 Monitor 切主时在途操作恢复协议。
 

@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::{Activity, CallError, Lifecycle, ServiceConfig};
 
 use super::*;
+use crate::pool::{Pool, PoolConfig};
 
 #[derive(Default)]
 struct TestPorts {
@@ -116,13 +117,14 @@ fn service(
     ports: Arc<TestPorts>,
     virtual_disks: Arc<dyn VirtualDisks>,
     recovery_window: Duration,
-) -> MemberDiskService {
-    MemberDiskService::new(
+) -> Pool {
+    Pool::new(
+        "pool-1",
         disks,
         ports.clone(),
         ports,
         virtual_disks,
-        MemberDiskConfig {
+        PoolConfig {
             recovery_window,
             retry_delay: Duration::from_millis(1),
             max_retries: 2,
@@ -144,7 +146,7 @@ async fn batch_down_uses_one_initial_broadcast_and_completes_each_disk() {
 
     let reply = instance
         .client
-        .call(MemberDiskCommand::ApplyEvents(vec![
+        .call(ProcessCommand::ApplyEvents(vec![
             DiskEvent {
                 disk: "a".into(),
                 state: PhysicalState::Down,
@@ -159,7 +161,7 @@ async fn batch_down_uses_one_initial_broadcast_and_completes_each_disk() {
         .await
         .unwrap();
 
-    let MemberDiskReply::Disks(outcomes) = reply else {
+    let ProcessReply::Disks(outcomes) = reply else {
         panic!("disk events returned the wrong reply kind");
     };
     assert_eq!(outcomes.len(), 2);
@@ -192,16 +194,15 @@ async fn allocation_uses_the_same_command_lifecycle_and_replies_on_completion() 
 
     let reply = instance
         .client
-        .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 3 }))
+        .call(ProcessCommand::Allocate(AllocateBlocks { count: 3 }))
         .await
         .unwrap();
-    let MemberDiskReply::Allocated(blocks) = reply else {
+    let ProcessReply::Allocated(blocks) = reply else {
         panic!("allocation returned the wrong reply kind");
     };
     assert_eq!(blocks.len(), 3);
 
-    let MemberDiskQueryReply::Disks(disks) =
-        instance.client.query(MemberDiskQuery::List).await.unwrap()
+    let ProcessQueryReply::Disks(disks) = instance.client.query(ProcessQuery::List).await.unwrap()
     else {
         panic!("list query returned the wrong reply kind");
     };
@@ -221,7 +222,8 @@ async fn allocation_uses_the_same_command_lifecycle_and_replies_on_completion() 
 async fn allocation_retries_only_the_uncommitted_remainder() {
     let nodes = Arc::new(TestPorts::default());
     let metadata = Arc::new(FailSecondCommitOnce::default());
-    let service = MemberDiskService::new(
+    let service = Pool::new(
+        "pool-1",
         vec![
             MemberDisk::new("a".into(), "pool-1", 2),
             MemberDisk::new("b".into(), "pool-1", 2),
@@ -229,9 +231,9 @@ async fn allocation_retries_only_the_uncommitted_remainder() {
         metadata.clone(),
         nodes,
         Arc::new(ImmediateEvacuation),
-        MemberDiskConfig {
+        PoolConfig {
             retry_delay: Duration::from_millis(1),
-            ..MemberDiskConfig::default()
+            ..PoolConfig::default()
         },
     )
     .unwrap();
@@ -239,10 +241,10 @@ async fn allocation_retries_only_the_uncommitted_remainder() {
 
     let reply = instance
         .client
-        .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 3 }))
+        .call(ProcessCommand::Allocate(AllocateBlocks { count: 3 }))
         .await
         .unwrap();
-    let MemberDiskReply::Allocated(blocks) = reply else {
+    let ProcessReply::Allocated(blocks) = reply else {
         panic!("allocation returned the wrong reply kind");
     };
     assert_eq!(blocks.len(), 3);
@@ -281,7 +283,7 @@ async fn every_request_remains_visible_while_one_disk_is_cancelling() {
     let client = instance.client.clone();
     let first = tokio::spawn(async move {
         client
-            .call(MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+            .call(ProcessCommand::ApplyEvents(vec![DiskEvent {
                 disk: "a".into(),
                 state: PhysicalState::Down,
                 observed_at: now_millis(),
@@ -293,7 +295,7 @@ async fn every_request_remains_visible_while_one_disk_is_cancelling() {
     for state in [PhysicalState::Up, PhysicalState::Down, PhysicalState::Up] {
         instance
             .client
-            .submit(MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+            .submit(ProcessCommand::ApplyEvents(vec![DiskEvent {
                 disk: "a".into(),
                 state,
                 observed_at: now_millis(),
@@ -302,8 +304,7 @@ async fn every_request_remains_visible_while_one_disk_is_cancelling() {
             .unwrap();
     }
 
-    let MemberDiskQueryReply::Work(work) =
-        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    let ProcessQueryReply::Work(work) = instance.client.query(ProcessQuery::Work).await.unwrap()
     else {
         panic!("work query returned the wrong reply kind");
     };
@@ -319,7 +320,7 @@ async fn every_request_remains_visible_while_one_disk_is_cancelling() {
         .expect("cancelled request did not settle")
         .unwrap()
         .unwrap();
-    let MemberDiskReply::Disks(outcomes) = first else {
+    let ProcessReply::Disks(outcomes) = first else {
         panic!("disk event returned the wrong reply kind");
     };
     assert_eq!(outcomes[0].result, Err(MemberDiskError::Cancelled));
@@ -344,16 +345,13 @@ async fn down_cancels_an_unrelated_inflight_shrink_command() {
     .start(ServiceConfig::default());
 
     let client = instance.client.clone();
-    let shrink = tokio::spawn(async move {
-        client
-            .call(MemberDiskCommand::Shrink(vec!["a".into()]))
-            .await
-    });
+    let shrink =
+        tokio::spawn(async move { client.call(ProcessCommand::Shrink(vec!["a".into()])).await });
     evacuation.started.notified().await;
 
     instance
         .client
-        .submit(MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+        .submit(ProcessCommand::ApplyEvents(vec![DiskEvent {
             disk: "b".into(),
             state: PhysicalState::Down,
             observed_at: now_millis(),
@@ -361,9 +359,9 @@ async fn down_cancels_an_unrelated_inflight_shrink_command() {
         .await
         .unwrap();
 
-    let MemberDiskQueryReply::Commands(commands) = instance
+    let ProcessQueryReply::Commands(commands) = instance
         .client
-        .query(MemberDiskQuery::InFlightCommands)
+        .query(ProcessQuery::InFlightCommands)
         .await
         .unwrap()
     else {
@@ -375,7 +373,7 @@ async fn down_cancels_an_unrelated_inflight_shrink_command() {
 
     evacuation.settle.notify_one();
     let reply = shrink.await.unwrap().unwrap();
-    let MemberDiskReply::Disks(outcomes) = reply else {
+    let ProcessReply::Disks(outcomes) = reply else {
         panic!("shrink returned the wrong reply kind");
     };
     assert_eq!(outcomes[0].result, Err(MemberDiskError::Cancelled));
@@ -400,13 +398,13 @@ async fn pause_rejects_commands_but_keeps_queries_available() {
     assert!(
         instance
             .client
-            .submit(MemberDiskCommand::Shrink(vec!["a".into()]))
+            .submit(ProcessCommand::Shrink(vec!["a".into()]))
             .await
             .is_err()
     );
     assert!(matches!(
-        instance.client.query(MemberDiskQuery::List).await,
-        Ok(MemberDiskQueryReply::Disks(_))
+        instance.client.query(ProcessQuery::List).await,
+        Ok(ProcessQueryReply::Disks(_))
     ));
 
     instance.control.resume().await.unwrap();
@@ -427,7 +425,7 @@ async fn aborting_the_root_task_drops_owned_work_and_closes_the_reply() {
     let client = instance.client.clone();
     let call = tokio::spawn(async move {
         client
-            .call(MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+            .call(ProcessCommand::ApplyEvents(vec![DiskEvent {
                 disk: "a".into(),
                 state: PhysicalState::Down,
                 observed_at: now_millis(),
@@ -453,7 +451,7 @@ async fn immediate_workflows_keep_advancing_without_another_command() {
     )
     .start(ServiceConfig::default());
     let up = || {
-        MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+        ProcessCommand::ApplyEvents(vec![DiskEvent {
             disk: "a".into(),
             state: PhysicalState::Up,
             observed_at: now_millis(),
@@ -470,17 +468,17 @@ async fn immediate_workflows_keep_advancing_without_another_command() {
     instance.join().await.unwrap();
 }
 
-fn event(id: &str, state: PhysicalState) -> MemberDiskCommand {
-    MemberDiskCommand::ApplyEvents(vec![DiskEvent {
+fn event(id: &str, state: PhysicalState) -> ProcessCommand {
+    ProcessCommand::ApplyEvents(vec![DiskEvent {
         disk: id.into(),
         state,
         observed_at: now_millis(),
     }])
 }
 
-fn outcomes(reply: MemberDiskReply) -> Vec<DiskOutcome> {
+fn outcomes(reply: ProcessReply) -> Vec<DiskOutcome> {
     match reply {
-        MemberDiskReply::Disks(disks) => disks,
+        ProcessReply::Disks(disks) => disks,
         _ => panic!("expected disk outcomes"),
     }
 }
@@ -525,8 +523,9 @@ impl MemberDiskMetadata for ControlledMetadata {
 
 fn with_metadata(
     metadata: Arc<dyn MemberDiskMetadata>,
-) -> crate::runtime::ServiceInstance<MemberDiskService> {
-    MemberDiskService::new(
+) -> crate::runtime::ServiceInstance<ProcessManager> {
+    Pool::new(
+        "pool-1",
         vec![
             MemberDisk::new("a".into(), "pool-1", 2),
             MemberDisk::new("b".into(), "pool-1", 2),
@@ -534,7 +533,7 @@ fn with_metadata(
         metadata,
         Arc::new(TestPorts::default()),
         Arc::new(ImmediateEvacuation),
-        MemberDiskConfig {
+        PoolConfig {
             recovery_window: Duration::ZERO,
             retry_delay: Duration::from_millis(1),
             max_retries: 1,
@@ -555,9 +554,9 @@ async fn pause_stops_next_activity_not_the_commit_in_progress() {
         .unwrap();
     metadata.started.notified().await;
     instance.control.pause().await.unwrap();
-    let MemberDiskQueryReply::Disk(Some(before)) = instance
+    let ProcessQueryReply::Disk(Some(before)) = instance
         .client
-        .query(MemberDiskQuery::Get("a".into()))
+        .query(ProcessQuery::Get("a".into()))
         .await
         .unwrap()
     else {
@@ -571,9 +570,9 @@ async fn pause_stops_next_activity_not_the_commit_in_progress() {
     metadata.finish.notify_one();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let MemberDiskQueryReply::Disk(Some(member)) = instance
+            let ProcessQueryReply::Disk(Some(member)) = instance
                 .client
-                .query(MemberDiskQuery::Get("a".into()))
+                .query(ProcessQuery::Get("a".into()))
                 .await
                 .unwrap()
             else {
@@ -642,7 +641,7 @@ async fn malformed_commit_blocks_disk_but_other_disks_can_complete() {
     assert!(matches!(
         instance
             .client
-            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 1 }))
+            .call(ProcessCommand::Allocate(AllocateBlocks { count: 1 }))
             .await,
         Err(CallError::Business(MemberDiskError::NeedsRecovery(_)))
     ));
@@ -688,7 +687,7 @@ async fn provider_panic_isolated_and_retains_resource_block() {
         Err(MemberDiskError::NeedsRecovery(_))
     ));
     assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
-    assert!(instance.client.query(MemberDiskQuery::List).await.is_ok());
+    assert!(instance.client.query(ProcessQuery::List).await.is_ok());
     instance.control.stop().await.unwrap();
     instance.join().await.unwrap();
 }
@@ -702,7 +701,7 @@ async fn partial_allocation_failure_returns_committed_blocks() {
     let instance = with_metadata(metadata.clone());
     let error = instance
         .client
-        .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 3 }))
+        .call(ProcessCommand::Allocate(AllocateBlocks { count: 3 }))
         .await
         .unwrap_err();
     let CallError::Business(MemberDiskError::PartialSpace {
@@ -732,7 +731,7 @@ async fn unclassified_metadata_error_is_not_retried() {
     let failed = outcomes(
         instance
             .client
-            .call(MemberDiskCommand::Shrink(vec!["a".into()]))
+            .call(ProcessCommand::Shrink(vec!["a".into()]))
             .await
             .unwrap(),
     );
@@ -748,7 +747,7 @@ async fn unclassified_metadata_error_is_not_retried() {
 #[tokio::test]
 async fn batch_preserves_input_order_duplicate_commands_and_unknown_disks() {
     let instance = with_metadata(Arc::new(TestPorts::default()));
-    let command = MemberDiskCommand::ApplyEvents(
+    let command = ProcessCommand::ApplyEvents(
         ["b", "missing", "a", "b"]
             .into_iter()
             .map(|id| DiskEvent {
@@ -771,8 +770,7 @@ async fn batch_preserves_input_order_duplicate_commands_and_unknown_disks() {
         Err(MemberDiskError::UnknownDisk(_))
     ));
     assert!(result[0].result.is_ok() && result[2].result.is_ok() && result[3].result.is_ok());
-    let MemberDiskQueryReply::Work(work) =
-        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    let ProcessQueryReply::Work(work) = instance.client.query(ProcessQuery::Work).await.unwrap()
     else {
         panic!()
     };
@@ -797,7 +795,7 @@ async fn no_space_preflight_counts_only_eligible_members() {
     assert!(matches!(
         instance
             .client
-            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 2 }))
+            .call(ProcessCommand::Allocate(AllocateBlocks { count: 2 }))
             .await,
         Err(CallError::Business(MemberDiskError::NoSpace))
     ));
@@ -813,7 +811,7 @@ async fn stop_waits_for_final_commit_and_preserves_success() {
     let client = instance.client.clone();
     let allocate = tokio::spawn(async move {
         client
-            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 1 }))
+            .call(ProcessCommand::Allocate(AllocateBlocks { count: 1 }))
             .await
     });
     metadata.started.notified().await;
@@ -837,7 +835,7 @@ async fn stop_waits_for_final_commit_and_preserves_success() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(matches!(reply, MemberDiskReply::Allocated(blocks) if blocks.len() == 1));
+    assert!(matches!(reply, ProcessReply::Allocated(blocks) if blocks.len() == 1));
     stop.await.unwrap().unwrap();
     instance.join().await.unwrap();
 }
@@ -849,7 +847,7 @@ async fn unknown_down_cannot_cancel_an_active_allocation() {
     let client = instance.client.clone();
     let allocate = tokio::spawn(async move {
         client
-            .call(MemberDiskCommand::Allocate(AllocateBlocks { count: 3 }))
+            .call(ProcessCommand::Allocate(AllocateBlocks { count: 3 }))
             .await
     });
     metadata.started.notified().await;
@@ -870,7 +868,7 @@ async fn unknown_down_cannot_cancel_an_active_allocation() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(matches!(reply, MemberDiskReply::Allocated(blocks) if blocks.len() == 3));
+    assert!(matches!(reply, ProcessReply::Allocated(blocks) if blocks.len() == 3));
     instance.control.drain().await.unwrap();
     instance.join().await.unwrap();
 }
@@ -881,7 +879,7 @@ async fn dropped_channels_do_not_starve_owned_work() {
     let instance = with_metadata(metadata.clone());
     instance
         .client
-        .submit(MemberDiskCommand::Allocate(AllocateBlocks { count: 1 }))
+        .submit(ProcessCommand::Allocate(AllocateBlocks { count: 1 }))
         .await
         .unwrap();
     metadata.started.notified().await;
@@ -915,12 +913,13 @@ async fn release_reports_partial_progress_and_rejects_invalid_plan_before_writes
     let mut b = MemberDisk::new("b".into(), "pool-1", 2);
     a.apply_committed(MemberDiskChange::Allocate(vec![BlockId(0)]));
     b.apply_committed(MemberDiskChange::Allocate(vec![BlockId(0)]));
-    let instance = MemberDiskService::new(
+    let instance = Pool::new(
+        "pool-1",
         vec![a, b],
         metadata.clone(),
         Arc::new(TestPorts::default()),
         Arc::new(ImmediateEvacuation),
-        MemberDiskConfig {
+        PoolConfig {
             retry_delay: Duration::from_millis(1),
             max_retries: 0,
             ..Default::default()
@@ -934,7 +933,7 @@ async fn release_reports_partial_progress_and_rejects_invalid_plan_before_writes
     };
     let invalid = instance
         .client
-        .call(MemberDiskCommand::Release(ReleaseBlocks {
+        .call(ProcessCommand::Release(ReleaseBlocks {
             blocks: vec![block("a"), block("missing")],
         }))
         .await;
@@ -945,7 +944,7 @@ async fn release_reports_partial_progress_and_rejects_invalid_plan_before_writes
     assert_eq!(metadata.calls.load(Ordering::SeqCst), 0);
     let result = instance
         .client
-        .call(MemberDiskCommand::Release(ReleaseBlocks {
+        .call(ProcessCommand::Release(ReleaseBlocks {
             blocks: vec![block("a"), block("b")],
         }))
         .await;
@@ -1001,8 +1000,7 @@ async fn another_disk_progresses_while_conflicting_work_waits_for_stable_cancel(
         outcomes(other)[0].result.as_ref().unwrap().state(),
         MemberDiskState::Removed
     );
-    let MemberDiskQueryReply::Work(work) =
-        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    let ProcessQueryReply::Work(work) = instance.client.query(ProcessQuery::Work).await.unwrap()
     else {
         panic!()
     };
@@ -1043,14 +1041,13 @@ async fn terminal_history_is_bounded_without_losing_large_batch_results() {
         .collect();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        instance.client.call(MemberDiskCommand::ApplyEvents(events)),
+        instance.client.call(ProcessCommand::ApplyEvents(events)),
     )
     .await
     .unwrap()
     .unwrap();
     assert_eq!(outcomes(result).len(), 270);
-    let MemberDiskQueryReply::Work(work) =
-        instance.client.query(MemberDiskQuery::Work).await.unwrap()
+    let ProcessQueryReply::Work(work) = instance.client.query(ProcessQuery::Work).await.unwrap()
     else {
         panic!()
     };

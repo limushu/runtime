@@ -12,6 +12,8 @@
 > 当前最小实现以 [`service-sdk-next`](../service-sdk-next/README.md) 为准：Workflow 直接
 > await Activity，Runtime 管理执行目录、资源占用和取消。已移除 Command/Request 队列
 > 与 Action 分发；领域状态权威和提交后发布原则保留，不提供持久化重放。
+> 2026-10-14 的[正式分层](proposals/2026-10-14-pool-process-manager.md)进一步将流程目录
+> 移到每个 Pool 的 ProcessManager，资源预约留在领域；Runtime 只提供执行机制。
 
 ## 摘要
 

@@ -1,5 +1,8 @@
 # Local Workflow + Activity 重构
 
+此文记录第一阶段实现；当前职责划分与 API 已由
+[2026-10-14 Pool/ProcessManager 正式接入](2026-10-14-pool-process-manager.md) 演进。
+
 日期：2026-10-13；验证于 2026-10-14 完成。状态：已实现本地执行范围。
 
 ## 范围

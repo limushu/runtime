@@ -1,39 +1,67 @@
 //! Domain effects. Validation, SDB confirmation and publication form one
 //! activity; neither a workflow nor a query can mutate the committed view.
 use super::*;
-use crate::runtime::workflow::WorkflowContext;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 type CloseReply = oneshot::Sender<Result<(), MemberDiskError>>;
 
+// A direct domain caller can be dropped independently of the Pool root. Do
+// not leave coalesced followers waiting forever if the leader is dropped at
+// the initial yield, before it has taken ownership of the queued senders.
+struct CloseLeader {
+    queue: Arc<Mutex<Vec<(DiskUuid, CloseReply)>>>,
+    armed: bool,
+}
+
+impl CloseLeader {
+    fn take(&mut self) -> Vec<(DiskUuid, CloseReply)> {
+        let batch = std::mem::take(&mut *self.queue.lock().unwrap());
+        self.armed = false;
+        batch
+    }
+}
+
+impl Drop for CloseLeader {
+    fn drop(&mut self) {
+        if self.armed {
+            for (_, reply) in self.take() {
+                let _ = reply.send(Err(MemberDiskError::NeedsRecovery(
+                    "close batch leader dropped".into(),
+                )));
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
-pub(crate) struct Activities {
-    disks: Arc<Mutex<BTreeMap<DiskUuid, MemberDisk>>>,
+pub(crate) struct DiskEffects {
+    disks: Arc<Mutex<Catalog>>,
     metadata: Arc<dyn MemberDiskMetadata>,
     nodes: Arc<dyn PoolNodes>,
-    vd: Arc<dyn VirtualDisks>,
-    config: MemberDiskConfig,
+    config: DiskConfig,
     close_batch: Arc<Mutex<Vec<(DiskUuid, CloseReply)>>>,
 }
 
-impl Activities {
+impl DiskEffects {
     pub fn new(
         disks: BTreeMap<DiskUuid, MemberDisk>,
         metadata: Arc<dyn MemberDiskMetadata>,
         nodes: Arc<dyn PoolNodes>,
-        vd: Arc<dyn VirtualDisks>,
-        config: MemberDiskConfig,
+        config: DiskConfig,
     ) -> Self {
         Self {
-            disks: Arc::new(Mutex::new(disks)),
+            disks: Arc::new(Mutex::new(Catalog {
+                members: disks,
+                versions: BTreeMap::new(),
+            })),
             metadata,
             nodes,
-            vd,
             config,
             close_batch: Arc::new(Mutex::new(Vec::new())),
         }
@@ -43,15 +71,19 @@ impl Activities {
         self.disks
             .lock()
             .unwrap()
+            .members
             .get(disk)
             .cloned()
             .ok_or_else(|| MemberDiskError::UnknownDisk(disk.clone()))
     }
     pub fn list(&self) -> Vec<MemberDisk> {
-        self.disks.lock().unwrap().values().cloned().collect()
-    }
-    pub fn recovery_window(&self) -> Duration {
-        self.config.recovery_window
+        self.disks
+            .lock()
+            .unwrap()
+            .members
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Coalesce simultaneously polled close activities. This is a provider
@@ -67,8 +99,12 @@ impl Activities {
             leader
         };
         if leader {
+            let mut leader = CloseLeader {
+                queue: self.close_batch.clone(),
+                armed: true,
+            };
             tokio::task::yield_now().await;
-            let batch = std::mem::take(&mut *self.close_batch.lock().unwrap());
+            let batch = leader.take();
             let changes = batch
                 .iter()
                 .map(|(disk, _)| DiskStateChange {
@@ -112,7 +148,7 @@ impl Activities {
     pub async fn bring_online(
         &self,
         disk: &DiskUuid,
-        ctx: &WorkflowContext,
+        cancel: &CancellationToken,
     ) -> Result<(), MemberDiskError> {
         let opened = self
             .nodes
@@ -138,36 +174,23 @@ impl Activities {
             }])
             .await
             .map_err(|e| MemberDiskError::NeedsRecovery(e.0))?;
-        self.commit(disk, MemberDiskChange::BringOnline, ctx, true)
+        self.commit(disk, MemberDiskChange::BringOnline, cancel, true)
             .await
     }
 
     pub async fn disable_allocation(
         &self,
         disk: &DiskUuid,
-        ctx: &WorkflowContext,
+        cancel: &CancellationToken,
     ) -> Result<(), MemberDiskError> {
-        self.commit(disk, MemberDiskChange::DisableAllocation, ctx, false)
+        self.commit(disk, MemberDiskChange::DisableAllocation, cancel, false)
             .await
-    }
-
-    pub async fn evacuate(
-        &self,
-        disk: &DiskUuid,
-        ctx: &WorkflowContext,
-    ) -> Result<(), MemberDiskError> {
-        // The provider contract owns the reference barrier and stable stopping.
-        let result = self.vd.evacuate(disk, ctx.cancellation()).await;
-        if ctx.cancellation().is_cancelled() {
-            return Err(MemberDiskError::Cancelled);
-        }
-        result.map_err(|e| MemberDiskError::VirtualDisks(e.0))
     }
 
     pub async fn remove(
         &self,
         disk: &DiskUuid,
-        ctx: &WorkflowContext,
+        cancel: &CancellationToken,
     ) -> Result<(), MemberDiskError> {
         self.get(disk)?.validate(&MemberDiskChange::Remove)?;
         self.push_down(vec![DiskStateChange {
@@ -175,7 +198,8 @@ impl Activities {
             state: IoState::Down,
         }])
         .await?;
-        self.commit(disk, MemberDiskChange::Remove, ctx, true).await
+        self.commit(disk, MemberDiskChange::Remove, cancel, true)
+            .await
     }
 
     pub fn allocation_plan(&self, count: usize) -> Result<Vec<MemberDiskCommit>, MemberDiskError> {
@@ -231,7 +255,7 @@ impl Activities {
         &self,
         disk: &DiskUuid,
         change: MemberDiskChange,
-        ctx: &WorkflowContext,
+        cancel: &CancellationToken,
         mandatory: bool,
     ) -> Result<(), MemberDiskError> {
         self.get(disk)?.validate(&change)?;
@@ -240,7 +264,7 @@ impl Activities {
                 disk: disk.clone(),
                 change,
             }],
-            Some(ctx),
+            Some(cancel),
             mandatory,
         )
         .await
@@ -251,7 +275,7 @@ impl Activities {
     async fn commit_batch(
         &self,
         commits: Vec<MemberDiskCommit>,
-        ctx: Option<&WorkflowContext>,
+        cancel: Option<&CancellationToken>,
         mandatory: bool,
     ) -> Vec<Result<(), MemberDiskError>> {
         let mut results = vec![Ok(()); commits.len()];
@@ -275,8 +299,12 @@ impl Activities {
                 match result {
                     Ok(()) => {
                         let mut disks = self.disks.lock().unwrap();
-                        let disk = disks.get_mut(&commits[i].disk).expect("validated member");
+                        let disk = disks
+                            .members
+                            .get_mut(&commits[i].disk)
+                            .expect("validated member");
                         disk.apply_committed(commits[i].change.clone());
+                        *disks.versions.entry(commits[i].disk.clone()).or_default() += 1;
                     }
                     Err(error)
                         if self.metadata.is_retryable(&error)
@@ -293,9 +321,8 @@ impl Activities {
             pending = retry;
             if !pending.is_empty() {
                 attempt += 1;
-                if !mandatory && let Some(ctx) = ctx {
-                    if let Err(error) = ctx.sleep::<MemberDiskError>(self.config.retry_delay).await
-                    {
+                if !mandatory && let Some(cancel) = cancel {
+                    if let Err(error) = wait_retry(cancel, self.config.retry_delay).await {
                         for i in pending {
                             results[i] = Err(error.clone());
                         }
@@ -308,4 +335,19 @@ impl Activities {
         }
         results
     }
+}
+
+struct Catalog {
+    members: BTreeMap<DiskUuid, MemberDisk>,
+    versions: BTreeMap<DiskUuid, u64>,
+}
+
+impl DiskEffects {
+    pub fn version(&self, disk: &DiskUuid) -> u64 {
+        *self.disks.lock().unwrap().versions.get(disk).unwrap_or(&0)
+    }
+}
+
+async fn wait_retry(cancel: &CancellationToken, delay: Duration) -> Result<(), MemberDiskError> {
+    tokio::select! { biased; _ = cancel.cancelled() => Err(MemberDiskError::Cancelled), _ = tokio::time::sleep(delay) => Ok(()) }
 }

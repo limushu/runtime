@@ -1,46 +1,54 @@
-use super::{
-    activities::Activities,
-    workflows::{self, DiskWorkflow},
-    *,
-};
-use crate::runtime::{
-    IncomingCommand, Lifecycle, NewRuns, Service, ServiceConfig, ServiceInstance, spawn_service,
-    workflow::{WorkflowCompletion, WorkflowStatus, Workflows},
-};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use super::{admission::Admission, effects::DiskEffects, *};
+use crate::runtime::Lifecycle;
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
-pub struct MemberDiskConfig {
-    pub recovery_window: Duration,
+pub struct DiskConfig {
     pub retry_delay: Duration,
     pub max_retries: u32,
 }
 
-impl Default for MemberDiskConfig {
-    fn default() -> Self {
-        Self {
-            recovery_window: Duration::from_secs(30),
-            retry_delay: Duration::from_millis(100),
-            max_retries: 3,
-        }
-    }
+/// Pool-scoped domain capability. Owns catalog, publication and resource
+/// arbitration, but no workflow queue, operation directory or business process.
+#[derive(Clone)]
+pub struct DiskService {
+    pool: Arc<str>,
+    identity: Arc<()>,
+    effects: DiskEffects,
+    admission: Admission,
 }
 
-pub struct MemberDiskService {
-    activities: Activities,
-    workflows: Workflows<DiskWorkflow, MemberDiskReply, MemberDiskError, MemberDiskReply>,
+/// Validated inactive member version, to be presented to the VD domain.
+pub struct DrainTicket {
+    pub(crate) pool: Arc<str>,
+    pub(crate) identity: Arc<()>,
+    pub(crate) disk: DiskUuid,
+    pub(crate) version: u64,
 }
 
-impl MemberDiskService {
-    pub fn new(
+/// Only the VD capability can construct a proof after successful evacuation.
+pub struct DrainProof {
+    pub(crate) ticket: DrainTicket,
+}
+
+impl DiskService {
+    pub(crate) fn new(
+        pool: Arc<str>,
         disks: impl IntoIterator<Item = MemberDisk>,
         metadata: Arc<dyn MemberDiskMetadata>,
-        pool_nodes: Arc<dyn PoolNodes>,
-        virtual_disks: Arc<dyn VirtualDisks>,
-        config: MemberDiskConfig,
+        nodes: Arc<dyn PoolNodes>,
+        config: DiskConfig,
+        changed: Arc<Notify>,
     ) -> Result<Self, MemberDiskError> {
         let mut members = BTreeMap::new();
         for disk in disks {
+            if disk.pool() != pool.as_ref() {
+                return Err(MemberDiskError::InvalidRequest(
+                    "member belongs to another Pool",
+                ));
+            }
             let id = disk.uuid().clone();
             if members.insert(id.clone(), disk).is_some() {
                 return Err(MemberDiskError::InvalidState {
@@ -50,176 +58,200 @@ impl MemberDiskService {
             }
         }
         Ok(Self {
-            activities: Activities::new(members, metadata, pool_nodes, virtual_disks, config),
-            workflows: Workflows::default(),
+            pool,
+            identity: Arc::new(()),
+            effects: DiskEffects::new(members, metadata, nodes, config),
+            admission: Admission::new(changed),
         })
     }
 
-    pub fn start(self, config: ServiceConfig) -> ServiceInstance<Self> {
-        spawn_service(self, config)
+    pub fn pool_id(&self) -> &str {
+        &self.pool
+    }
+    pub fn get(&self, disk: &DiskUuid) -> Result<MemberDisk, MemberDiskError> {
+        self.effects.get(disk)
+    }
+    pub fn list(&self) -> Vec<MemberDisk> {
+        self.effects.list()
+    }
+    pub fn blocked_resources(&self) -> Vec<Option<DiskUuid>> {
+        self.admission.blocked()
+    }
+    pub(crate) fn identity(&self) -> Arc<()> {
+        self.identity.clone()
+    }
+    pub(crate) fn lifecycle(&self, state: Lifecycle) {
+        self.admission.lifecycle(state);
+    }
+    pub(crate) fn stop(&self) {
+        self.admission.stop();
+    }
+    pub(crate) fn is_idle(&self) -> bool {
+        self.admission.is_idle()
     }
 
-    fn command_snapshots(&self) -> Vec<CommandSnapshot> {
-        let mut commands = BTreeMap::new();
-        for execution in self.workflows.executions() {
-            let command = commands
-                .entry(execution.command)
-                .or_insert(CommandSnapshot {
-                    id: execution.command,
-                    kind: execution.input.kind(),
-                    status: CommandStatus::Accepted,
-                    workflows: 0,
-                    finished: 0,
-                });
-            command.workflows += 1;
-            if execution.result.is_some() {
-                command.finished += 1;
-            }
-            match execution.status() {
-                WorkflowStatus::Cancelling => command.status = CommandStatus::Cancelling,
-                WorkflowStatus::Running { .. } if command.status != CommandStatus::Cancelling => {
-                    command.status = CommandStatus::Running
-                }
-                _ => {}
-            }
-        }
-        commands
-            .into_values()
-            .filter(|c| c.finished < c.workflows)
-            .collect()
-    }
-
-    fn workflow_snapshots(&self) -> Vec<WorkflowSnapshot> {
-        self.workflows
-            .executions()
-            .map(|execution| WorkflowSnapshot {
-                id: execution.id,
-                command_id: execution.command,
-                disk: execution.input.disk().cloned(),
-                status: execution.status(),
-                result: execution.result.clone(),
-            })
-            .collect()
-    }
-}
-
-impl Service for MemberDiskService {
-    type Command = MemberDiskCommand;
-    type CommandReply = MemberDiskReply;
-    type Query = MemberDiskQuery;
-    type QueryReply = MemberDiskQueryReply;
-    type Completion = WorkflowCompletion<MemberDiskReply, MemberDiskError>;
-    type Error = MemberDiskError;
-    type Snapshot = MemberDiskSnapshot;
-
-    fn query(&self, query: Self::Query) -> Result<Self::QueryReply, Self::Error> {
-        Ok(match query {
-            MemberDiskQuery::Get(disk) => {
-                MemberDiskQueryReply::Disk(self.activities.get(&disk).ok())
-            }
-            MemberDiskQuery::List => MemberDiskQueryReply::Disks(self.activities.list()),
-            MemberDiskQuery::InFlightCommands => {
-                MemberDiskQueryReply::Commands(self.command_snapshots())
-            }
-            MemberDiskQuery::Work => MemberDiskQueryReply::Work(self.workflow_snapshots()),
-        })
-    }
-
-    fn receive_command(
-        &mut self,
-        command: IncomingCommand<Self::Command, Self::CommandReply, Self::Error>,
-    ) {
-        let IncomingCommand { id, payload, reply } = command;
-        let kind = payload.kind();
-        let inputs: Vec<_> = match payload {
-            MemberDiskCommand::ApplyEvents(events) => {
-                // Global DOWN/Shrink precedence is business policy, not Runtime policy.
-                if events
-                    .iter()
-                    .any(|e| e.state == PhysicalState::Down && self.activities.get(&e.disk).is_ok())
-                {
-                    self.workflows
-                        .cancel_where(|w| matches!(w, DiskWorkflow::Shrink(_)));
-                }
-                events
-                    .into_iter()
-                    .map(|e| match e.state {
-                        PhysicalState::Down => DiskWorkflow::Offline {
-                            disk: e.disk,
-                            observed_at: e.observed_at,
-                        },
-                        PhysicalState::Up => DiskWorkflow::Online(e.disk),
-                    })
-                    .collect()
-            }
-            MemberDiskCommand::Shrink(disks) => {
-                disks.into_iter().map(DiskWorkflow::Shrink).collect()
-            }
-            MemberDiskCommand::Allocate(request) => vec![DiskWorkflow::Allocate(request.count)],
-            MemberDiskCommand::Release(request) => vec![DiskWorkflow::Release(request.blocks)],
+    async fn execute<T, F, Fut>(
+        &self,
+        disk: Option<DiskUuid>,
+        caller: &CancellationToken,
+        action: F,
+    ) -> Result<T, MemberDiskError>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = Result<T, MemberDiskError>>,
+    {
+        let mut reservation = self.admission.acquire(disk, caller).await?;
+        let cancel = reservation.cancel.clone();
+        let action = action(cancel.clone());
+        tokio::pin!(action);
+        let result = tokio::select! {
+            biased;
+            result = &mut action => result,
+            _ = caller.cancelled() => { cancel.cancel(); action.await },
         };
-        let inputs: Vec<_> = inputs
-            .into_iter()
-            .map(|input| match input.disk() {
-                Some(disk) if self.activities.get(disk).is_err() => DiskWorkflow::Unknown {
+        reservation.settled(&result);
+        result
+    }
+
+    pub async fn close_io(
+        &self,
+        disk: &DiskUuid,
+        cancel: &CancellationToken,
+    ) -> Result<(), MemberDiskError> {
+        self.execute(Some(disk.clone()), cancel, |_| self.effects.close_io(disk))
+            .await
+    }
+    pub async fn bring_online(
+        &self,
+        disk: &DiskUuid,
+        cancel: &CancellationToken,
+    ) -> Result<(), MemberDiskError> {
+        self.execute(Some(disk.clone()), cancel, |token| async move {
+            self.effects.bring_online(disk, &token).await
+        })
+        .await
+    }
+    pub async fn disable_allocation(
+        &self,
+        disk: &DiskUuid,
+        cancel: &CancellationToken,
+    ) -> Result<(), MemberDiskError> {
+        self.execute(Some(disk.clone()), cancel, |token| async move {
+            self.effects.disable_allocation(disk, &token).await
+        })
+        .await
+    }
+
+    pub async fn prepare_drain(
+        &self,
+        disk: &DiskUuid,
+        cancel: &CancellationToken,
+    ) -> Result<DrainTicket, MemberDiskError> {
+        self.execute(Some(disk.clone()), cancel, |_| async {
+            // A subsequent domain mutation changes the version and invalidates the
+            // ticket. The final validation occurs under the removal reservation.
+            let version = self.effects.version(disk);
+            if !matches!(
+                self.get(disk)?.state(),
+                MemberDiskState::UpInactive | MemberDiskState::DownInactive
+            ) {
+                return Err(MemberDiskError::InvalidState {
                     disk: disk.clone(),
-                    kind,
-                },
-                _ => input,
-            })
-            .collect();
-        let disks: Vec<_> = inputs.iter().filter_map(|w| w.disk().cloned()).collect();
-        self.workflows.submit(id, inputs, reply, move |results| {
-            if matches!(kind, CommandKind::DiskEvents | CommandKind::Shrink) {
-                let outcomes = disks
-                    .into_iter()
-                    .zip(results)
-                    .map(|(disk, result)| {
-                        let result = result.and_then(|reply| match reply {
-                            MemberDiskReply::Disks(mut disks) => disks.remove(0).result,
-                            _ => Err(MemberDiskError::Internal("wrong workflow output".into())),
-                        });
-                        DiskOutcome { disk, result }
-                    })
-                    .collect();
-                Ok(MemberDiskReply::Disks(outcomes))
-            } else {
-                results.into_iter().next().expect("space workflow")
+                    reason: "drain requires inactive allocation",
+                });
             }
-        });
+            Ok(DrainTicket {
+                pool: self.pool.clone(),
+                identity: self.identity.clone(),
+                disk: disk.clone(),
+                version,
+            })
+        })
+        .await
     }
 
-    fn admit(&mut self) {}
-
-    fn start_ready(&mut self, runs: &mut NewRuns<Self::Completion>) {
-        let activities = self.activities.clone();
-        self.workflows.start_ready(
-            runs,
-            DiskWorkflow::conflicts,
-            DiskWorkflow::preempts,
-            move |input, context| workflows::run(input, activities.clone(), context),
-        );
-    }
-
-    fn finish_running(&mut self, completion: Self::Completion) {
-        self.workflows.finish(completion);
-    }
-    fn cancel_all(&mut self) {
-        self.workflows.cancel_where(|_| true);
-    }
-    fn is_idle(&self) -> bool {
-        self.workflows.is_idle()
-    }
-    fn lifecycle_changed(&mut self, lifecycle: Lifecycle) {
-        self.workflows.lifecycle(lifecycle);
-    }
-    fn progress_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
-        Some(self.workflows.changed())
-    }
-    fn snapshot(&self) -> Self::Snapshot {
-        MemberDiskSnapshot {
-            commands: self.command_snapshots(),
-            workflows: self.workflow_snapshots(),
+    pub async fn remove(
+        &self,
+        proof: DrainProof,
+        cancel: &CancellationToken,
+    ) -> Result<(), MemberDiskError> {
+        let ticket = proof.ticket;
+        if !Arc::ptr_eq(&ticket.identity, &self.identity) || ticket.pool != self.pool {
+            return Err(MemberDiskError::InvalidRequest(
+                "drain proof belongs to another Pool instance",
+            ));
         }
+        self.execute(Some(ticket.disk.clone()), cancel, |token| async move {
+            if self.effects.version(&ticket.disk) != ticket.version {
+                return Err(MemberDiskError::InvalidState {
+                    disk: ticket.disk,
+                    reason: "stale drain proof",
+                });
+            }
+            self.effects.remove(&ticket.disk, &token).await
+        })
+        .await
+    }
+
+    pub async fn allocate(
+        &self,
+        count: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AllocatedBlock>, MemberDiskError> {
+        self.execute(None, cancel, |token| async move {
+            self.space(self.effects.allocation_plan(count)?, true, &token)
+                .await
+        })
+        .await
+    }
+    pub async fn release(
+        &self,
+        blocks: Vec<AllocatedBlock>,
+        cancel: &CancellationToken,
+    ) -> Result<(), MemberDiskError> {
+        self.execute(None, cancel, |token| async move {
+            self.space(self.effects.release_plan(blocks)?, false, &token)
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    async fn space(
+        &self,
+        plan: Vec<MemberDiskCommit>,
+        allocating: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AllocatedBlock>, MemberDiskError> {
+        let mut committed = Vec::new();
+        for commit in plan {
+            let result = if cancel.is_cancelled() {
+                Err(MemberDiskError::Cancelled)
+            } else {
+                self.effects
+                    .commit(&commit.disk, commit.change.clone(), cancel, false)
+                    .await
+            };
+            if let Err(cause) = result {
+                return if committed.is_empty() {
+                    Err(cause)
+                } else {
+                    Err(MemberDiskError::PartialSpace {
+                        allocated: allocating,
+                        committed,
+                        cause: Box::new(cause),
+                    })
+                };
+            }
+            let blocks = match commit.change {
+                MemberDiskChange::Allocate(b) | MemberDiskChange::Release(b) => b,
+                _ => unreachable!(),
+            };
+            committed.extend(blocks.into_iter().map(|block| AllocatedBlock {
+                disk: commit.disk.clone(),
+                block,
+            }));
+        }
+        Ok(committed)
     }
 }
