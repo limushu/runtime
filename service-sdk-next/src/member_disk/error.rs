@@ -59,7 +59,30 @@ impl fmt::Display for MemberDiskError {
 
 impl std::error::Error for MemberDiskError {}
 
-impl crate::runtime::workflow::WorkflowFailure for MemberDiskError {
+impl From<crate::process_manager::WorkflowError> for MemberDiskError {
+    fn from(error: crate::process_manager::WorkflowError) -> Self {
+        use crate::process_manager::WorkflowError;
+        match error {
+            WorkflowError::Cancelled => Self::Cancelled,
+            WorkflowError::Failed(reason) => Self::Internal(reason),
+            WorkflowError::NeedsRecovery(reason) => Self::NeedsRecovery(reason),
+        }
+    }
+}
+impl From<MemberDiskError> for crate::process_manager::WorkflowError {
+    fn from(error: MemberDiskError) -> Self {
+        use crate::process_manager::WorkflowFailure;
+        if error.needs_recovery() {
+            Self::NeedsRecovery(error.to_string())
+        } else if error.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Failed(error.to_string())
+        }
+    }
+}
+
+impl crate::process_manager::WorkflowFailure for MemberDiskError {
     fn is_cancelled(&self) -> bool {
         match self {
             Self::Cancelled => true,

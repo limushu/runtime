@@ -1,7 +1,10 @@
-use super::{admission::Admission, effects::DiskEffects, *};
-use crate::runtime::Lifecycle;
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
-use tokio::sync::Notify;
+use super::{effects::DiskEffects, *};
+use crate::{
+    process_manager::{ExecutionScope, ObjectClaim, ObjectKey, WorkflowContext},
+    runtime::{CallError, activity::*},
+};
+use async_trait::async_trait;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -10,213 +13,60 @@ pub struct DiskConfig {
     pub max_retries: u32,
 }
 
-/// Pool-scoped domain capability. Owns catalog, publication and resource
-/// arbitration, but no workflow queue, operation directory or business process.
-#[derive(Clone)]
+/// Owns the disk catalog and commits. Hosted by its own ActivityService Runtime.
+/// Object arbitration happens exclusively in the Pool's ProcessManager.
 pub struct DiskService {
-    pool: Arc<str>,
-    identity: Arc<()>,
+    scope: ExecutionScope,
     effects: DiskEffects,
-    admission: Admission,
 }
-
-/// Validated inactive member version, to be presented to the VD domain.
 pub struct DrainTicket {
-    pub(crate) pool: Arc<str>,
-    pub(crate) identity: Arc<()>,
+    pub(crate) scope: ExecutionScope,
     pub(crate) disk: DiskUuid,
     pub(crate) version: u64,
 }
-
-/// Only the VD capability can construct a proof after successful evacuation.
 pub struct DrainProof {
     pub(crate) ticket: DrainTicket,
+}
+pub enum DiskRequest {
+    CloseIo(DiskUuid),
+    BringOnline(DiskUuid),
+    DisableAllocation(DiskUuid),
+    PrepareDrain(DiskUuid),
+    Remove(DrainProof),
+    Allocate(usize),
+    Release(Vec<AllocatedBlock>),
+}
+pub enum DiskReply {
+    Done,
+    Ticket(DrainTicket),
+    Allocated(Vec<AllocatedBlock>),
 }
 
 impl DiskService {
     pub(crate) fn new(
-        pool: Arc<str>,
+        pool: &str,
+        scope: ExecutionScope,
         disks: impl IntoIterator<Item = MemberDisk>,
         metadata: Arc<dyn MemberDiskMetadata>,
         nodes: Arc<dyn PoolNodes>,
         config: DiskConfig,
-        changed: Arc<Notify>,
     ) -> Result<Self, MemberDiskError> {
         let mut members = BTreeMap::new();
         for disk in disks {
-            if disk.pool() != pool.as_ref() {
+            if disk.pool() != pool {
                 return Err(MemberDiskError::InvalidRequest(
                     "member belongs to another Pool",
                 ));
             }
-            let id = disk.uuid().clone();
-            if members.insert(id.clone(), disk).is_some() {
-                return Err(MemberDiskError::InvalidState {
-                    disk: id,
-                    reason: "duplicate UUID",
-                });
+            if members.insert(disk.uuid().clone(), disk).is_some() {
+                return Err(MemberDiskError::InvalidRequest("duplicate disk UUID"));
             }
         }
         Ok(Self {
-            pool,
-            identity: Arc::new(()),
+            scope,
             effects: DiskEffects::new(members, metadata, nodes, config),
-            admission: Admission::new(changed),
         })
     }
-
-    pub fn pool_id(&self) -> &str {
-        &self.pool
-    }
-    pub fn get(&self, disk: &DiskUuid) -> Result<MemberDisk, MemberDiskError> {
-        self.effects.get(disk)
-    }
-    pub fn list(&self) -> Vec<MemberDisk> {
-        self.effects.list()
-    }
-    pub fn blocked_resources(&self) -> Vec<Option<DiskUuid>> {
-        self.admission.blocked()
-    }
-    pub(crate) fn identity(&self) -> Arc<()> {
-        self.identity.clone()
-    }
-    pub(crate) fn lifecycle(&self, state: Lifecycle) {
-        self.admission.lifecycle(state);
-    }
-    pub(crate) fn stop(&self) {
-        self.admission.stop();
-    }
-    pub(crate) fn is_idle(&self) -> bool {
-        self.admission.is_idle()
-    }
-
-    async fn execute<T, F, Fut>(
-        &self,
-        disk: Option<DiskUuid>,
-        caller: &CancellationToken,
-        action: F,
-    ) -> Result<T, MemberDiskError>
-    where
-        F: FnOnce(CancellationToken) -> Fut,
-        Fut: Future<Output = Result<T, MemberDiskError>>,
-    {
-        let mut reservation = self.admission.acquire(disk, caller).await?;
-        let cancel = reservation.cancel.clone();
-        let action = action(cancel.clone());
-        tokio::pin!(action);
-        let result = tokio::select! {
-            biased;
-            result = &mut action => result,
-            _ = caller.cancelled() => { cancel.cancel(); action.await },
-        };
-        reservation.settled(&result);
-        result
-    }
-
-    pub async fn close_io(
-        &self,
-        disk: &DiskUuid,
-        cancel: &CancellationToken,
-    ) -> Result<(), MemberDiskError> {
-        self.execute(Some(disk.clone()), cancel, |_| self.effects.close_io(disk))
-            .await
-    }
-    pub async fn bring_online(
-        &self,
-        disk: &DiskUuid,
-        cancel: &CancellationToken,
-    ) -> Result<(), MemberDiskError> {
-        self.execute(Some(disk.clone()), cancel, |token| async move {
-            self.effects.bring_online(disk, &token).await
-        })
-        .await
-    }
-    pub async fn disable_allocation(
-        &self,
-        disk: &DiskUuid,
-        cancel: &CancellationToken,
-    ) -> Result<(), MemberDiskError> {
-        self.execute(Some(disk.clone()), cancel, |token| async move {
-            self.effects.disable_allocation(disk, &token).await
-        })
-        .await
-    }
-
-    pub async fn prepare_drain(
-        &self,
-        disk: &DiskUuid,
-        cancel: &CancellationToken,
-    ) -> Result<DrainTicket, MemberDiskError> {
-        self.execute(Some(disk.clone()), cancel, |_| async {
-            // A subsequent domain mutation changes the version and invalidates the
-            // ticket. The final validation occurs under the removal reservation.
-            let version = self.effects.version(disk);
-            if !matches!(
-                self.get(disk)?.state(),
-                MemberDiskState::UpInactive | MemberDiskState::DownInactive
-            ) {
-                return Err(MemberDiskError::InvalidState {
-                    disk: disk.clone(),
-                    reason: "drain requires inactive allocation",
-                });
-            }
-            Ok(DrainTicket {
-                pool: self.pool.clone(),
-                identity: self.identity.clone(),
-                disk: disk.clone(),
-                version,
-            })
-        })
-        .await
-    }
-
-    pub async fn remove(
-        &self,
-        proof: DrainProof,
-        cancel: &CancellationToken,
-    ) -> Result<(), MemberDiskError> {
-        let ticket = proof.ticket;
-        if !Arc::ptr_eq(&ticket.identity, &self.identity) || ticket.pool != self.pool {
-            return Err(MemberDiskError::InvalidRequest(
-                "drain proof belongs to another Pool instance",
-            ));
-        }
-        self.execute(Some(ticket.disk.clone()), cancel, |token| async move {
-            if self.effects.version(&ticket.disk) != ticket.version {
-                return Err(MemberDiskError::InvalidState {
-                    disk: ticket.disk,
-                    reason: "stale drain proof",
-                });
-            }
-            self.effects.remove(&ticket.disk, &token).await
-        })
-        .await
-    }
-
-    pub async fn allocate(
-        &self,
-        count: usize,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<AllocatedBlock>, MemberDiskError> {
-        self.execute(None, cancel, |token| async move {
-            self.space(self.effects.allocation_plan(count)?, true, &token)
-                .await
-        })
-        .await
-    }
-    pub async fn release(
-        &self,
-        blocks: Vec<AllocatedBlock>,
-        cancel: &CancellationToken,
-    ) -> Result<(), MemberDiskError> {
-        self.execute(None, cancel, |token| async move {
-            self.space(self.effects.release_plan(blocks)?, false, &token)
-                .await
-                .map(|_| ())
-        })
-        .await
-    }
-
     async fn space(
         &self,
         plan: Vec<MemberDiskCommit>,
@@ -253,5 +103,175 @@ impl DiskService {
             }));
         }
         Ok(committed)
+    }
+}
+#[async_trait]
+impl ActivityHandler for DiskService {
+    type Request = DiskRequest;
+    type Reply = DiskReply;
+    type Query = Option<DiskUuid>;
+    type QueryReply = Vec<MemberDisk>;
+    type Error = MemberDiskError;
+    fn claims(request: &DiskRequest) -> Vec<ObjectClaim> {
+        let object = match request {
+            DiskRequest::CloseIo(d)
+            | DiskRequest::BringOnline(d)
+            | DiskRequest::DisableAllocation(d)
+            | DiskRequest::PrepareDrain(d) => ObjectKey::new("disk", d.to_string()),
+            DiskRequest::Remove(p) => ObjectKey::new("disk", p.ticket.disk.to_string()),
+            DiskRequest::Allocate(_) | DiskRequest::Release(_) => ObjectKey::collection("disk"),
+        };
+        vec![ObjectClaim::exclusive(object)]
+    }
+    fn name(request: &DiskRequest) -> &'static str {
+        match request {
+            DiskRequest::CloseIo(_) => "disk.close-io",
+            DiskRequest::BringOnline(_) => "disk.online",
+            DiskRequest::DisableAllocation(_) => "disk.disable-allocation",
+            DiskRequest::PrepareDrain(_) => "disk.prepare-drain",
+            DiskRequest::Remove(_) => "disk.remove",
+            DiskRequest::Allocate(_) => "disk.allocate",
+            DiskRequest::Release(_) => "disk.release",
+        }
+    }
+    fn query(&self, disk: Option<DiskUuid>) -> Result<Vec<MemberDisk>, MemberDiskError> {
+        match disk {
+            Some(d) => Ok(vec![self.effects.get(&d)?]),
+            None => Ok(self.effects.list()),
+        }
+    }
+    async fn execute(
+        &self,
+        request: DiskRequest,
+        cancel: CancellationToken,
+    ) -> Result<DiskReply, MemberDiskError> {
+        match request {
+            DiskRequest::CloseIo(d) => self.effects.close_io(&d).await?,
+            DiskRequest::BringOnline(d) => self.effects.bring_online(&d, &cancel).await?,
+            DiskRequest::DisableAllocation(d) => {
+                self.effects.disable_allocation(&d, &cancel).await?
+            }
+            DiskRequest::PrepareDrain(d) => {
+                if !matches!(
+                    self.effects.get(&d)?.state(),
+                    MemberDiskState::UpInactive | MemberDiskState::DownInactive
+                ) {
+                    return Err(MemberDiskError::InvalidState {
+                        disk: d,
+                        reason: "drain requires inactive allocation",
+                    });
+                }
+                return Ok(DiskReply::Ticket(DrainTicket {
+                    scope: self.scope.clone(),
+                    version: self.effects.version(&d),
+                    disk: d,
+                }));
+            }
+            DiskRequest::Remove(proof) => {
+                let ticket = proof.ticket;
+                if !ticket.scope.same(&self.scope) {
+                    return Err(MemberDiskError::InvalidRequest("foreign drain proof"));
+                }
+                if self.effects.version(&ticket.disk) != ticket.version {
+                    return Err(MemberDiskError::InvalidState {
+                        disk: ticket.disk,
+                        reason: "stale drain proof",
+                    });
+                }
+                self.effects.remove(&ticket.disk, &cancel).await?;
+            }
+            DiskRequest::Allocate(count) => {
+                return self
+                    .space(self.effects.allocation_plan(count)?, true, &cancel)
+                    .await
+                    .map(DiskReply::Allocated);
+            }
+            DiskRequest::Release(blocks) => {
+                self.space(self.effects.release_plan(blocks)?, false, &cancel)
+                    .await?;
+            }
+        }
+        Ok(DiskReply::Done)
+    }
+}
+
+#[derive(Clone)]
+pub struct DiskClient(pub(crate) ActivityClient<DiskService>);
+impl DiskClient {
+    pub async fn get(&self, disk: DiskUuid) -> Result<MemberDisk, CallError<MemberDiskError>> {
+        Ok(self.0.query(Some(disk)).await?.remove(0))
+    }
+    pub async fn list(&self) -> Result<Vec<MemberDisk>, CallError<MemberDiskError>> {
+        self.0.query(None).await
+    }
+    pub async fn close_io(
+        &self,
+        ctx: &mut WorkflowContext,
+        disk: DiskUuid,
+    ) -> Result<(), MemberDiskError> {
+        self.0
+            .call(ctx, DiskRequest::CloseIo(disk))
+            .await
+            .map(|_| ())
+    }
+    pub async fn bring_online(
+        &self,
+        ctx: &mut WorkflowContext,
+        disk: DiskUuid,
+    ) -> Result<(), MemberDiskError> {
+        self.0
+            .call(ctx, DiskRequest::BringOnline(disk))
+            .await
+            .map(|_| ())
+    }
+    pub async fn disable_allocation(
+        &self,
+        ctx: &mut WorkflowContext,
+        disk: DiskUuid,
+    ) -> Result<(), MemberDiskError> {
+        self.0
+            .call(ctx, DiskRequest::DisableAllocation(disk))
+            .await
+            .map(|_| ())
+    }
+    pub async fn prepare_drain(
+        &self,
+        ctx: &mut WorkflowContext,
+        disk: DiskUuid,
+    ) -> Result<DrainTicket, MemberDiskError> {
+        match self.0.call(ctx, DiskRequest::PrepareDrain(disk)).await? {
+            DiskReply::Ticket(t) => Ok(t),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn remove(
+        &self,
+        ctx: &mut WorkflowContext,
+        proof: DrainProof,
+    ) -> Result<(), MemberDiskError> {
+        self.0
+            .call(ctx, DiskRequest::Remove(proof))
+            .await
+            .map(|_| ())
+    }
+    pub async fn allocate(
+        &self,
+        ctx: &mut WorkflowContext,
+        count: usize,
+    ) -> Result<Vec<AllocatedBlock>, MemberDiskError> {
+        match self.0.call(ctx, DiskRequest::Allocate(count)).await? {
+            DiskReply::Allocated(b) => Ok(b),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn release(
+        &self,
+        ctx: &mut WorkflowContext,
+        blocks: Vec<AllocatedBlock>,
+    ) -> Result<(), MemberDiskError> {
+        self.0
+            .call(ctx, DiskRequest::Release(blocks))
+            .await
+            .map(|_| ())
     }
 }

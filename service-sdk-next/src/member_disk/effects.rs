@@ -11,9 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 type CloseReply = oneshot::Sender<Result<(), MemberDiskError>>;
 
-// A direct domain caller can be dropped independently of the Pool root. Do
-// not leave coalesced followers waiting forever if the leader is dropped at
-// the initial yield, before it has taken ownership of the queued senders.
+// A failed/aborted domain worker must not orphan coalesced followers if its
+// leader disappears at the initial yield, before taking the queued senders.
 struct CloseLeader {
     queue: Arc<Mutex<Vec<(DiskUuid, CloseReply)>>>,
     armed: bool,

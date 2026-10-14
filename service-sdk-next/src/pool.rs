@@ -1,8 +1,11 @@
-//! Composition and routing. Each Pool has one independent Runtime root.
-use crate::{member_disk::*, process_manager::ProcessManager, runtime::*, vd::VdService};
+//! Pool is a composition/lifetime boundary, not a shared Future driver.
+use crate::{
+    member_disk::*,
+    process_manager::*,
+    runtime::{activity::*, *},
+    vd::{VdClient, VdService},
+};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::sync::Notify;
-
 #[cfg(test)]
 mod tests;
 
@@ -12,7 +15,6 @@ pub struct PoolConfig {
     pub retry_delay: Duration,
     pub max_retries: u32,
 }
-
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
@@ -22,20 +24,17 @@ impl Default for PoolConfig {
         }
     }
 }
-
 pub struct Pool {
-    id: Arc<str>,
+    id: String,
+    scope: ExecutionScope,
     disk: DiskService,
     vd: VdService,
     recovery_window: Duration,
-    changed: Arc<Notify>,
 }
-
 impl Pool {
-    /// Provider instances must already be scoped to this Pool. Local identity
-    /// checks cannot namespace a remote database or data-plane connection.
+    /// Providers must already be scoped to this Pool's external namespace.
     pub fn new(
-        id: impl Into<Arc<str>>,
+        id: impl Into<String>,
         disks: impl IntoIterator<Item = MemberDisk>,
         metadata: Arc<dyn MemberDiskMetadata>,
         nodes: Arc<dyn PoolNodes>,
@@ -44,11 +43,12 @@ impl Pool {
     ) -> Result<Self, MemberDiskError> {
         let id = id.into();
         if id.trim().is_empty() {
-            return Err(MemberDiskError::InvalidRequest("Pool ID is empty"));
+            return Err(MemberDiskError::InvalidRequest("empty Pool ID"));
         }
-        let changed = Arc::new(Notify::new());
+        let scope = ExecutionScope::default();
         let disk = DiskService::new(
-            id.clone(),
+            &id,
+            scope.clone(),
             disks,
             metadata,
             nodes,
@@ -56,40 +56,102 @@ impl Pool {
                 retry_delay: config.retry_delay,
                 max_retries: config.max_retries,
             },
-            changed.clone(),
         )?;
-        let vd = VdService::new(id.clone(), disk.identity(), vd, changed.clone());
+        let vd = VdService::new(scope.clone(), vd);
         Ok(Self {
             id,
+            scope,
             disk,
             vd,
             recovery_window: config.recovery_window,
-            changed,
         })
     }
     pub fn id(&self) -> &str {
         &self.id
     }
-    pub fn disks(&self) -> DiskService {
-        self.disk.clone()
-    }
-    pub fn virtual_disks(&self) -> VdService {
-        self.vd.clone()
-    }
-    pub fn start(self, config: ServiceConfig) -> ServiceInstance<ProcessManager> {
-        spawn_service(
-            ProcessManager::new(self.disk, self.vd, self.recovery_window, self.changed),
-            config,
-        )
+    pub fn start(self, config: ServiceConfig) -> PoolInstance {
+        let disk = spawn_service(ActivityService::new(self.disk), config.clone());
+        let vd = spawn_service(ActivityService::new(self.vd), config.clone());
+        let workflows = spawn_service(ProcessManager::new(self.scope.clone()), config);
+        let handle = PoolHandle {
+            id: self.id,
+            recovery_window: self.recovery_window,
+            client: workflows.client.clone(),
+            control: workflows.control.clone(),
+            observer: workflows.observer.clone(),
+            disks: DiskClient(ActivityClient::new(disk.client.clone(), self.scope.clone())),
+            virtual_disks: VdClient(ActivityClient::new(vd.client.clone(), self.scope)),
+            disk_control: disk.control.clone(),
+            disk_observer: disk.observer.clone(),
+            vd_control: vd.control.clone(),
+            vd_observer: vd.observer.clone(),
+        };
+        PoolInstance {
+            handle,
+            workflows,
+            disk,
+            vd,
+        }
     }
 }
-
+#[derive(Clone)]
 pub struct PoolHandle {
+    pub id: String,
+    pub recovery_window: Duration,
     pub client: ServiceClient<ProcessManager>,
+    /// Controls only workflow scheduling, NOT the domain runtimes.
     pub control: ServiceControl,
-    pub observer: ServiceObserver<crate::process_manager::ProcessSnapshot>,
+    pub observer: ServiceObserver<ProcessSnapshot>,
+    pub disks: DiskClient,
+    pub virtual_disks: VdClient,
+    pub disk_control: ServiceControl,
+    pub disk_observer: ServiceObserver<ActivitySnapshot>,
+    pub vd_control: ServiceControl,
+    pub vd_observer: ServiceObserver<ActivitySnapshot>,
 }
-
+pub struct PoolInstance {
+    pub handle: PoolHandle,
+    workflows: ServiceInstance<ProcessManager>,
+    disk: ServiceInstance<ActivityService<DiskService>>,
+    vd: ServiceInstance<ActivityService<VdService>>,
+}
+async fn stop<S: Service>(instance: &mut ServiceInstance<S>) -> Result<(), PoolManagerError> {
+    if instance.observer.snapshot().lifecycle != Lifecycle::Stopped {
+        instance
+            .control
+            .stop()
+            .await
+            .map_err(PoolManagerError::Control)?;
+    }
+    instance
+        .task
+        .join()
+        .await
+        .map_err(|e| PoolManagerError::RootFailed(e.to_string()))
+}
+impl PoolInstance {
+    /// Keep the workers alive until all workflow activities settle. Safe to
+    /// cancel this waiting future and retry; task ownership stays in Self.
+    pub async fn shutdown(&mut self) -> Result<(), PoolManagerError> {
+        // Paused workers may own already accepted requests. Let their drivers
+        // observe cancellation/settle those requests before awaiting the manager.
+        for control in [
+            (&self.disk.control, self.disk.observer.snapshot().lifecycle),
+            (&self.vd.control, self.vd.observer.snapshot().lifecycle),
+        ] {
+            if control.1 == Lifecycle::Paused {
+                control
+                    .0
+                    .resume()
+                    .await
+                    .map_err(PoolManagerError::Control)?;
+            }
+        }
+        stop(&mut self.workflows).await?;
+        stop(&mut self.disk).await?;
+        stop(&mut self.vd).await
+    }
+}
 #[derive(Debug)]
 pub enum PoolManagerError {
     DuplicatePool(String),
@@ -97,14 +159,10 @@ pub enum PoolManagerError {
     Control(ControlError),
     RootFailed(String),
 }
-
-/// Owns root task lifetimes; routes by explicit Pool identity. No disk/BG
-/// workflow or resource policy is implemented here.
 #[derive(Default)]
 pub struct PoolManager {
-    pools: BTreeMap<String, ServiceInstance<ProcessManager>>,
+    pools: BTreeMap<String, PoolInstance>,
 }
-
 impl PoolManager {
     pub fn insert(
         &mut self,
@@ -119,39 +177,20 @@ impl PoolManager {
         self.get(&id)
     }
     pub fn get(&self, id: &str) -> Result<PoolHandle, PoolManagerError> {
-        let instance = self
-            .pools
+        self.pools
             .get(id)
-            .ok_or_else(|| PoolManagerError::UnknownPool(id.into()))?;
-        Ok(PoolHandle {
-            client: instance.client.clone(),
-            control: instance.control.clone(),
-            observer: instance.observer.clone(),
-        })
+            .map(|p| p.handle.clone())
+            .ok_or_else(|| PoolManagerError::UnknownPool(id.into()))
     }
     pub fn ids(&self) -> Vec<String> {
         self.pools.keys().cloned().collect()
     }
-
-    /// Keep ownership while waiting, so cancellation of this management call
-    /// does not implicitly abort the Pool or remove its route.
     pub async fn remove(&mut self, id: &str) -> Result<(), PoolManagerError> {
-        let instance = self
-            .pools
+        self.pools
             .get_mut(id)
-            .ok_or_else(|| PoolManagerError::UnknownPool(id.into()))?;
-        if instance.observer.snapshot().lifecycle != Lifecycle::Stopped {
-            instance
-                .control
-                .stop()
-                .await
-                .map_err(PoolManagerError::Control)?;
-        }
-        instance
-            .task
-            .join()
-            .await
-            .map_err(|e| PoolManagerError::RootFailed(e.to_string()))?;
+            .ok_or_else(|| PoolManagerError::UnknownPool(id.into()))?
+            .shutdown()
+            .await?;
         self.pools.remove(id);
         Ok(())
     }

@@ -5,6 +5,7 @@ use service_sdk_next::{
     pool::{Pool, PoolConfig, PoolManager},
     process_manager::*,
     runtime::ServiceConfig,
+    workflows,
 };
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -68,38 +69,30 @@ async fn main() {
         .insert(make_pool("pool-b"), ServiceConfig::default())
         .unwrap();
     a.client
-        .call(ProcessCommand::ApplyEvents(vec![DiskEvent {
-            disk: "disk-1".into(),
-            state: PhysicalState::Down,
-            observed_at: now_millis(),
-        }]))
+        .call(ProcessCommand::Start(workflows::offline(
+            &a,
+            "disk-1".into(),
+        )))
         .await
         .unwrap();
-    let ProcessQueryReply::Disk(Some(a_disk)) = a
-        .client
-        .query(ProcessQuery::Get("disk-1".into()))
-        .await
-        .unwrap()
-    else {
-        panic!()
-    };
-    let ProcessQueryReply::Disk(Some(b_disk)) = b
-        .client
-        .query(ProcessQuery::Get("disk-1".into()))
-        .await
-        .unwrap()
-    else {
-        panic!()
-    };
+    let a_disk = a.disks.get("disk-1".into()).await.unwrap();
+    let b_disk = b.disks.get("disk-1".into()).await.unwrap();
     assert_eq!(a_disk.state(), MemberDiskState::Removed);
     assert_eq!(b_disk.state(), MemberDiskState::UpActive);
     println!("pool-a: {:?}, pool-b: {:?}", a_disk.state(), b_disk.state());
     manager.remove("pool-a").await.unwrap();
-    let allocation = b
-        .client
-        .call(ProcessCommand::Allocate(AllocateBlocks { count: 2 }))
+    let disks = b.disks.clone();
+    b.client
+        .call(ProcessCommand::Start(WorkflowTask::new(
+            "allocate",
+            vec![workflows::disk_collection()],
+            move |mut ctx| async move {
+                let blocks = disks.allocate(&mut ctx, 2).await?;
+                println!("pool-a stopped; pool-b still allocates: {blocks:?}");
+                Ok(())
+            },
+        )))
         .await
         .unwrap();
-    println!("pool-a stopped; pool-b still allocates: {allocation:?}");
     manager.remove("pool-b").await.unwrap();
 }

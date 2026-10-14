@@ -1,7 +1,7 @@
+pub mod activity;
 mod api;
 mod lifecycle;
 mod runs;
-pub mod workflow;
 
 pub use api::{
     CallError, CommandId, CommandReply, ControlError, IncomingCommand, RuntimeSnapshot,
@@ -22,9 +22,8 @@ use tokio::{
 
 /// Business hooks invoked by the fixed service runtime.
 ///
-/// Low-level host adapter retained for custom services and examples. Workflow
-/// hosts delegate execution bookkeeping to `workflow::Workflows`; business
-/// steps themselves are ordinary async functions, not per-step callbacks.
+/// Shared execution mechanism for workflow managers and domain activity services.
+/// Every spawned service owns a distinct mailbox, lifecycle and Future driver.
 pub trait Service: Send + 'static {
     type Command: Send + 'static;
     type CommandReply: Send + 'static;
@@ -103,10 +102,12 @@ pub struct ServiceTask {
 
 impl ServiceTask {
     pub async fn join(&mut self) -> Result<(), JoinError> {
-        match self.handle.take() {
+        let result = match self.handle.as_mut() {
             Some(handle) => handle.await,
-            None => Ok(()),
-        }
+            None => return Ok(()),
+        };
+        self.handle.take();
+        result
     }
 
     pub fn abort(&mut self) {

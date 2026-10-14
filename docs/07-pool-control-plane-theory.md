@@ -9,11 +9,10 @@
 文档性质：内部架构立场论文，未经同行评审；用于统一理论语言、约束后续设计，不替代具体功能规格和验证。
 
 > 实现注记（2026-10-13）：本文保留理论推导和历史切片，不能作为当前 API 说明。
-> 当前最小实现以 [`service-sdk-next`](../service-sdk-next/README.md) 为准：Workflow 直接
-> await Activity，Runtime 管理执行目录、资源占用和取消。已移除 Command/Request 队列
-> 与 Action 分发；领域状态权威和提交后发布原则保留，不提供持久化重放。
-> 2026-10-14 的[正式分层](proposals/2026-10-14-pool-process-manager.md)进一步将流程目录
-> 移到每个 Pool 的 ProcessManager，资源预约留在领域；Runtime 只提供执行机制。
+> 当前实现以 [`service-sdk-next`](../service-sdk-next/README.md) 和
+> [2026-10-14 重建规格](proposals/2026-10-14-generic-workflow-manager.md) 为准：
+> Pool 内通用 Workflow 管理者集中负责对象互斥；各领域独立 Runtime 提供 Activity。
+> 领域不再自建资源预约队列；领域状态权威和提交后发布原则保留，不提供持久化重放。
 
 ## 摘要
 

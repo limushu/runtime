@@ -1,4 +1,3 @@
-pub(crate) mod admission;
 mod effects;
 mod error;
 mod model;
@@ -14,4 +13,6 @@ pub use ports::{
     DiskOpenResult, DiskStateChange, MemberDiskCommit, MemberDiskMetadata, PoolNodes, PortError,
     VirtualDisks,
 };
-pub use service::{DiskConfig, DiskService, DrainProof, DrainTicket};
+pub use service::{
+    DiskClient, DiskConfig, DiskReply, DiskRequest, DiskService, DrainProof, DrainTicket,
+};

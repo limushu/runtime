@@ -4,6 +4,7 @@ use service_sdk_next::{
     pool::{Pool, PoolConfig},
     process_manager::*,
     runtime::ServiceConfig,
+    workflows,
 };
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -52,7 +53,7 @@ impl VirtualDisks for DemoPorts {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let ports = Arc::new(DemoPorts);
-    let service = Pool::new(
+    let mut service = Pool::new(
         "pool-1",
         vec![
             MemberDisk::new("disk-a".into(), "pool-1", 32),
@@ -69,32 +70,29 @@ async fn main() {
     .unwrap()
     .start(ServiceConfig::default());
 
-    let allocation = service
-        .client
-        .call(ProcessCommand::Allocate(AllocateBlocks { count: 4 }))
+    let h = &service.handle;
+    let disks = h.disks.clone();
+    h.client
+        .call(ProcessCommand::Start(WorkflowTask::new(
+            "allocate",
+            vec![workflows::disk_collection()],
+            move |mut ctx| async move {
+                println!("ALLOCATED {:?}", disks.allocate(&mut ctx, 4).await?);
+                Ok(())
+            },
+        )))
         .await
         .unwrap();
-    println!("ALLOCATED {allocation:?}");
-
-    let offline = service
-        .client
-        .call(ProcessCommand::ApplyEvents(vec![
-            DiskEvent {
-                disk: "disk-a".into(),
-                state: PhysicalState::Down,
-                observed_at: now_millis(),
-            },
-            DiskEvent {
-                disk: "disk-b".into(),
-                state: PhysicalState::Down,
-                observed_at: now_millis(),
-            },
-        ]))
-        .await
-        .unwrap();
-    println!("OFFLINE   {offline:#?}");
-
-    println!("SNAPSHOT  {:#?}", service.observer.snapshot());
-    service.control.drain().await.unwrap();
-    service.join().await.unwrap();
+    for disk in ["disk-a", "disk-b"] {
+        h.client
+            .submit(ProcessCommand::Start(workflows::offline(h, disk.into())))
+            .await
+            .unwrap();
+    }
+    h.control.drain().await.unwrap();
+    println!("WORKFLOWS {:#?}", h.observer.snapshot());
+    println!("DISKS     {:#?}", h.disks.list().await.unwrap());
+    println!("DISK RUNTIME {:?}", h.disk_observer.snapshot());
+    println!("VD RUNTIME   {:?}", h.vd_observer.snapshot());
+    service.shutdown().await.unwrap();
 }

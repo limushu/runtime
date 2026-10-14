@@ -2,9 +2,9 @@
 
 版本：`Baseline B0.7`
 
-状态：理论基线 + Pool/ProcessManager + MemberDisk 纵切面。完整 VD/BG、Node 领域仍待实现。
+状态：理论基线 + 通用 Workflow 管理者 + 领域独立 Runtime。完整 VD/BG、Node 业务仍待实现。
 
-当前实现以 [2026-10-14 分层范围](proposals/2026-10-14-pool-process-manager.md) 和
+当前实现以 [2026-10-14 重建范围](proposals/2026-10-14-generic-workflow-manager.md) 和
 [service-sdk-next](../service-sdk-next/README.md) 为准，早期 Runtime 章节保留历史推导。
 
 ## 目的
@@ -69,11 +69,11 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **已确认：** 业务执行优先写成所属 Service 上的自然 `async fn`；跨服务通信通过明确目标实例的类型化 Service facade；请求不携带隐藏路由身份。
 - **当前实现：** 命令映射为普通 async Workflow；Query 直接读取已提交领域视图，不创建 Workflow。
 - **已确认：** MemberDisk 决策元数据、DiskMap 输入事实、派生运行状态和在途意图是不同信息，不得用单一状态枚举替代完整实体。
-- **当前实现：** Workflow 直接 await 类型化 Activity；已移除 CommandTable、RequestTable、RequestPhase 和 Action 枚举分发。
-- **当前实现：** 每个 Pool 的 ProcessManager 拥有流程目录、生命周期冲突策略和结果；Runtime 提供机械执行，领域保护实际资源。
-- **当前实现：** PoolManager 持有各 Pool 根任务并按 ID 路由；每 Pool 一个独立根 task。Workflow/领域 async 调用共用 Future driver，无每盘 task。
-- **当前实现：** DiskService 私有持有目录并独立保护资源，按“预校验 -> SDB 确认 -> 发布内存”修改；目录锁不跨 await，资源预约跨 await。
-- **当前实现：** 同盘流程准入和 DOWN 取消本 Pool Shrink 由 ProcessManager 决定；领域负责同盘修改与空间操作互斥，长流程等待不占全局空间锁。
+- **当前实现：** Workflow await 类型化 Activity；步骤通过消息在领域独立 Runtime 内执行，再将结果返回流程。
+- **当前实现：** Pool 内的通用 ProcessManager 接受任意流程函数，统一管理对象集合互斥、执行、取消和结果，不导入领域类型。
+- **当前实现：** PoolManager 持有并路由 Pool；每 Pool 当前有管理者、DiskService、VdService 三个独立 Runtime 根 task，不共用 Future driver。
+- **当前实现：** DiskService 私有持有目录并校验不变量，按“预校验 -> SDB 确认 -> 发布内存”修改；没有对象锁/资源预约队列。
+- **当前实现：** Workflow 一次声明完整对象集合，锁持有整个流程。Allocate/Release 声明 disk 集合独占，保守等待磁盘生命周期流程结束。无自动 UP/DOWN 抢占，取消显式请求。
 - **当前实现：** 元数据错误默认按结果不明处理；只有 provider 确认可重试才重试。panic 或不明提交阻塞相关资源；未执行的等待项不会扩大阻塞范围。
 - **当前实现：** BLK 分配/释放按盘提交，只重试未提交部分；失败或取消返回已提交进度。当前示例未实现 Tier/故障域筛选。
 - **当前实现：** VdService 输出绑定 Pool 实例、盘和领域版本的排空凭据；生产 provider 仍须保证持续引用屏障。完整 BG/Node、fencing 和切主恢复未实现。
