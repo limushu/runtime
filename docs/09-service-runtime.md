@@ -1,6 +1,14 @@
 # Service Runtime：生命周期、任务与观测
 
-状态：`B0.7 已实现`。
+状态：`B0.7 历史设计`。
+
+> 2026-10-13 实现基线已经切换到本地 Workflow + Activity：
+> [`service-sdk-next`](../service-sdk-next/README.md)。本章保留早期设计推导，涉及
+> `ManagedService`、`OperationContext`、`TaskAttempt` 和 `ObjectTaskCoordinator` 的代码接口
+> 不再代表当前实现。2026-09-14 的 Command/Request/Action 流水线也已移除。
+> 2026-10-14 用户纠正后的当前模型：Pool 内通用 ProcessManager 推进 Workflow 并统一管理对象互斥；
+> 每个领域使用独立 Runtime 执行 Activity，不再拥有对象预约队列，也不共用 Pool driver。
+> 参见[当前范围与验收](proposals/2026-10-14-generic-workflow-manager.md)；尚无持久化重放能力。
 
 本章定义 Pool 内领域 Service 共用的运行组件。它解决的是“服务如何运行和被管理”，而不是
 “某个业务下一步应该做什么”。MemberDisk 是第一个适配者，Node、VD、BG 可以复用同一

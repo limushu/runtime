@@ -1,5 +1,32 @@
 # 决策与待决问题
 
+## 2026-10-14 用户纠正后重建
+
+取代下节分层：Pool 内使用通用 Workflow 管理者推进任意流程，并集中管理对象集合互斥。
+每个领域是独立运行的服务，拥有自己的 Runtime；领域只提供步骤能力和状态/提交校验，
+不再拥有对象冲突仲裁。第一版采用整个 Workflow 的静态对象集合锁。
+实现、取舍和验证见[重建规格](proposals/2026-10-14-generic-workflow-manager.md)。
+
+## 2026-10-14 首版 ProcessManager（已被上节取代）
+
+PoolManager 拥有并路由独立 Pool 根任务；每个 Pool 的 ProcessManager 管理完整操作，
+具名 Workflow 调用 DiskService/VdService 能力。流程冲突归应用，资源冲突归领域，
+Runtime 复用执行机制。DiskService 不再持有流程目录，Activity 也不再拥有目录。
+全局空间占用仅覆盖实际分配/释放或磁盘修改，不覆盖恢复等待或 VD 排空全过程。
+排空凭据增加 Pool 实例、盘和提交版本校验；生产引用屏障仍为 provider 契约。
+详见[历史范围与证据](proposals/2026-10-14-pool-process-manager.md)。
+后续章节中的具体旧接口是历史记录，不代表 Node/BG/持久化恢复已经实现。
+
+## 2026-10-13 实现调整
+
+用户已批准在 service-sdk-next 中以本地 Workflow + Activity 替换请求流水线。
+Workflow 表达过程，Activity 保护领域提交，Runtime 统一执行目录与资源占用；
+旧 CommandTable/RequestTable/Action 分发不再是当前实现。既有领域安全不变量保留。
+这不确认切主恢复或持久化重放设计。独立 ProcessManager 与 temporal_process 示例保留，
+但不作为正式库能力。[范围、验收和证据](proposals/2026-10-13-local-workflows.md)。
+
+下文为既有领域决策和历史运行时讨论；涉及具体执行 API 时以上述新基线为准。
+
 ## 已确认决策
 
 ### D-001 中心化 Monitor

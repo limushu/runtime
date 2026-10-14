@@ -2,7 +2,10 @@
 
 版本：`Baseline B0.7`
 
-状态：理论基线 + MemberDisk 最小纵切面。PoolManager、Pool 装配和其他领域仍待实现。
+状态：理论基线 + 通用 Workflow 管理者 + 领域独立 Runtime。完整 VD/BG、Node 业务仍待实现。
+
+当前实现以 [2026-10-14 重建范围](proposals/2026-10-14-generic-workflow-manager.md) 和
+[service-sdk-next](../service-sdk-next/README.md) 为准，早期 Runtime 章节保留历史推导。
 
 ## 目的
 
@@ -64,18 +67,17 @@ PlantUML 源文件位于 [`diagrams/`](diagrams/)，渲染后的图片位于 [`a
 - **已确认：** Monitor 全局层的 `PoolManager` 负责 Pool 生命周期和路由；每个 Pool 是独立业务对象、内存隔离与管控边界，通用 Runtime 只是各领域 Service 的内部执行机制。
 - **已确认：** 核心业务状态只属于领域对象；Operation Context 不建立第二套 `phase/status` 业务状态机。
 - **已确认：** 业务执行优先写成所属 Service 上的自然 `async fn`；跨服务通信通过明确目标实例的类型化 Service facade；请求不携带隐藏路由身份。
-- **已确认：** 每个请求都是 Future，但只有需要审计或命令式并发控制的操作才创建受管 Task；Query 直接执行。
-- **当前实现：** `ServiceClient::call(Request)` 通过统一 Request/Reply Envelope 和单一 oneshot 通信，`CallError` 分离框架、业务、handler panic 与强制 abort；MemberDisk facade 提供保留 `OperationContext` 的 `_in` 调用，内部采用 `Client -> ServiceRuntime root -> MemberDiskService::handle -> executable state table`，不实现通用 ActionFlow DSL。
-- **当前实现：** DOWN、UP、Shrink 是同一个 `MemberDiskEvent` 的变体；物理事件保存在每盘 active/pending 槽中而不写入 MemberDisk，Shrink 第一步提交持久化管理意图；不同事件请求当前 step 稳定停止。
-- **当前实现：** `ServiceRuntime` 为每个服务实例创建唯一根执行单元，统一 poll 请求 Future，不为每个硬盘创建 Tokio task。
-- **当前实现：** `ObjectTaskCoordinator<DiskUuid, MemberDiskEvent, Error>` 保存盘级 active/pending 输入、取消控制和等待者；MemberDisk 以一个普通函数声明冲突策略，执行槽不复制业务状态。
+- **当前实现：** 命令映射为普通 async Workflow；Query 直接读取已提交领域视图，不创建 Workflow。
 - **已确认：** MemberDisk 决策元数据、DiskMap 输入事实、派生运行状态和在途意图是不同信息，不得用单一状态枚举替代完整实体。
-- **当前实现：** 仓库只有一个 `pool-control-plane` crate；`MemberDiskService` 私有持有对象目录，并通过统一的“校验 -> SDB -> 内存”路径修改。
-- **当前实现：** `reconcile_once` 直接穷举 `(MemberDiskState, active MemberDiskEvent, shrink_requested)`；分支用普通 `await` 调用一个业务 action，再验证声明的结束状态。`Transitioned` 重新读取权威状态并继续同一事件，`Stable` 结束驱动，不存在 Action enum、执行转发表或隐藏兜底分支。
-- **当前实现：** VDM 是 BG 引用关系的权威来源；排空完成不能只相信一次 Future 返回，必须通过 `has_references` 验证。该查询只发生在需要排空的转换中，不会把不可失败的 DOWN 边界耦合到 VDM 可用性。
-- **当前实现：** `SetDiskState::Down` 同时表示通知 DOWN 和停止 IO；Shrink 期间 DOWN 会先让当前 VDm step 协作稳定退出，再从对象真实状态继续。
-- **当前实现：** BLK 申请是 MemberDisk 领域的 typed Request，按 Tier 和可选故障域选择成员盘，SDB 提交后发布内存，不进入 DiskUuid 生命周期槽。
-- **当前实现：** 公共 Runtime 已提供独立业务/控制通道、完整 Service 生命周期、Idle/Busy、可选 Task、Trace、精确取消、结构化快照/事件和根任务强制回收，并由 MemberDisk 纵切面接入验证；第二个真实领域仍用于检验抽象的泛化边界，而不是决定这些机制是否存在。
+- **当前实现：** Workflow await 类型化 Activity；步骤通过消息在领域独立 Runtime 内执行，再将结果返回流程。
+- **当前实现：** Pool 内的通用 ProcessManager 接受任意流程函数，统一管理对象集合互斥、执行、取消和结果，不导入领域类型。
+- **当前实现：** PoolManager 持有并路由 Pool；每 Pool 当前有管理者、DiskService、VdService 三个独立 Runtime 根 task，不共用 Future driver。
+- **当前实现：** DiskService 私有持有目录并校验不变量，按“预校验 -> SDB 确认 -> 发布内存”修改；没有对象锁/资源预约队列。
+- **当前实现：** Workflow 一次声明完整对象集合，锁持有整个流程。Allocate/Release 声明 disk 集合独占，保守等待磁盘生命周期流程结束。无自动 UP/DOWN 抢占，取消显式请求。
+- **当前实现：** 元数据错误默认按结果不明处理；只有 provider 确认可重试才重试。panic 或不明提交阻塞相关资源；未执行的等待项不会扩大阻塞范围。
+- **当前实现：** BLK 分配/释放按盘提交，只重试未提交部分；失败或取消返回已提交进度。当前示例未实现 Tier/故障域筛选。
+- **当前实现：** VdService 输出绑定 Pool 实例、盘和领域版本的排空凭据；生产 provider 仍须保证持续引用屏障。完整 BG/Node、fencing 和切主恢复未实现。
+- **当前实现：** 普通执行终态保留最近 256 项，恢复阻塞不淘汰；无持久化历史或重放。独立持久化示例不改变该边界。
 - **待决：** Tier、PoolCore、Rebuild 的最终服务粒度，以及 Monitor 切主时在途操作恢复协议。
 
 ## 基线完成标准

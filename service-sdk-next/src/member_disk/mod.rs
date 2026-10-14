@@ -1,16 +1,18 @@
+mod effects;
 mod error;
 mod model;
 mod ports;
 mod service;
-mod state_machine;
 
-pub use error::MemberDiskServiceError;
+pub use error::MemberDiskError;
 pub use model::{
-    DiskIoState, DiskUuid, EpochMillis, MemberDiskCommand, MemberDiskMutation, MemberDiskQuery,
-    MemberDiskQueryReply, MemberDiskReply, MemberDiskSeed, MemberDiskState,
+    AllocatedBlock, AllocationState, BlockId, DiskUuid, IoState, MemberDisk, MemberDiskChange,
+    MemberDiskState,
 };
-pub use ports::{MemberDiskMetadata, PoolNodes, PortError, VirtualDisks};
-pub use service::{MemberDiskConfig, MemberDiskService};
-
-#[cfg(test)]
-mod tests;
+pub use ports::{
+    DiskOpenResult, DiskStateChange, MemberDiskCommit, MemberDiskMetadata, PoolNodes, PortError,
+    VirtualDisks,
+};
+pub use service::{
+    DiskClient, DiskConfig, DiskReply, DiskRequest, DiskService, DrainProof, DrainTicket,
+};

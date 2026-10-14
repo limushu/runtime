@@ -1,99 +1,128 @@
 # Service SDK Next
 
-这是一个独立实验目录，不修改现有 `src/member_disk`。目标不是建立业务框架宇宙，
-而是只回答一个问题：**Pool 内的领域服务应具备哪些统一能力，业务开发者又只需要写什么？**
+当前模型：**Pool 内通用 Workflow 管理者 + 各领域独立 Runtime**。
+本次推倒旧的“磁盘专用 ProcessManager / 领域内部资源预约 / Pool 共用 driver”设计。
 
-## 一条边界
-
-```text
-外部
-  ├─ Query   ───────> 只读查询
-  ├─ Command ───────> 准入 -> Future -> 完成
-  └─ Control ───────> Pause / Resume / Drain / Stop
-                         │
-                    Service SDK
-                         │
-              MemberDiskService（私有数据）
-                         │
-              显式状态转换 + await 业务动作
-```
-
-外部拿不到 `MemberDisk`、对象表或锁。读操作通过 `Query`，写操作通过
-`Command`。`ServiceEndpoint` 只是通道的薄封装，不承载业务规则。
-
-## Service 契约
-
-每个领域服务实现同一个 `Service` trait：
-
-| 业务实现 | 含义 |
-|---|---|
-| `name` | 服务名 |
-| `command_key` | 哪个对象拥有本次命令；SDK 据此建立单对象执行槽 |
-| `admit` | 业务冲突规则，只回答 Run / Join / Queue / Replace / Complete |
-| `handle_query` | 查询私有数据，不创建业务任务 |
-| `handle_command` | 普通的 async 业务入口，可直接使用 `await` |
-| `task_snapshots` | 业务主动投影它认可的 Task；SDK 不暗中制造业务 Task |
-| `initialize` / `shutdown` | 可选的业务启停钩子 |
-
-SDK 默认实现并统一管理：
-
-- 一个根 Tokio task 和一个 `FuturesUnordered` 驱动集合；
-- Query、Command、Control 三条语义不同的通道；
-- `Initializing / Running / Paused / Draining / Stopping / Stopped / Failed`；
-- 每对象一个执行槽，以及合并、排队、替换的机械动作；
-- 协作取消：替换命令只设置当前 Execution 的 token，旧 Future 在稳定边界返回后才启动替代者；
-- 两层观测：SDK 报告正在轮询的 Execution，业务通过 `task_snapshots()` 报告业务 Task。
-
-这里没有通用状态机 trait，也没有通用 Action DSL。状态机是 MemberDisk 的业务知识，
-SDK 只驱动它返回的 Future。
-
-## MemberDisk 如何接入
-
-`MemberDiskService` 自己保存私有 `HashMap<DiskUuid, MemberDisk>`，并实现：
+## 从这里读
 
 ```text
-Command
-  -> admit：读取同一 disk 的当前 Execution，给出冲突决定
-  -> handle_command：显式登记一个领域 Task
-  -> reconcile_once：读取已提交的 MemberDisk 状态
-  -> 执行一个动作并 await
-  -> SDB commit 成功后更新内存
-  -> 回到 reconcile_once，直到稳态
+PoolManager：路由和生命周期
+└─ Pool：实例隔离与组合
+   ├─ ProcessManager + Runtime：通用流程推进、对象集合互斥、取消、结果
+   ├─ DiskService + Runtime：独立消息队列、执行、查询、磁盘状态和提交
+   └─ VdService + Runtime：独立消息队列、执行、排空能力
 ```
 
-状态转换按起始状态拆开，见 `src/member_disk/state_machine.rs`。例如普通下盘：
+不是一个 Pool 一个 driver；当前每 Pool 三个独立根 task。
+它们可以运行在同一个 Tokio executor 上；独立 Runtime 不等于独占线程。
+新增领域沿用 ActivityHandler/ActivityService，不需要修改 ProcessManager。
+新增 Workflow 是普通 async 函数，不需要扩展磁盘命令枚举。
 
-```text
-UpActive
-  -- DiskDown / 停 IO 并广播 DOWN（必须完成） --> DownActive
-  -- 等待恢复窗口（可协作取消）              --> DownInactive
-  -- 请求 VDM 排空所有 BG                    --> DownInactive
-  -- 无 BG 引用后提交 Remove                  --> Removed
+| 文件 | 职责 |
+| --- | --- |
+| [process_manager/mod.rs](src/process_manager/mod.rs) | 接受任意 WorkflowTask；统一准入、执行目录、FIFO、取消、恢复阻塞 |
+| [process_manager/objects.rs](src/process_manager/objects.rs) | 对象命名空间、集合/单对象、共享/独占 |
+| [process_manager/context.rs](src/process_manager/context.rs) | Workflow 上下文、暂停/计时、Activity 执行许可与停稳追踪 |
+| [runtime/activity.rs](src/runtime/activity.rs) | 每个领域独立的消息入口和 Future driver；无对象冲突队列 |
+| [member_disk/service.rs](src/member_disk/service.rs) | 领域状态、类型化能力、预校验、提交后发布 |
+| [vd.rs](src/vd.rs) | 独立 VD 服务及排空端口适配 |
+| [workflows.rs](src/workflows.rs) | 磁盘离线、上线、缩容定义，属于应用流程而非管理者 |
+| [pool.rs](src/pool.rs) | 装配三个 Runtime，路由、先收敛 Workflow 再停止领域 |
+
+## 通用提交与具体步骤
+
+```rust,ignore
+// manager 不认识这个名称，也不需要知道磁盘命令类型。
+let disks = handle.disks.clone();
+let task = WorkflowTask::new(
+    "allocate",
+    vec![ObjectClaim::exclusive(ObjectKey::collection("disk"))],
+    move |mut ctx| async move {
+        let blocks = disks.allocate(&mut ctx, 4).await?;
+        // 消费类型化结果；也可以通过应用的 oneshot 返回业务输出。
+        Ok(())
+    },
+);
+handle.client.call(ProcessCommand::Start(task)).await?;
 ```
 
-上线与下盘冲突时，SDK 设置下盘 Execution 的取消 token。停 IO 这个安全动作不观察
-该 token；完成并提交 DOWN 后，统一驱动循环在稳定边界发现取消并返回，然后同一对象槽
-才启动 UP。业务开发者不需要在每个小动作中反复写 `is_cancelled()`。
+`submit(Start(task))` 返回接收的 CommandId；`call(Start(task))` 等待整个流程及其
+已派发 Activity 停稳。`Cancel(id)` 请求协作取消，不代表取消已经完成。
+`query(())` 查询执行状态和最终错误；磁盘查询使用 `handle.disks.get/list`。
+业务步骤得到类型化结果/错误；管理者只记录通用成功/失败，不引入领域结果大枚举。
+如用应用输出通道，读到输出不等同于 Workflow 已终结，应同时等待管理者完成。
 
-Shrink 是持久化目标：先提交 `RequestShrink`，随后禁止分配、排空 BG、停 IO、移除。
-Shrink 途中收到 DOWN 时，DOWN 替换当前 Future，先完成安全停 IO；因为 shrink intent 已
-持久化，新 Future 会继续走到 `Removed`。UP 则排在 Shrink 后面，移除完成后按 rejoin 执行。
+## 对象互斥只在一个地方
 
-## Execution 与 Task
+Workflow 开始前声明完整对象集合；管理者一次性取得全部对象，持有到整个流程结束。
+同对象冲突 FIFO，不同对象并发；多个共享读可并发，独占写与读写均冲突。
+单对象与所属集合冲突；不同命名空间、不同 Pool 不冲突。
+第一版不动态扩锁，不自动抢占，不内置 DOWN/UP/Shrink 业务优先规则；
+调用方可以显式取消旧 Workflow，再等待对象交接。
 
-二者不能混为一谈：
+领域没有 Admission、每盘异步锁、空间占用队列。
+领域 Activity 声明自身需要的对象；客户端只校验当前 Workflow 的许可是否覆盖，
+以及是否属于同一 Pool 实例，不再竞争对象锁。同步目录 Mutex 仅保护短内存访问，
+不跨 await。只读查询可看到已提交状态，不保证跨多次查询的一致性快照。
 
-- **Execution**：SDK 正在 poll 的一次 Query/Command Future，用于看运行时是否忙、是否取消。
-- **Task**：业务认为值得展示和审计的工作。MemberDisk 在 `handle_command` 中自行登记；
-  简单 Query 不登记。以后一个重建 Execution 内部聚合多个硬盘，也完全可以只投影一个
-  “Pool 正在重建”的 Task。
+当前 Allocate/Release 保守要求整个 disk 集合独占。
+因此它会等待同 Pool 的磁盘生命周期 Workflow（包括恢复计时/排空）结束。
+这与被推翻版本的“等待期间仍允许其他磁盘分配”不同；将来可以细化对象集合。
+跨领域流程必须声明所有实际受影响对象；目前 VD 仅提供以磁盘为目标的排空端口，
+未来 BG 级能力必须声明对应 BG 对象，不能假定不同磁盘就天然没有 BG 冲突。
 
-## 运行验证
+## Activity 与安全取消
 
-```powershell
-$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER='rust-lld.exe'
-cargo +stable-x86_64-pc-windows-gnu test --manifest-path service-sdk-next/Cargo.toml --all-targets
+Workflow 顺序 await 类型化 Activity；实际副作用在领域自己的 Runtime 内执行，
+结果通过消息返回。这借鉴 [Temporal Workflow](https://docs.temporal.io/workflows) /
+[Activity](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/activities/workflow-activity.mdx)
+分工及[协作式取消](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/workflow/cancellation-and-termination.mdx)；
+对象锁是本项目语义，不是声称 Temporal 自带这些锁。
+
+- 取消传递到 Activity，等待领域返回稳定结果；已确认的最终提交可以成功。
+- 许可随已派发请求一起追踪，而不是随调用者的等待 Future 生存。
+  Workflow panic、丢弃等待 Future、提前返回，也必须等后台 Activity 停稳再交接对象。
+- 同一 Workflow 上下文不可 Clone；步骤借用可变上下文。不支持并发发起多个 Activity；
+  丢弃前一次等待后，其步骤未结束之前不能再发下一步。
+- 未知副作用、Activity/Workflow panic 保留对象恢复阻塞。即使 Workflow 忽略 Activity
+  的未知错误，也不能清除阻塞。被拒绝的等待者不会扩大恢复阻塞。
+- 领域仍校验不变量，按“预校验 → provider 确认 → 发布内存”执行；
+  只有明确未提交且可安全重试的错误才重试。不对整段 Workflow 自动重试。
+- BLK 部分成功保留 PartialSpace 类型化进度；排空凭据绑定 Pool 实例/盘/版本。
+  provider 必须提供持续引用屏障和正确的 Pool 外部命名空间。
+
+## 生命周期和边界
+
+`handle.control` 只控制 Workflow 管理者；`disk_control / vd_control` 分别控制领域。
+暂停管理者阻止下一个步骤，但已经发出的 Activity 继续执行和提交。
+暂停领域时，它拒绝新调用；不会自动重试或无限等待。
+Pool shutdown 让已暂停领域恢复处理已接收请求，然后请求 Workflow 取消并等停稳，
+最后停止所有领域。取消 shutdown/remove 的等待不会丢失 task 所有权，可以重试。
+
+强行 Drop PoolInstance/PoolManager 或 abort task 是强制回收，不能证明远端副作用终止。
+已持有的业务 client 不会自动路由到重建的同名 Pool。恢复阻塞没有“删记录即解锁”接口；
+生产重建前必须外部对账，不能将本地重建当作安全恢复机制。
+
+普通终态保留最近 256 项；恢复阻塞保留。队列背压目前只有有界消息通道，
+没有总在途流程/历史容量上限。一个 ExecutionScope 只能对应一个管理者；
+生产写路径必须全部通过这个管理者，不能在外部直接调用 provider。
+
+## 本次没有声称完成
+
+没有接入 Temporal 服务；没有历史持久化、确定性重放、切主恢复、Signal/Update、
+自动补偿、Activity 幂等键协议、生产限流或完整 BG/Node/Topology 领域实现。
+VdService 具有独立运行边界，但业务仍是排空端口适配，不是完整 BG 调度器。
+
+## 验证
+
+[重建范围与实测证据](../docs/proposals/2026-10-14-generic-workflow-manager.md)。
+
+```sh
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo run --example pools
+cargo run --example member_disk
 ```
 
-测试覆盖 Query 隔离、相同 DOWN 合并、UP 协作替换 DOWN、Shrink 完整转换、Shrink
-途中 DOWN、SDB-first 失败不发布内存，以及 Pause/Drain 生命周期。
+本机可用 GNU 工具链及 ASCII sysroot：
+`RUSTFLAGS=--sysroot C:\rustup-ascii\toolchains\stable-x86_64-pc-windows-gnu`。
