@@ -73,3 +73,17 @@ Pool 是实例隔离范围；Workflow 组织过程；Coordinator 统一管理执
 `cargo +stable-x86_64-pc-windows-gnu`，并设置
 `RUSTFLAGS=--sysroot C:\rustup-ascii\toolchains\stable-x86_64-pc-windows-gnu`。
 使用已有离线 registry 缓存，格式检查使用已安装的默认 rustfmt。
+
+## 2026-10-15 扩展：应用策略与协作暂停
+
+- 新增 AdmissionPolicy<D> 扩展点，应用自己定义描述和冲突原则，Runtime 只执行决定。
+  所有准入决定串行、完整评估；容量或任一拒绝时不取消旧工作；策略 panic 拒绝本次输入。
+  CancelExisting 只发取消，不早释对象、不越过旧 Activity 的停稳，也不解除不确定阻塞。
+- 新增 pause / wait_paused / resume / safe_point。请求和确认分离；不抢停在途 IO，
+  在下一执行边界确认暂停。暂停保留流程对象，完成步骤释放资源；资源等待可撤回。
+  Signal 有界缓存，Timer 截止时间继续流逝；取消和 shutdown 优先唤醒暂停。
+  最终成功已完成时不伪造暂停或取消结果；控制操作是进程内语义，不是崩溃恢复。
+- 业务方的领域决策读取通过只读 Activity；外部查询仍可独立观察。执行结果尚无持久历史。
+- 本轮原 26 项 + 新 7 项测试共 33 项通过，全部额外重复 10 轮通过；Clippy、rustfmt、
+  根项目 npm run verify 通过。新 storage-pool 的 26 项业务集成测试也全部通过。
+- 基础库仍然没有 Disk/VD/Node 业务依赖；Pool-specific policy 在相邻业务 crate 实现。

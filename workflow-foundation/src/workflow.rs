@@ -54,8 +54,55 @@ pub struct RunControl {
     signals: mpsc::Sender<Signal>,
     state: watch::Receiver<RunState>,
     max_signal_bytes: usize,
+    pause: watch::Sender<bool>,
 }
 impl RunControl {
+    /// Request a pause at the next safe boundary, not preemption of external IO.
+    pub fn pause(&self) -> Outcome<()> {
+        self.set_pause(true)
+    }
+    pub fn resume(&self) -> Outcome<()> {
+        self.set_pause(false)
+    }
+    fn set_pause(&self, value: bool) -> Outcome<()> {
+        if self.cancel.is_cancelled()
+            || matches!(self.state(), RunState::Completed | RunState::Failed(_))
+        {
+            return Err(Failure::Rejected("run is cancelled or terminal".into()));
+        }
+        self.pause.send_replace(value);
+        Ok(())
+    }
+    pub fn pause_requested(&self) -> bool {
+        *self.pause.borrow()
+    }
+    /// Cancellation-safe wait for acknowledgement, not merely request delivery.
+    pub async fn wait_paused(&self) -> Outcome<()> {
+        let mut state = self.state.clone();
+        let mut request = self.pause.subscribe();
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            if !*request.borrow_and_update() {
+                return Err(Failure::Rejected("pause request is not active".into()));
+            }
+            match state.borrow_and_update().clone() {
+                RunState::Paused => return Ok(()),
+                RunState::Completed | RunState::Failed(_) => {
+                    return Err(Failure::Rejected(
+                        "run ended before pause acknowledgement".into(),
+                    ));
+                }
+                _ => {}
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
+                changed = state.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                changed = request.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+            }
+        }
+    }
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
@@ -172,6 +219,8 @@ pub struct WorkflowContext {
     state: watch::Sender<RunState>,
     tracker: Tracker,
     next_activity: u64,
+    pause: watch::Receiver<bool>,
+    _pause_sender: watch::Sender<bool>,
 }
 impl WorkflowContext {
     pub fn id(&self) -> WorkflowId {
@@ -190,45 +239,76 @@ impl WorkflowContext {
             self.tracker.ready()
         }
     }
-    pub async fn next_signal(&mut self) -> Outcome<Signal> {
+    /// Cooperative boundary for custom computation; checkpoint() only checks cancel.
+    pub async fn safe_point(&mut self) -> Outcome<()> {
         self.checkpoint()?;
-        self.state.send_replace(RunState::WaitingSignal);
-        let result = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => Err(Failure::Cancelled),
-            signal = self.signals.recv() => signal.ok_or(Failure::Unavailable),
-        };
+        while *self.pause.borrow_and_update() {
+            self.state.send_replace(RunState::Paused);
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
+                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+            }
+            self.checkpoint()?;
+        }
         self.state.send_replace(RunState::Running);
-        result
+        Ok(())
+    }
+    pub async fn next_signal(&mut self) -> Outcome<Signal> {
+        loop {
+            self.safe_point().await?;
+            self.state.send_replace(RunState::WaitingSignal);
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
+                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                signal = self.signals.recv() => {
+                    let signal = signal.ok_or(Failure::Unavailable)?;
+                    self.safe_point().await?;
+                    return Ok(signal);
+                }
+            }
+        }
     }
     pub async fn sleep(&mut self, delay: Duration) -> Outcome<()> {
-        self.checkpoint()?;
-        self.state.send_replace(RunState::WaitingTimer);
-        let result = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => Err(Failure::Cancelled),
-            _ = tokio::time::sleep(delay) => Ok(()),
-        };
-        self.state.send_replace(RunState::Running);
-        result
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            self.safe_point().await?;
+            self.state.send_replace(RunState::WaitingTimer);
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
+                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                _ = tokio::time::sleep_until(deadline) => return self.safe_point().await,
+            }
+        }
     }
     pub async fn activity<S: DomainService>(
         &mut self,
         service: &ServiceClient<S>,
         request: S::Request,
     ) -> Outcome<S::Reply> {
-        self.checkpoint()?;
+        self.safe_point().await?;
         if !Arc::ptr_eq(&self.scope, &service.scope) {
             return Err(Failure::Rejected(
                 "service belongs to another Pool instance".into(),
             ));
         }
         let resources = S::resources(&request);
-        self.state.send_replace(RunState::WaitingResources);
-        let permit = self
-            .broker
-            .acquire(Kind::Activity, resources, &self.cancel)
-            .await?;
+        let permit = loop {
+            self.safe_point().await?;
+            self.state.send_replace(RunState::WaitingResources);
+            let broker = self.broker.clone();
+            tokio::select! {
+                biased;
+                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                permit = broker.acquire(Kind::Activity, resources.clone(), &self.cancel) => {
+                    let permit = permit?;
+                    if *self.pause.borrow() { drop(permit); continue; }
+                    break permit;
+                }
+            }
+        };
         self.checkpoint()?;
         self.next_activity += 1;
         let id = ActivityId {
@@ -303,6 +383,7 @@ pub(crate) fn execution<W: Workflow>(
     let (reply, result) = oneshot::channel();
     let (signals, signal_rx) = mpsc::channel(config.capacity);
     let (state, state_rx) = watch::channel(RunState::WaitingObjects);
+    let (pause, pause_rx) = watch::channel(false);
     let control = RunControl {
         id,
         name: W::NAME,
@@ -310,6 +391,7 @@ pub(crate) fn execution<W: Workflow>(
         signals: signals.clone(),
         state: state_rx,
         max_signal_bytes: config.max_signal_bytes,
+        pause: pause.clone(),
     };
     let mut completion = Completion {
         reply: Some(reply),
@@ -326,6 +408,8 @@ pub(crate) fn execution<W: Workflow>(
         state,
         tracker: Tracker::default(),
         next_activity: 0,
+        pause: pause_rx,
+        _pause_sender: pause,
     };
     let future = Box::pin(async move {
         // Include declaration/constructor panics in the workflow boundary.
@@ -342,8 +426,7 @@ pub(crate) fn execution<W: Workflow>(
                     .acquire(Kind::Workflow, objects, &context.cancel)
                     .await?,
             );
-            context.checkpoint()?;
-            context.state.send_replace(RunState::Running);
+            context.safe_point().await?;
             workflow.run(&mut context).await
         })
         .catch_unwind()

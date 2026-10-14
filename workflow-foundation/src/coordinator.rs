@@ -1,4 +1,5 @@
 use crate::{
+    admission::Admission,
     locks::{Broker, LockTable},
     model::Scope,
     service::{self, ServiceOwner},
@@ -7,7 +8,8 @@ use crate::{
 };
 use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -22,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 struct Submission {
     future: BoxFuture<'static, WorkflowId>,
     reply: oneshot::Sender<Outcome<()>>,
+    control: RunControl,
+    admission: Option<Admission>,
 }
 #[derive(Clone)]
 pub struct CoordinatorClient {
@@ -39,6 +43,26 @@ impl CoordinatorClient {
         self.state.borrow().clone()
     }
     pub async fn submit<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+        self.submit_inner(workflow, None).await
+    }
+    pub async fn submit_with_policy<
+        W: Workflow,
+        D: Clone + Send + Sync + 'static,
+        P: AdmissionPolicy<D>,
+    >(
+        &self,
+        workflow: W,
+        descriptor: D,
+        policy: Arc<P>,
+    ) -> Outcome<Run<W::Output>> {
+        self.submit_inner(workflow, Some(Admission::new(descriptor, policy)))
+            .await
+    }
+    async fn submit_inner<W: Workflow>(
+        &self,
+        workflow: W,
+        admission: Option<Admission>,
+    ) -> Outcome<Run<W::Output>> {
         if self.scope.is_closed() {
             return Err(Failure::Unavailable);
         }
@@ -60,7 +84,12 @@ impl CoordinatorClient {
         );
         let (reply, accepted) = oneshot::channel();
         self.tx
-            .send(Submission { future, reply })
+            .send(Submission {
+                future,
+                reply,
+                control: run.control.clone(),
+                admission,
+            })
             .await
             .map_err(|_| Failure::Unavailable)?;
         accepted.await.unwrap_or(Err(Failure::Unavailable))?;
@@ -131,6 +160,7 @@ impl Coordinator {
             let mut table = LockTable::default();
             let mut running: FuturesUnordered<BoxFuture<'static, WorkflowId>> =
                 FuturesUnordered::new();
+            let mut active: BTreeMap<WorkflowId, (RunControl, Option<Admission>)> = BTreeMap::new();
             let mut closing = false;
             loop {
                 let (waiting, held, fenced) = table.counts();
@@ -166,13 +196,37 @@ impl Coordinator {
                         while let Ok(submission) = rx.try_recv() { let _ = submission.reply.send(Err(Failure::Unavailable)); }
                     }
                     event = events.recv() => { if let Some(event) = event { table.event(event, &broker); } }
-                    Some(_) = running.next(), if !running.is_empty() => {}
+                    Some(id) = running.next(), if !running.is_empty() => { active.remove(&id); }
                     submission = rx.recv(), if !closing => match submission {
                         None => { scope.close(); closing = true; stop.cancel(); }
                         Some(submission) => {
                             if running.len() >= config.max_workflows { let _ = submission.reply.send(Err(Failure::Busy)); }
                             else {
+                                // Decide against one serialized admission snapshot. Never cancel
+                                // old work if any rule rejects or if the new run cannot be accepted.
+                                let decision = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    let mut victims = Vec::new();
+                                    if let Some(incoming) = &submission.admission {
+                                        for (id, (control, descriptor)) in &active {
+                                            if matches!(control.state(), RunState::Completed | RunState::Failed(_)) { continue; }
+                                            if let Some(existing) = descriptor {
+                                                match incoming.decide(existing) {
+                                                    AdmissionDecision::Queue => {}
+                                                    AdmissionDecision::CancelExisting => victims.push(*id),
+                                                    AdmissionDecision::Reject(reason) => return Err(Failure::Rejected(reason)),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(victims)
+                                })).unwrap_or_else(|_| Err(Failure::Rejected("admission policy panicked".into())));
+                                let victims = match decision {
+                                    Ok(victims) => victims,
+                                    Err(failure) => { let _ = submission.reply.send(Err(failure)); continue; }
+                                };
+                                active.insert(submission.control.id, (submission.control, submission.admission));
                                 running.push(submission.future);
+                                for id in victims { if let Some((control, _)) = active.get(&id) { control.cancel(); } }
                                 let _ = submission.reply.send(Ok(()));
                             }
                         }

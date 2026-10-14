@@ -14,6 +14,7 @@
 | [model.rs](src/model.rs) | 对象、资源访问、身份、结果分类、状态和配置 |
 | [coordinator.rs](src/coordinator.rs) | 一个 Pool 的组合入口、流程准入、运行与退出 |
 | [locks.rs](src/locks.rs) | 内部统一对象仲裁，不向业务暴露锁操作 |
+| [admission.rs](src/admission.rs) | 类型化应用准入策略：正常排队、拒绝、请求取消旧执行 |
 
 ```text
 Coordinator（一个 Pool 实例）
@@ -90,6 +91,32 @@ Activity 的执行许可随请求进入服务。丢弃其响应 Future、Workflo
 查询读取领域已提交视图，不获取 Workflow 占用，也不提供跨域一致快照。
 
 ## 生命周期与容量
+
+### 应用准入策略（2026-10-15）
+
+`CoordinatorClient::submit_with_policy(workflow, descriptor, policy)` 允许应用实现
+`AdmissionPolicy<D>`；基础库不认识描述中的业务概念。纯同步策略对每个在途描述返回
+Queue / Reject / CancelExisting。所有决定在协调者准入点串行检查；只有容量允许且
+没有拒绝才接收新工作并请求取消旧工作。异常策略拒绝该次请求，不终止旧工作。
+CancelExisting 不解除对象占用：新流程仍须等待旧步骤实际停稳；未知结果仍会阻塞。
+应用必须让描述与 Workflow 对象声明一致，并通过固定应用入口使用同一描述/策略；
+无策略或不同描述类型的执行只接受普通对象仲裁。本库不提供结果合并或业务优先级。
+业务用法见相邻 [storage-pool](../storage-pool/README.md)。
+
+### 协作暂停与恢复（2026-10-15）
+
+`RunControl::pause()` 请求在下一个安全边界暂停，`wait_paused().await` 等待 Paused
+确认，`resume()` 在同一执行继续。请求与确认不同：正在执行的 Activity 不会被强停；
+最后一步已成功时可能直接完成。暂停保留逻辑对象，占用直到流程结束；已完成步骤的
+资源照常释放。资源等待可撤回以响应暂停。流程对象准入的等待尚不支持即时暂停确认。
+
+Activity / Signal / Timer 前会检查暂停；自定义循环应调用 `safe_point().await`。
+同步 `checkpoint()` 只检查取消。暂停不回退已完成步骤；Signal 有界缓存，Timer 按
+原来的单调时钟截止时间继续计时，恢复后才返回。Cancel 和 shutdown 可直接唤醒暂停，
+不需要先 resume。无暂停请求/已恢复/终态时等待暂停返回错误，不无限等待。
+这是进程内控制，不是快照、持久化执行、崩溃后恢复或 Temporal 的完整暂停语义。
+
+### 关闭
 
 Coordinator 持有领域宿主的所有权。正常 shutdown：拒绝新流程 → 请求取消 →
 等待流程和 Activity 停稳 → 停止领域宿主。shutdown 的等待可以取消后重试。

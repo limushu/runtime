@@ -101,6 +101,8 @@ impl Signal {
 pub enum RunState {
     WaitingObjects,
     Running,
+    /// Acknowledged cooperative pause; no Activity is executing for this workflow.
+    Paused,
     WaitingResources,
     WaitingSignal,
     WaitingTimer,
