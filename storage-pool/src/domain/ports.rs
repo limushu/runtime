@@ -1,7 +1,13 @@
 //! Explicit external boundaries. No implementation here performs real disk IO.
-use crate::*;
+use crate::domain::{
+    PoolId,
+    disk::{DiskId, IoState, MemberDisk},
+    node::NodeId,
+    vd::{BgEntry, VirtualDisk, VolumeId},
+};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use workflow_foundation::Outcome;
 
 /// Field-level mutations, not overwrites of stale MemberDisk snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]

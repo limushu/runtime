@@ -1,6 +1,7 @@
 use crate::{
-    coordination::PoolWorkflowCoordinator, disk::DiskService, node::NodeService, ports::*,
-    types::*, vd::VdService, workflows::*, *,
+    app::{coordination::PoolWorkflowCoordinator, workflows::*},
+    domain::{disk::DiskService, node::NodeService, ports::*, reject, vd::VdService},
+    *,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},

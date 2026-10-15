@@ -1,5 +1,8 @@
 //! Explicit simulators, not persistence or real user_dp implementations.
-use crate::{ports::*, *};
+use crate::{
+    domain::{ports::*, reject},
+    *,
+};
 use async_trait::async_trait;
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio_util::sync::CancellationToken;
@@ -26,7 +29,7 @@ impl MetadataStore for MemoryMetadata {
         match &change {
             MetadataChange::AddDisk(disk) => {
                 if disk.pool != *pool || state.disks.keys().any(|(_, id)| *id == disk.id) {
-                    return Err(types::reject("disk identity already owned or wrong pool"));
+                    return Err(reject("disk identity already owned or wrong pool"));
                 }
                 state
                     .disks
@@ -40,9 +43,9 @@ impl MetadataStore for MemoryMetadata {
                 let disk = state
                     .disks
                     .get_mut(&(pool.clone(), disk.clone()))
-                    .ok_or_else(|| types::reject("unknown disk"))?;
+                    .ok_or_else(|| reject("unknown disk"))?;
                 if disk.revision != *expected_revision {
-                    return Err(types::reject("stale disk revision"));
+                    return Err(reject("stale disk revision"));
                 }
                 disk.io = *io;
                 disk.revision += 1;
@@ -56,13 +59,13 @@ impl MetadataStore for MemoryMetadata {
                 let disk = state
                     .disks
                     .get_mut(&(pool.clone(), disk.clone()))
-                    .ok_or_else(|| types::reject("unknown disk"))?;
+                    .ok_or_else(|| reject("unknown disk"))?;
                 if disk.revision != *expected_revision
                     || !disk.allocatable()
                     || *blk >= disk.capacity_blks
                     || disk.allocated.contains(blk)
                 {
-                    return Err(types::reject("invalid allocation or stale revision"));
+                    return Err(reject("invalid allocation or stale revision"));
                 }
                 disk.allocated.insert(*blk);
                 disk.revision += 1;
@@ -70,7 +73,7 @@ impl MetadataStore for MemoryMetadata {
             MetadataChange::CreateVolume(volume) => {
                 let key = (pool.clone(), volume.id.clone());
                 if volume.pool != *pool || state.volumes.contains_key(&key) {
-                    return Err(types::reject("volume exists or wrong pool"));
+                    return Err(reject("volume exists or wrong pool"));
                 }
                 state.volumes.insert(key, volume.clone());
             }

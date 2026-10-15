@@ -1013,7 +1013,7 @@ fn conflict_policy_is_explicit_and_testable_without_running_services() {
 
 #[test]
 fn workflows_do_not_bypass_activity_with_direct_domain_queries() {
-    assert!(!include_str!("../src/workflows.rs").contains(".query("));
+    assert!(!include_str!("../src/app/workflows/mod.rs").contains(".query("));
 }
 
 #[tokio::test]

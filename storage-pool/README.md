@@ -17,17 +17,27 @@ PoolManager：Pool 路由 / 生命周期 / 普通物理盘唯一归属
 每个领域由基础库的独立服务宿主运行。领域只声明 Activity 资源，不实现自己的对象
 排队、互斥或 Workflow 调度。短暂的内存 Mutex 只保护数据访问，不跨 await 持有。
 
+## 分层与依赖
+
+- `app/`：Pool 装配与业务入口、应用请求、Workflow 编排及业务准入策略。
+- `domain/`：Disk、VD、Node 各自的实体、业务规则和领域服务；外部能力契约位于 `domain/ports.rs`。
+- `infrastructure/`：元数据与数据面契约的适配实现。
+
+应用层调用领域能力并使用 `workflow-foundation` 执行流程；领域层不依赖应用流程或协调策略。
+领域服务当前直接实现基础库的 `DomainService` 运行契约。通用 Coordinator 仍属于基础库，
+理解存储操作的 PoolWorkflowCoordinator 属于应用层。旧根模块路径保留兼容导出。
+
 ## 从哪里读
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/types.rs` | 强类型身份、领域实体、输入、内部空间分配凭据 |
-| `src/pool.rs` | PoolManager / Pool 装配、类型化业务入口与查询 |
-| `src/coordination.rs` | Pool 协调服务、操作描述、可独立测试的冲突策略 |
-| `src/workflows.rs` | 节点观测/加载、完整硬盘上线/离线、创建镜像卷 |
-| `src/disk.rs` / `vd.rs` / `node.rs` | 各领域状态唯一所有者与能力 |
-| `src/ports.rs` | 显式 MetadataStore / DataPlane 外部边界及失败契约 |
-| `src/adapters.rs` | 带版本校验的内存元数据、无真实 IO 的模拟数据面 |
+| `src/domain/{disk,node,vd}/model.rs + src/app/requests.rs` | 强类型身份、领域实体、输入、内部空间分配凭据 |
+| `src/app/pool.rs` | PoolManager / Pool 装配、类型化业务入口与查询 |
+| `src/app/coordination.rs` | Pool 协调服务、操作描述、可独立测试的冲突策略 |
+| `src/app/workflows/mod.rs` | 节点观测/加载、完整硬盘上线/离线、创建镜像卷 |
+| `src/domain/disk/service.rs` / `src/domain/vd/service.rs` / `src/domain/node/service.rs` | 各领域状态唯一所有者与能力 |
+| `src/domain/ports.rs` | 显式 MetadataStore / DataPlane 外部边界及失败契约 |
+| `src/infrastructure/adapters.rs` | 带版本校验的内存元数据、无真实 IO 的模拟数据面 |
 | `examples/pool_lifecycle.rs` | 两节点两盘 → 镜像卷 → 盘离线/上线 |
 
 API 使用 `PoolHandle` 而不是向调用者开放内部领域命令或任意 Workflow 提交，以免业务

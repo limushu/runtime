@@ -1,11 +1,11 @@
 //! Named application workflows. No domain state lives in these structs.
 //! Construct through PoolHandle so callers cannot omit the required conflict set.
 use crate::{
-    coordination::{OperationKind, PoolOperation, PoolWorkflow},
-    disk::{DiskCommand, DiskReply, DiskService},
-    node::{NodeCommand, NodeService},
-    types::*,
-    vd::{VdCommand, VdReply, VdService},
+    app::coordination::{OperationKind, PoolOperation, PoolWorkflow},
+    domain::disk::{DiskCommand, DiskReply, DiskService},
+    domain::node::{NodeCommand, NodeService},
+    domain::vd::{VdCommand, VdReply, VdService},
+    domain::{object, reject},
     *,
 };
 use async_trait::async_trait;
