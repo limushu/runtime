@@ -21,6 +21,10 @@ pub(crate) enum VdCommand {
         allocations: Vec<Allocation>,
     },
     Invalidate(DiskId),
+    InvalidateMany(Vec<DiskId>),
+    WaitRebuildMany(Vec<DiskId>),
+    /// Placeholder: wait for rebuild and committed removal of old disk references.
+    WaitRebuild(DiskId),
 }
 pub(crate) enum VdReply {
     Checked,
@@ -112,6 +116,33 @@ impl DomainService for VdService {
                     .await?;
                 self.volumes.lock().unwrap().insert(id, volume.clone());
                 Ok(VdReply::Created(volume))
+            }
+            VdCommand::WaitRebuild(disk) => {
+                self.data_plane
+                    .wait_rebuild(&self.pool, &[disk], ctx.cancellation())
+                    .await?;
+                Ok(VdReply::Checked)
+            }
+            VdCommand::WaitRebuildMany(disks) => {
+                self.data_plane
+                    .wait_rebuild(&self.pool, &disks, ctx.cancellation())
+                    .await?;
+                Ok(VdReply::Checked)
+            }
+            VdCommand::InvalidateMany(disks) => {
+                for disk in disks {
+                    // Every confirmed commit is published, even if a later item fails.
+                    self.metadata
+                        .commit(
+                            &self.pool,
+                            MetadataChange::InvalidateDisk { disk: disk.clone() },
+                        )
+                        .await?;
+                    for volume in self.volumes.lock().unwrap().values_mut() {
+                        volume.invalidate(&disk);
+                    }
+                }
+                Ok(VdReply::Invalidated)
             }
             VdCommand::Invalidate(disk) => {
                 self.metadata

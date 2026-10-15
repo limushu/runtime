@@ -16,3 +16,10 @@ impl CreateVolume {
         Ok(())
     }
 }
+
+/// Monotonic topology sequence, shared with observe_node notifications.
+#[derive(Debug, Clone)]
+pub struct NodeTransitionRequest {
+    pub node: crate::NodeId,
+    pub sequence: u64,
+}

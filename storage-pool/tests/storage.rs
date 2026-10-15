@@ -29,6 +29,12 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
 async fn result<T>(mut run: Run<T>) -> Outcome<T> {
     bounded(run.result()).await
 }
+async fn rebuild_pending(run: Run<MemberDisk>) {
+    assert!(matches!(
+        result(run).await,
+        Err(Failure::Failed(message)) if message.starts_with("waiting for rebuild is not implemented")
+    ));
+}
 struct Gate {
     entered: Semaphore,
     release: Semaphore,
@@ -123,6 +129,12 @@ struct ControlledPlane {
     open_failure: Mutex<Option<Failure>>,
     up_failure: Mutex<Option<Failure>>,
     disk_calls: Mutex<Vec<&'static str>>,
+    batch_calls: Mutex<Vec<(Vec<DiskId>, IoState)>>,
+    rebuild_gate: Mutex<Option<Arc<Gate>>>,
+    rebuild_cancelled: Mutex<Option<Arc<Semaphore>>>,
+    rebuild_uncertain: std::sync::atomic::AtomicBool,
+    malformed_batch: std::sync::atomic::AtomicBool,
+    batch_failures: Mutex<std::collections::BTreeMap<DiskId, Failure>>,
 }
 #[async_trait]
 impl DataPlane for ControlledPlane {
@@ -178,6 +190,59 @@ impl DataPlane for ControlledPlane {
         // Once started, this simulated external effect completes successfully
         // despite cancellation. The framework must wait for this confirmation.
         Ok(())
+    }
+    async fn set_disks_io(
+        &self,
+        pool: &PoolId,
+        ids: &[DiskId],
+        io: IoState,
+        cancel: &CancellationToken,
+    ) -> Outcome<Vec<(DiskId, Outcome<()>)>> {
+        self.batch_calls.lock().unwrap().push((ids.to_vec(), io));
+        let mut results = Vec::new();
+        for id in ids {
+            let failure = self.batch_failures.lock().unwrap().get(id).cloned();
+            let outcome = match failure {
+                Some(error) => Err(error),
+                None => self.set_disk_io(pool, id, io, cancel).await,
+            };
+            results.push((id.clone(), outcome));
+        }
+        if self
+            .malformed_batch
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            results.clear();
+        }
+        Ok(results)
+    }
+    async fn wait_rebuild(
+        &self,
+        _: &PoolId,
+        _: &[DiskId],
+        cancel: &CancellationToken,
+    ) -> Outcome<()> {
+        let gate = self.rebuild_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            cancel.cancelled().await;
+            if let Some(seen) = self.rebuild_cancelled.lock().unwrap().as_ref() {
+                seen.add_permits(1);
+            }
+            gate.release.acquire().await.unwrap().forget();
+            if self
+                .rebuild_uncertain
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Failure::Uncertain(
+                    "rebuild outcome unknown after cancellation".into(),
+                ));
+            }
+            return Err(Failure::Cancelled);
+        }
+        Err(Failure::Failed(
+            "waiting for rebuild is not implemented".into(),
+        ))
     }
     async fn initialize_bg(
         &self,
@@ -350,9 +415,7 @@ async fn online_does_not_restore_invalid_data_or_free_blocks() {
     result(pool.create_volume(request("v")).await.unwrap())
         .await
         .unwrap();
-    result(pool.offline_disk(disk_id("d1")).await.unwrap())
-        .await
-        .unwrap();
+    rebuild_pending(pool.offline_disk(disk_id("d1")).await.unwrap()).await;
     assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Down);
     result(pool.online_disk(disk_id("d1")).await.unwrap())
         .await
@@ -425,9 +488,7 @@ async fn down_or_disconnected_replica_rejected_before_allocation() {
         2,
     )
     .await;
-    result(pool.offline_disk(disk_id("d2")).await.unwrap())
-        .await
-        .unwrap();
+    rebuild_pending(pool.offline_disk(disk_id("d2")).await.unwrap()).await;
     assert!(
         result(pool.create_volume(request("v")).await.unwrap())
             .await
@@ -637,7 +698,7 @@ async fn metadata_in_flight_keeps_old_view_and_object_ownership() {
     );
     gate.open();
     result(create).await.unwrap();
-    result(offline).await.unwrap();
+    rebuild_pending(offline).await;
     assert_eq!(
         pool.volumes().await.unwrap()[0].groups[0].entries[0].data,
         DataState::Invalid
@@ -690,11 +751,9 @@ async fn cancelled_offline_waits_for_stable_io_before_online_and_other_disk_prog
             .await
             .is_err()
     );
-    result(pool.offline_disk(disk_id("d2")).await.unwrap())
-        .await
-        .unwrap();
+    rebuild_pending(pool.offline_disk(disk_id("d2")).await.unwrap()).await;
     gate.open();
-    assert_eq!(result(offline).await.unwrap().io, IoState::Down);
+    assert_eq!(result(offline).await, Err(Failure::Cancelled));
     assert_eq!(result(online).await.unwrap().io, IoState::Up);
     manager.shutdown().await.unwrap();
 }
@@ -933,7 +992,7 @@ async fn offline_policy_cancels_online_but_waits_for_open_to_settle() {
     );
     gate.open();
     assert_eq!(result(online).await, Err(Failure::Cancelled));
-    assert_eq!(result(offline).await.unwrap().io, IoState::Down);
+    rebuild_pending(offline).await;
     assert_eq!(
         plane.disk_calls.lock().unwrap().as_slice(),
         ["open", "disable"]
@@ -955,7 +1014,7 @@ async fn paused_online_can_be_cancelled_by_offline_without_resume() {
     bounded(online.control.wait_paused()).await.unwrap();
     let offline = pool.offline_disk(spec.id).await.unwrap();
     assert_eq!(result(online).await, Err(Failure::Cancelled));
-    result(offline).await.unwrap();
+    rebuild_pending(offline).await;
     manager.shutdown().await.unwrap();
 }
 
@@ -1013,7 +1072,17 @@ fn conflict_policy_is_explicit_and_testable_without_running_services() {
 
 #[test]
 fn workflows_do_not_bypass_activity_with_direct_domain_queries() {
-    assert!(!include_str!("../src/app/workflows/mod.rs").contains(".query("));
+    for source in [
+        include_str!("../src/app/workflows/observe_node.rs"),
+        include_str!("../src/app/workflows/load_node.rs"),
+        include_str!("../src/app/workflows/online_disk.rs"),
+        include_str!("../src/app/workflows/offline_disk.rs"),
+        include_str!("../src/app/workflows/create_volume.rs"),
+        include_str!("../src/app/workflows/offline_node.rs"),
+        include_str!("../src/app/workflows/online_node.rs"),
+    ] {
+        assert!(!source.contains(".query("));
+    }
 }
 
 #[tokio::test]
@@ -1057,7 +1126,7 @@ async fn three_replica_layout_and_topology_and_revision_validation() {
         capacity_blks: 3,
     };
     assert!(matches!(
-        result(manager.online_disk(pool.id(), bad).await.unwrap()).await,
+        manager.online_disk(pool.id(), bad).await,
         Err(Failure::Rejected(_))
     ));
     let before = store.committed().len();
@@ -1083,5 +1152,434 @@ async fn three_replica_layout_and_topology_and_revision_validation() {
         "query must not expose mutable state"
     );
     invariant(&pool).await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_skeleton_keeps_member_and_blocks_removal_without_rebuild() {
+    let store = Arc::new(MemoryMetadata::default());
+    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
+    result(pool.create_volume(request("v")).await.unwrap())
+        .await
+        .unwrap();
+    let before = pool.disks().await.unwrap()[0].allocated.clone();
+    let run = pool.offline_disk(disk_id("d1")).await.unwrap();
+    let control = run.control.clone();
+    rebuild_pending(run).await;
+    assert!(matches!(
+        control.state(),
+        RunState::Failed(Failure::Failed(_))
+    ));
+    let member = pool
+        .disks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.id == disk_id("d1"))
+        .unwrap();
+    assert_eq!(member.io, IoState::Down);
+    assert_eq!(member.allocated, before);
+    assert_eq!(
+        pool.volumes().await.unwrap()[0].groups[0].entries[0].data,
+        DataState::Invalid
+    );
+    assert!(matches!(
+        store.committed().last().unwrap().1,
+        MetadataChange::DiskIo {
+            io: IoState::Down,
+            ..
+        }
+    ));
+    invariant(&pool).await;
+    manager.shutdown().await.unwrap();
+}
+
+fn transition(sequence: u64) -> NodeTransitionRequest {
+    NodeTransitionRequest {
+        node: node_id("n1"),
+        sequence,
+    }
+}
+
+#[tokio::test]
+async fn coordinator_cancels_node_offline_and_waits_for_batch_rebuild_to_settle_before_online() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 3).await;
+    add(&mut manager, &pool, "d3", "n1", 3).await;
+    let gate = Gate::new();
+    let seen = Arc::new(Semaphore::new(0));
+    *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
+    *plane.rebuild_cancelled.lock().unwrap() = Some(seen.clone());
+    let offline = pool.offline_node(transition(2)).await.unwrap();
+    gate.wait().await;
+    assert_eq!(
+        pool.task(offline.id()).unwrap().progress.stage.as_deref(),
+        Some("wait-rebuild")
+    );
+    assert_eq!(
+        plane.batch_calls.lock().unwrap().as_slice(),
+        &[(vec![disk_id("d1"), disk_id("d3")], IoState::Down)]
+    );
+    let mut online = pool.online_node(transition(3)).await.unwrap();
+    bounded(seen.acquire()).await.unwrap().forget();
+    assert!(offline.control.cancellation_requested());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), online.result())
+            .await
+            .is_err()
+    );
+    assert!(
+        !pool
+            .nodes()
+            .await
+            .unwrap()
+            .iter()
+            .find(|n| n.id == node_id("n1"))
+            .unwrap()
+            .serving()
+    );
+    assert_eq!(plane.batch_calls.lock().unwrap().len(), 1);
+    gate.open();
+    assert_eq!(result(offline).await, Err(Failure::Cancelled));
+    assert!(result(online).await.unwrap().serving());
+    assert!(
+        pool.disks()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|d| d.node == node_id("n1"))
+            .all(|d| d.io == IoState::Up)
+    );
+    assert_eq!(
+        plane.batch_calls.lock().unwrap().last().unwrap(),
+        &(vec![disk_id("d1"), disk_id("d3")], IoState::Up)
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn connected_observation_alone_cancels_down_workflow_without_claiming_loaded() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let gate = Gate::new();
+    *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
+    let offline = pool.offline_node(transition(2)).await.unwrap();
+    gate.wait().await;
+    let mut observed = pool.observe_node(node_id("n1"), 3, true).await.unwrap();
+    assert!(offline.control.cancellation_requested());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), observed.result())
+            .await
+            .is_err()
+    );
+    gate.open();
+    assert_eq!(result(offline).await, Err(Failure::Cancelled));
+    let node = result(observed).await.unwrap();
+    assert!(node.connected);
+    assert!(!node.loaded);
+    assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Down);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disk_online_then_disk_offline_then_node_offline_are_coordinated_without_parallel_io() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    add(&mut manager, &pool, "d3", "n1", 2).await;
+    let gate = Gate::new();
+    *plane.open_gate.lock().unwrap() = Some(gate.clone());
+    let online = pool.online_disk(disk_id("d1")).await.unwrap();
+    gate.wait().await;
+    let disk_offline = pool.offline_disk(disk_id("d1")).await.unwrap();
+    assert!(online.control.cancellation_requested());
+    let mut node_offline = pool.offline_node(transition(2)).await.unwrap();
+    assert!(disk_offline.control.cancellation_requested());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), node_offline.result())
+            .await
+            .is_err()
+    );
+    assert!(plane.batch_calls.lock().unwrap().is_empty());
+    gate.open();
+    assert_eq!(result(online).await, Err(Failure::Cancelled));
+    assert_eq!(result(disk_offline).await, Err(Failure::Cancelled));
+    assert!(
+        matches!(result(node_offline).await, Err(Failure::Failed(message)) if message.contains("rebuild"))
+    );
+    assert_eq!(
+        plane.batch_calls.lock().unwrap().as_slice(),
+        &[(vec![disk_id("d1"), disk_id("d3")], IoState::Down)]
+    );
+    assert!(
+        pool.disks()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|d| d.node == node_id("n1"))
+            .all(|d| d.io == IoState::Down)
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn uncertain_rebuild_fences_node_online_after_cancellation() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let gate = Gate::new();
+    *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
+    plane
+        .rebuild_uncertain
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let offline = pool.offline_node(transition(2)).await.unwrap();
+    gate.wait().await;
+    let online = pool.online_node(transition(3)).await.unwrap();
+    gate.open();
+    assert!(matches!(result(offline).await, Err(Failure::Uncertain(_))));
+    assert!(matches!(result(online).await, Err(Failure::Rejected(_))));
+    assert_eq!(plane.batch_calls.lock().unwrap().len(), 1);
+    assert!(pool.execution().fenced > 0);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_node_online_does_not_cancel_newer_offline() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let gate = Gate::new();
+    *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
+    let offline = pool.offline_node(transition(3)).await.unwrap();
+    gate.wait().await;
+    assert!(matches!(
+        pool.online_node(transition(2)).await,
+        Err(Failure::Rejected(_))
+    ));
+    assert!(!offline.control.cancellation_requested());
+    offline.control.cancel();
+    gate.open();
+    assert_eq!(result(offline).await, Err(Failure::Cancelled));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_batch_io_response_fences_node_and_does_not_publish_unconfirmed_states() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    plane
+        .malformed_batch
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        result(pool.offline_node(transition(2)).await.unwrap()).await,
+        Err(Failure::Uncertain(_))
+    ));
+    assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Up);
+    assert!(matches!(
+        result(pool.online_node(transition(3)).await.unwrap()).await,
+        Err(Failure::Rejected(_))
+    ));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn node_offline_includes_member_whose_initial_add_is_still_committing() {
+    let store = Arc::new(ControlledStore::default());
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool, mut spec) = new_disk_fixture(store.clone(), plane.clone()).await;
+    // Use the node observed by new_disk_fixture, which starts at sequence 1.
+    spec.node = node_id("n");
+    let gate = store.pause(Point::Add);
+    let online = manager.online_disk(pool.id(), spec.clone()).await.unwrap();
+    gate.wait().await;
+    assert!(pool.disks().await.unwrap().is_empty());
+    let mut offline = pool
+        .offline_node(NodeTransitionRequest {
+            node: node_id("n"),
+            sequence: 2,
+        })
+        .await
+        .unwrap();
+    assert!(online.control.cancellation_requested());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), offline.result())
+            .await
+            .is_err()
+    );
+    gate.open();
+    assert_eq!(result(online).await, Err(Failure::Cancelled));
+    assert!(
+        matches!(result(offline).await, Err(Failure::Failed(message)) if message.contains("rebuild"))
+    );
+    assert_eq!(
+        plane.batch_calls.lock().unwrap().as_slice(),
+        &[(vec![spec.id], IoState::Down)]
+    );
+    assert!(!plane.disk_calls.lock().unwrap().contains(&"open"));
+    assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Down);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_io_publishes_all_confirmed_items_even_when_one_item_fails() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    add(&mut manager, &pool, "d3", "n1", 2).await;
+    plane
+        .batch_failures
+        .lock()
+        .unwrap()
+        .insert(disk_id("d1"), Failure::Failed("known IO failure".into()));
+    assert_eq!(
+        result(pool.offline_node(transition(2)).await.unwrap()).await,
+        Err(Failure::Failed("known IO failure".into()))
+    );
+    let disks = pool.disks().await.unwrap();
+    assert_eq!(
+        disks.iter().find(|d| d.id == disk_id("d1")).unwrap().io,
+        IoState::Up
+    );
+    assert_eq!(
+        disks.iter().find(|d| d.id == disk_id("d3")).unwrap().io,
+        IoState::Down
+    );
+    assert_eq!(pool.execution().fenced, 0);
+    manager.shutdown().await.unwrap();
+}
+
+#[test]
+fn configured_rules_are_ordered_named_and_cannot_override_stale_node_guard() {
+    use storage_pool::coordination::*;
+    use workflow_foundation::{AdmissionDecision, AdmissionPolicy, ObjectKey};
+    let mut rules = PoolRules::default();
+    rules.rules.insert(
+        0,
+        CoordinationRule::new(
+            "disk-offline-waits-for-online",
+            OperationSelector::Class(OperationClass::OfflineDisk),
+            OperationSelector::Class(OperationClass::OnlineDisk),
+            RuleRelation::SameDisk,
+            AdmissionDecision::Queue,
+        ),
+    );
+    rules.duplicate = AdmissionDecision::Queue;
+    let policy = RulePolicy::new(rules).unwrap();
+    let operation = |kind| PoolOperation {
+        kind,
+        objects: vec![ObjectKey::new("disk", "d1"), ObjectKey::new("node", "n1")],
+    };
+    let offline = operation(OperationKind::OfflineDisk(disk_id("d1")));
+    let online = operation(OperationKind::OnlineDisk(disk_id("d1")));
+    let decision = policy.evaluate(&offline, &online);
+    assert_eq!(
+        decision.rule.as_deref(),
+        Some("disk-offline-waits-for-online")
+    );
+    assert_eq!(decision.decision, AdmissionDecision::Queue);
+    assert_eq!(policy.decide(&offline, &offline), AdmissionDecision::Queue);
+    let stale = operation(OperationKind::OnlineNode {
+        id: node_id("n1"),
+        sequence: 1,
+    });
+    let newer = operation(OperationKind::OfflineNode {
+        id: node_id("n1"),
+        sequence: 2,
+    });
+    assert_eq!(
+        policy.evaluate(&stale, &newer).rule.as_deref(),
+        Some("stale-node-guard")
+    );
+    assert!(matches!(
+        policy.decide(&stale, &newer),
+        AdmissionDecision::Reject(_)
+    ));
+    let mut invalid = PoolRules::default();
+    invalid.rules.push(invalid.rules[0].clone());
+    assert!(RulePolicy::new(invalid).is_err());
+}
+
+#[tokio::test]
+async fn pool_uses_configured_queue_rule_and_exposes_id_controls_and_reason() {
+    use storage_pool::coordination::*;
+    use workflow_foundation::AdmissionDecision;
+    let plane = Arc::new(ControlledPlane::default());
+    let mut rules = PoolRules::default();
+    rules.rules.insert(
+        0,
+        CoordinationRule::new(
+            "disk-offline-waits-for-online",
+            OperationSelector::Class(OperationClass::OfflineDisk),
+            OperationSelector::Class(OperationClass::OnlineDisk),
+            RuleRelation::SameDisk,
+            AdmissionDecision::Queue,
+        ),
+    );
+    let mut manager = manager(Arc::new(MemoryMetadata::default()), plane.clone())
+        .with_rules(rules)
+        .unwrap();
+    let pool = manager.create_pool(pool_id("a")).unwrap();
+    add(&mut manager, &pool, "d1", "n1", 2).await;
+    let gate = Gate::new();
+    *plane.open_gate.lock().unwrap() = Some(gate.clone());
+    let online = pool.online_disk(disk_id("d1")).await.unwrap();
+    gate.wait().await;
+    let offline = pool.offline_disk(disk_id("d1")).await.unwrap();
+    assert!(!online.control.cancellation_requested());
+    let snapshot = pool.task(offline.id()).unwrap();
+    assert_eq!(
+        snapshot.admission[0].evaluation.rule.as_deref(),
+        Some("disk-offline-waits-for-online")
+    );
+    assert_eq!(snapshot.admission[0].existing, online.id());
+    assert_eq!(snapshot.state, RunState::WaitingObjects);
+    pool.cancel(offline.id()).unwrap();
+    assert_eq!(result(offline).await, Err(Failure::Cancelled));
+    gate.open();
+    result(online).await.unwrap();
+    manager.shutdown().await.unwrap();
+}
+
+struct CustomQueuePolicy;
+impl workflow_foundation::AdmissionPolicy<coordination::PoolOperation> for CustomQueuePolicy {
+    fn decide(
+        &self,
+        _: &coordination::PoolOperation,
+        _: &coordination::PoolOperation,
+    ) -> workflow_foundation::AdmissionDecision {
+        workflow_foundation::AdmissionDecision::Queue
+    }
+    fn evaluate(
+        &self,
+        incoming: &coordination::PoolOperation,
+        existing: &coordination::PoolOperation,
+    ) -> workflow_foundation::AdmissionEvaluation {
+        workflow_foundation::AdmissionEvaluation::named(
+            "custom-maintenance-policy",
+            self.decide(incoming, existing),
+        )
+    }
+}
+#[tokio::test]
+async fn pool_accepts_coded_policy_without_workflow_changes() {
+    let plane = Arc::new(ControlledPlane::default());
+    let mut manager = manager(Arc::new(MemoryMetadata::default()), plane.clone())
+        .with_policy(Arc::new(CustomQueuePolicy))
+        .unwrap();
+    let pool = manager.create_pool(pool_id("a")).unwrap();
+    add(&mut manager, &pool, "d1", "n1", 2).await;
+    let gate = Gate::new();
+    *plane.open_gate.lock().unwrap() = Some(gate.clone());
+    let online = pool.online_disk(disk_id("d1")).await.unwrap();
+    gate.wait().await;
+    let offline = pool.offline_disk(disk_id("d1")).await.unwrap();
+    assert!(!online.control.cancellation_requested());
+    assert_eq!(
+        pool.task(offline.id()).unwrap().admission[0]
+            .evaluation
+            .rule
+            .as_deref(),
+        Some("custom-maintenance-policy")
+    );
+    pool.cancel(offline.id()).unwrap();
+    assert_eq!(result(offline).await, Err(Failure::Cancelled));
+    gate.open();
+    result(online).await.unwrap();
     manager.shutdown().await.unwrap();
 }

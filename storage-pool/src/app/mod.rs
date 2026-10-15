@@ -5,4 +5,4 @@ mod requests;
 pub mod workflows;
 
 pub use pool::{Pool, PoolHandle, PoolManager};
-pub use requests::CreateVolume;
+pub use requests::{CreateVolume, NodeTransitionRequest};

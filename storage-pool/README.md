@@ -33,8 +33,8 @@ PoolManager：Pool 路由 / 生命周期 / 普通物理盘唯一归属
 | --- | --- |
 | `src/domain/{disk,node,vd}/model.rs + src/app/requests.rs` | 强类型身份、领域实体、输入、内部空间分配凭据 |
 | `src/app/pool.rs` | PoolManager / Pool 装配、类型化业务入口与查询 |
-| `src/app/coordination.rs` | Pool 协调服务、操作描述、可独立测试的冲突策略 |
-| `src/app/workflows/mod.rs` | 节点观测/加载、完整硬盘上线/离线、创建镜像卷 |
+| `src/app/coordination/mod.rs` | Pool 协调服务、操作描述、可独立测试的冲突策略 |
+| `src/app/workflows/*.rs` | 每个业务流程独立文件，`mod.rs` 保留导出与公共辅助代码 |
 | `src/domain/disk/service.rs` / `src/domain/vd/service.rs` / `src/domain/node/service.rs` | 各领域状态唯一所有者与能力 |
 | `src/domain/ports.rs` | 显式 MetadataStore / DataPlane 外部边界及失败契约 |
 | `src/infrastructure/adapters.rs` | 带版本校验的内存元数据、无真实 IO 的模拟数据面 |
@@ -69,9 +69,11 @@ let volume = pool.create_volume(CreateVolume { id, disks }).await?.result().awai
   `BG 引用 ⊆ 已分配 BLK`。分配凭据由 DiskService 私有构造，VD 不接受用户自报 BLK。
 - 失败/取消留下的未引用分配不回滚、不复用。没有释放能力；需要后续对账再设计回收。
   重复创建已存在 VD 拒绝；不是跨失败重试幂等接口，失败后重试可能增加保守泄露。
-- 本轮 offline 是**显式保守失效流程**，不是完整物理故障/计划缩容状态机：先提交该盘
-  所有 BGEntry Invalid，再关闭 IO 并提交 Down。部分失败允许 Up+Invalid，不允许
-  自动声称修复；online 不修改数据有效性。不实现重建、移除或副本补齐。
+- 离线 Workflow 骨架：检查成员盘 → 失效相关 BGEntry → 关闭 IO 并提交 Down →
+  等待重建完成 → 移除成员盘。后两步目前只有领域 Activity 占位，返回明确的
+  `Failure::Failed`，不模拟重建成功或成员移除。流程会停在等待重建步骤，盘保持 Down
+  和原有成员身份、BLK 分配。真正重建、无引用确认及成员移除提交留待后续实现。
+  部分失败允许 Up+Invalid；online 不修改数据有效性。
 - 对外副作用成功后 DiskIo 元数据失败，一律 Uncertain；协调者保留阻塞，不能凭旧内存
   状态继续修改。未知提交也保持基础库的恢复阻塞；读视图仍是最后确认状态，不能用来
   证明外部实际状态。没有人工跳过阻塞接口。
@@ -155,3 +157,97 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo run --locked --example pool_lifecycle
 ```
+
+## 节点上下线与协调者取消
+
+```rust,ignore
+let offline = pool.offline_node(NodeTransitionRequest { node: node.clone(), sequence: 2 }).await?;
+let online = pool.online_node(NodeTransitionRequest { node, sequence: 3 }).await?;
+// 协调者取消旧下线；online.result() 等旧 Activity 稳定退出后才可能完成。
+```
+
+节点转换序号与 `observe_node` 共享单调序列，表示可信拓扑观测。本轮不是实际电源控制 API。
+`OfflineNodeWorkflow` 顺序执行：确认断连事实 → 检查已登记成员盘 → 批量失效数据 →
+批量关闭 IO → 等待重建 → 移除成员盘 → 最终下电占位。
+`OnlineNodeWorkflow` 确认连接事实、加载 Pool、确认/打开成员盘，再批量启用 IO；不会修复 Invalid 数据。
+仅 `observe_node(..., true)` 会取消在途节点下线，但不自动加载 Pool 或启用 IO。
+
+业务取消只由协调者应用 AdmissionPolicy：较新的节点转换替换旧转换；节点下线取消相交的
+盘上线/离线与加载；节点上线取消相交的盘离线。所有者释放对象前必须等 Activity 真正停稳。
+旧序号不能取消在途新转换。Workflow 内不保存其他 Run、不调用其他 Workflow 的控制方法。
+节点和磁盘的影响集合由应用路由登记构造，包含尚未完成首次 Add 的磁盘；登记身份不可变，
+失败后保守保留。单盘离线也声明所属节点，保证节点事实变更不能越过它的停稳边界。
+
+DiskService 的 SetIoMany 是一次批量 Activity，并调用 `DataPlane::set_disks_io` 批量端口。
+适配器可一次通知多盘；兼容默认实现逐盘执行。回复必须逐盘标明结果且覆盖完整输入，
+缺项/重复/错盘结果按 Uncertain 处理。所有确认成功项逐盘提交并发布，即使别的项失败；
+外部成功而元数据未确认也按 Uncertain 处理，不自动重试整批。
+`DataPlane::wait_rebuild` 是可注入的等待边界，默认明确报未实现；测试适配器验证取消后停稳。
+真实重建、成员移除和物理下电仍是空壳，不能将测试的成功/取消当成生产重建能力。
+
+当前节点流程仍声明完整节点/磁盘集合，采用现有完整集合准入；单盘流程增加节点占用会
+保守串行化同节点操作。通用的“批次冲突项摘出等待，其余继续”部分准入尚未实现，
+这里的领域批量 IO 能力不等同于该调度能力。基础库的释放事件会重新检查等待队列并通过
+oneshot 发放许可，唤醒等待 Future，无定时轮询；不确定释放建立恢复阻塞，不放行后继写操作。
+
+Workflow 文件按业务过程拆分：`observe_node.rs`、`load_node.rs`、`online_disk.rs`、
+`offline_disk.rs`、`create_volume.rs`、`offline_node.rs`、`online_node.rs`。
+各文件同时包含流程参数、操作描述、对象声明和执行步骤；公开类型路径不变。
+
+## 外部 CMD 暂停/恢复示例
+
+运行 `cargo run --manifest-path storage-pool/Cargo.toml --example shrink_commands`。
+[shrink_commands.rs](examples/shrink_commands.rs) 使用独立命令通道模拟 Start / Suspend /
+WaitSuspended / Resume / Finish 请求；协调者正式任务索引保存 WorkflowId 到执行控制句柄的映射。
+发起方只拿 ID，后续指令不依赖最初的 Run。暂停请求与暂停完成分别确认，在途第一块搬移
+完成后暂停，恢复继续第二块，保持同一个 WorkflowId。等待确认/结果不会阻塞后续命令。
+该示例只有内存内的模拟缩容，不接入真实 IO、网络 CMD、持久任务索引或实际缩容业务。
+
+## 可配置协调规则与任务观测
+
+规则入口是 `app/coordination/rules.rs`。创建 Pool 前选择：
+
+- `manager.with_rules(PoolRules)`：有名称的类型化有序规则表，先匹配者生效；默认排队。
+- `manager.with_policy(Arc<dyn AdmissionPolicy<PoolOperation>>)`：复杂业务用普通 Rust 策略实现。
+
+规则包含新/旧操作类别、对象关系和 Queue / Reject / CancelExisting 决定，可单独测试。
+默认规则保持之前行为。规则表先检查对象交集和旧节点序号，旧观测不能通过配置取消新转换；
+自定义策略是可信应用代码，须自己保持业务约束。任何策略都不能跳过 Runtime 的对象占用、
+容量检查、停稳交接和不确定结果阻塞。策略固定后用于新建 Pool，当前不支持在线热更新。
+
+```rust,ignore
+let mut rules = PoolRules::default();
+rules.rules.insert(0, CoordinationRule::new(
+    "maintenance-offline-waits",
+    OperationSelector::Class(OperationClass::OfflineDisk),
+    OperationSelector::Class(OperationClass::OnlineDisk),
+    RuleRelation::SameDisk,
+    AdmissionDecision::Queue,
+));
+let mut manager = manager.with_rules(rules)?;
+```
+
+任务索引由基础库在接受提交时建立，不依赖发起者是否保留 Run。以目标 Pool 为范围：
+
+```rust,ignore
+let id = run.id();
+let snapshot = pool.task(id)?;
+let tasks = pool.tasks();
+let mut observer = pool.observe_task(id)?;
+pool.suspend(id)?;                   // 请求
+pool.wait_suspended(id).await?;      // 安全暂停确认
+pool.resume(id)?;
+pool.cancel(id)?;                    // 请求；最终状态仍需观察
+let updated = observer.changed().await?;
+```
+
+快照包含 Pool、ID、流程名称、声明对象、执行状态、阶段/进度、暂停/取消请求及准入时
+匹配的规则和已有任务 ID。`admission` 是准入时的说明，不是实时阻塞者列表。
+Workflow 用 `ctx.report_progress(stage, completed, total)` 报告进度，不把进度作为业务状态。
+订阅是 watch 当前值，可能合并中间更新，不是完整事件日志。
+`WorkflowId` 只在当前 Coordinator 实例内唯一，不可跨 Pool 或重建实例当作全局业务身份。
+普通终态按 `Config::task_history` 保留最近 256 项（可配置为 0），不确定终态保留；
+已有 Observer 不因历史淘汰失效。记录在内存中，尚无持久化历史、跨主恢复或远程鉴权接口。
+
+运行 `cargo run --manifest-path storage-pool/Cargo.toml --example coordination_rules` 查看规则与任务快照；
+`shrink_commands` 已改用协调者正式任务索引完成外部命令按 ID 暂停/恢复。

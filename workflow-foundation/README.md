@@ -146,3 +146,16 @@ cargo run --locked --example two_services
 ```
 
 范围与验收见 [DESIGN.md](DESIGN.md)。
+
+## 任务索引、观测与命名准入说明
+
+`CoordinatorClient` 提供 `tasks/task/observe_task` 和按本实例 WorkflowId 的
+`suspend/wait_suspended/resume/cancel`。接受提交时即登记控制句柄，丢弃 Run 不丢失可观测性。
+任务快照报告状态、对象、阶段/进度和准入说明；只读 TaskObserver 同时订阅状态与进度。
+Workflow 可调用 `report_progress`；该记录不参与调度或业务决策。
+`AdmissionPolicy::evaluate` 默认包装 decide，也可返回带规则名的 AdmissionEvaluation，
+Runtime 只评估一次并记录已有任务 ID 与决定。失败/Busy 的提交不产生已接收任务记录。
+
+普通终态按 Config::task_history 有界保留，Uncertain 记录保留。watch 可能合并变化；
+任务 ID 是实例内身份、历史只在内存、准入说明不是实时等待图。生产持久化、跨主身份、
+远程控制和鉴权不在此接口中实现。

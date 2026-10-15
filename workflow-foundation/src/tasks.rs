@@ -1,0 +1,140 @@
+//! Bounded in-memory execution observation; never a business WAL.
+use crate::*;
+use std::collections::{BTreeMap, VecDeque};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskProgress {
+    pub stage: Option<String>,
+    pub completed: u64,
+    pub total: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionMatch {
+    pub existing: WorkflowId,
+    pub evaluation: AdmissionEvaluation,
+}
+#[derive(Debug, Clone)]
+pub struct TaskSnapshot {
+    pub pool: String,
+    pub id: WorkflowId,
+    pub name: &'static str,
+    pub state: RunState,
+    pub objects: Vec<ObjectKey>,
+    pub progress: TaskProgress,
+    pub pause_requested: bool,
+    pub cancellation_requested: bool,
+    /// Admission-time explanation, not a live list of current blockers.
+    pub admission: Vec<AdmissionMatch>,
+}
+#[derive(Clone)]
+pub(crate) struct TaskRecord {
+    pub control: RunControl,
+    pub pool: String,
+    pub admission: Vec<AdmissionMatch>,
+}
+impl TaskRecord {
+    fn snapshot(&self) -> TaskSnapshot {
+        TaskSnapshot {
+            pool: self.pool.clone(),
+            id: self.control.id,
+            name: self.control.name,
+            state: self.control.state(),
+            objects: self.control.objects.lock().unwrap().clone(),
+            progress: self.control.progress(),
+            pause_requested: self.control.pause_requested(),
+            cancellation_requested: self.control.cancellation_requested(),
+            admission: self.admission.clone(),
+        }
+    }
+}
+/// Read-only subscription survives history eviction. watch coalesces updates;
+/// it is a current-state feed, not a guaranteed event journal.
+pub struct TaskObserver {
+    record: TaskRecord,
+    progress: tokio::sync::watch::Receiver<TaskProgress>,
+    ended: bool,
+}
+impl TaskObserver {
+    pub fn snapshot(&self) -> TaskSnapshot {
+        self.record.snapshot()
+    }
+    pub async fn changed(&mut self) -> Outcome<TaskSnapshot> {
+        if self.ended {
+            return Err(Failure::Unavailable);
+        }
+        let changed = tokio::select! {
+            changed = self.record.control.changed() => changed.map(|_| ()),
+            changed = self.progress.changed() => changed.map_err(|_| Failure::Unavailable),
+        };
+        let snapshot = self.snapshot();
+        self.ended = matches!(snapshot.state, RunState::Completed | RunState::Failed(_));
+        if let Err(error) = changed
+            && !self.ended
+        {
+            return Err(error);
+        }
+        Ok(snapshot)
+    }
+}
+pub(crate) struct TaskRegistry {
+    entries: BTreeMap<WorkflowId, TaskRecord>,
+    completed: VecDeque<WorkflowId>,
+    limit: usize,
+}
+impl TaskRegistry {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            completed: VecDeque::new(),
+            limit,
+        }
+    }
+    pub fn insert(&mut self, pool: String, control: RunControl, admission: Vec<AdmissionMatch>) {
+        self.entries.insert(
+            control.id,
+            TaskRecord {
+                control,
+                pool,
+                admission,
+            },
+        );
+    }
+    pub fn finish(&mut self, id: WorkflowId) {
+        if self.entries.get(&id).is_some_and(|record| {
+            matches!(
+                record.control.state(),
+                RunState::Failed(Failure::Uncertain(_))
+            )
+        }) {
+            return;
+        }
+        self.completed.push_back(id);
+        while self.completed.len() > self.limit {
+            if let Some(id) = self.completed.pop_front() {
+                self.entries.remove(&id);
+            }
+        }
+    }
+    pub fn observer(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+        let record = self
+            .entries
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Failure::Rejected("unknown or expired task id".into()))?;
+        Ok(TaskObserver {
+            progress: record.control.progress.clone(),
+            record,
+            ended: false,
+        })
+    }
+    pub fn snapshots(&self) -> Vec<TaskSnapshot> {
+        self.entries.values().map(TaskRecord::snapshot).collect()
+    }
+    pub fn control(&self, id: WorkflowId) -> Outcome<RunControl> {
+        let control = self.observer(id)?.record.control;
+        if matches!(control.state(), RunState::Completed | RunState::Failed(_)) {
+            return Err(Failure::Rejected("task is terminal".into()));
+        }
+        Ok(control)
+    }
+}

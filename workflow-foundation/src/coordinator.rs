@@ -3,6 +3,7 @@ use crate::{
     locks::{Broker, LockTable},
     model::Scope,
     service::{self, ServiceOwner},
+    tasks::TaskRegistry,
     workflow::{ExecutionEnv, execution},
     *,
 };
@@ -11,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     panic::AssertUnwindSafe,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -37,8 +38,37 @@ pub struct CoordinatorClient {
     stop: CancellationToken,
     config: Config,
     state: watch::Receiver<CoordinatorSnapshot>,
+    tasks: Arc<Mutex<TaskRegistry>>,
 }
 impl CoordinatorClient {
+    pub fn tasks(&self) -> Vec<TaskSnapshot> {
+        self.tasks.lock().unwrap().snapshots()
+    }
+    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
+        Ok(self.observe_task(id)?.snapshot())
+    }
+    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+        self.tasks.lock().unwrap().observer(id)
+    }
+    fn control(&self, id: WorkflowId) -> Outcome<RunControl> {
+        if self.scope.is_closed() {
+            return Err(Failure::Unavailable);
+        }
+        self.tasks.lock().unwrap().control(id)
+    }
+    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
+        self.control(id)?.pause()
+    }
+    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
+        self.control(id)?.resume()
+    }
+    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
+        self.control(id)?.cancel();
+        Ok(())
+    }
+    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
+        self.control(id)?.wait_paused().await
+    }
     pub fn snapshot(&self) -> CoordinatorSnapshot {
         self.state.borrow().clone()
     }
@@ -48,7 +78,7 @@ impl CoordinatorClient {
     pub async fn submit_with_policy<
         W: Workflow,
         D: Clone + Send + Sync + 'static,
-        P: AdmissionPolicy<D>,
+        P: AdmissionPolicy<D> + ?Sized,
     >(
         &self,
         workflow: W,
@@ -140,6 +170,9 @@ impl Coordinator {
             held: 0,
             fenced: 0,
         });
+        let tasks = Arc::new(Mutex::new(TaskRegistry::new(config.task_history)));
+        let task_records = tasks.clone();
+        let task_pool = pool.clone();
         let client = CoordinatorClient {
             pool,
             scope: scope.clone(),
@@ -149,6 +182,7 @@ impl Coordinator {
             stop: stop.clone(),
             config: config.clone(),
             state,
+            tasks,
         };
         let task = tokio::spawn(async move {
             let state_guard = StateGuard {
@@ -196,7 +230,7 @@ impl Coordinator {
                         while let Ok(submission) = rx.try_recv() { let _ = submission.reply.send(Err(Failure::Unavailable)); }
                     }
                     event = events.recv() => { if let Some(event) = event { table.event(event, &broker); } }
-                    Some(id) = running.next(), if !running.is_empty() => { active.remove(&id); }
+                    Some(id) = running.next(), if !running.is_empty() => { active.remove(&id); task_records.lock().unwrap().finish(id); }
                     submission = rx.recv(), if !closing => match submission {
                         None => { scope.close(); closing = true; stop.cancel(); }
                         Some(submission) => {
@@ -206,11 +240,14 @@ impl Coordinator {
                                 // old work if any rule rejects or if the new run cannot be accepted.
                                 let decision = std::panic::catch_unwind(AssertUnwindSafe(|| {
                                     let mut victims = Vec::new();
+                                    let mut evaluations = Vec::new();
                                     if let Some(incoming) = &submission.admission {
                                         for (id, (control, descriptor)) in &active {
                                             if matches!(control.state(), RunState::Completed | RunState::Failed(_)) { continue; }
                                             if let Some(existing) = descriptor {
-                                                match incoming.decide(existing) {
+                                                let evaluation = incoming.evaluate(existing);
+                                                evaluations.push(AdmissionMatch { existing: *id, evaluation: evaluation.clone() });
+                                                match evaluation.decision {
                                                     AdmissionDecision::Queue => {}
                                                     AdmissionDecision::CancelExisting => victims.push(*id),
                                                     AdmissionDecision::Reject(reason) => return Err(Failure::Rejected(reason)),
@@ -218,12 +255,13 @@ impl Coordinator {
                                             }
                                         }
                                     }
-                                    Ok(victims)
+                                    Ok((victims, evaluations))
                                 })).unwrap_or_else(|_| Err(Failure::Rejected("admission policy panicked".into())));
-                                let victims = match decision {
-                                    Ok(victims) => victims,
+                                let (victims, evaluations) = match decision {
+                                    Ok(result) => result,
                                     Err(failure) => { let _ = submission.reply.send(Err(failure)); continue; }
                                 };
+                                task_records.lock().unwrap().insert(task_pool.clone(), submission.control.clone(), evaluations);
                                 active.insert(submission.control.id, (submission.control, submission.admission));
                                 running.push(submission.future);
                                 for id in victims { if let Some((control, _)) = active.get(&id) { control.cancel(); } }

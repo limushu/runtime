@@ -16,14 +16,20 @@ use workflow_foundation::{Failure, Outcome};
 
 pub(crate) enum DiskCommand {
     Inspect(DiskId),
+    InspectMany(Vec<DiskId>),
+    SetIoMany(Vec<DiskId>, IoState),
+    RemoveMany(Vec<DiskId>),
     Add(DiskSpec),
     Open(DiskId),
     SetIo(DiskId, IoState),
     Allocate(DiskId, VolumeId),
+    /// Placeholder: remove membership only after VD confirms rebuild completion.
+    Remove(DiskId),
 }
 pub(crate) enum DiskReply {
     Disk(MemberDisk),
     Allocated(Allocation),
+    Disks(Vec<MemberDisk>),
 }
 pub(crate) struct DiskService {
     pool: PoolId,
@@ -60,12 +66,34 @@ impl DomainService for DiskService {
     type Query = Option<DiskId>;
     type View = Vec<MemberDisk>;
     fn resources(request: &DiskCommand) -> Vec<ResourceAccess> {
+        if let DiskCommand::InspectMany(ids)
+        | DiskCommand::SetIoMany(ids, _)
+        | DiskCommand::RemoveMany(ids) = request
+        {
+            return ids
+                .iter()
+                .map(|id| {
+                    let key = object("disk", id.as_str());
+                    if matches!(request, DiskCommand::InspectMany(_)) {
+                        ResourceAccess::read(key)
+                    } else {
+                        ResourceAccess::write(key)
+                    }
+                })
+                .collect();
+        }
         let id = match request {
             DiskCommand::Inspect(id) => {
                 return vec![ResourceAccess::read(object("disk", id.as_str()))];
             }
+            DiskCommand::InspectMany(_)
+            | DiskCommand::SetIoMany(_, _)
+            | DiskCommand::RemoveMany(_) => unreachable!(),
             DiskCommand::Add(s) => &s.id,
-            DiskCommand::Open(id) | DiskCommand::SetIo(id, _) | DiskCommand::Allocate(id, _) => id,
+            DiskCommand::Open(id)
+            | DiskCommand::SetIo(id, _)
+            | DiskCommand::Allocate(id, _)
+            | DiskCommand::Remove(id) => id,
         };
         vec![ResourceAccess::write(object("disk", id.as_str()))]
     }
@@ -74,6 +102,83 @@ impl DomainService for DiskService {
         // all object scheduling is the generic Coordinator's responsibility.
         match request {
             DiskCommand::Inspect(id) => Ok(DiskReply::Disk(self.get(&id)?)),
+            DiskCommand::InspectMany(ids) => {
+                // Routing also includes reserved disks whose Add never committed.
+                let disks = self.disks.lock().unwrap();
+                Ok(DiskReply::Disks(
+                    ids.iter().filter_map(|id| disks.get(id).cloned()).collect(),
+                ))
+            }
+            DiskCommand::RemoveMany(_) => Err(Failure::Failed(
+                "member disk removal is not implemented".into(),
+            )),
+            DiskCommand::SetIoMany(ids, io) => {
+                let mut unique = std::collections::BTreeSet::new();
+                let mut disks = Vec::new();
+                for id in &ids {
+                    if !unique.insert(id.clone()) {
+                        return Err(reject("duplicate disk in IO batch"));
+                    }
+                    disks.push(self.get(id)?);
+                }
+                let results = self
+                    .data_plane
+                    .set_disks_io(&self.pool, &ids, io, ctx.cancellation())
+                    .await
+                    .map_err(|error| {
+                        Failure::Uncertain(format!("batch IO not confirmed: {error}"))
+                    })?;
+                let returned: std::collections::BTreeSet<_> =
+                    results.iter().map(|(id, _)| id.clone()).collect();
+                if results.len() != ids.len() || returned != unique {
+                    return Err(Failure::Uncertain(
+                        "invalid batch IO response identities".into(),
+                    ));
+                }
+                let results: BTreeMap<_, _> = results.into_iter().collect();
+                let mut failure = None;
+                for disk in &mut disks {
+                    match &results[&disk.id] {
+                        Ok(()) => {
+                            let committed = self
+                                .metadata
+                                .commit(
+                                    &self.pool,
+                                    MetadataChange::DiskIo {
+                                        disk: disk.id.clone(),
+                                        expected_revision: disk.revision,
+                                        io,
+                                    },
+                                )
+                                .await;
+                            if let Err(error) = committed {
+                                failure = Some(Failure::Uncertain(format!(
+                                    "batch IO applied but metadata not confirmed: {error}"
+                                )));
+                            } else {
+                                disk.io = io;
+                                disk.revision += 1;
+                                self.disks
+                                    .lock()
+                                    .unwrap()
+                                    .insert(disk.id.clone(), disk.clone());
+                            }
+                        }
+                        Err(error) => {
+                            if failure
+                                .as_ref()
+                                .is_none_or(|e| !matches!(e, Failure::Uncertain(_)))
+                            {
+                                failure = Some(error.clone());
+                            }
+                        }
+                    }
+                }
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(DiskReply::Disks(disks)),
+                }
+            }
             DiskCommand::Add(spec) => {
                 if spec.capacity_blks == 0 {
                     return Err(reject("disk has zero capacity"));
@@ -139,6 +244,13 @@ impl DomainService for DiskService {
                 disk.revision += 1;
                 self.disks.lock().unwrap().insert(id, disk.clone());
                 Ok(DiskReply::Disk(disk))
+            }
+            DiskCommand::Remove(id) => {
+                // TODO: validate no-reference evidence and commit membership removal.
+                Err(Failure::Failed(format!(
+                    "member disk removal is not implemented for disk {}",
+                    id.as_str()
+                )))
             }
             DiskCommand::Allocate(id, volume) => {
                 let mut disk = self.get(&id)?;

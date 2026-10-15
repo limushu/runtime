@@ -43,7 +43,11 @@ async fn main() -> Outcome<()> {
         .result()
         .await?;
     println!("SIMULATION: created {:?}", volume);
-    pool.offline_disk(disks[0].clone()).await?.result().await?;
+    let offline = pool.offline_disk(disks[0].clone()).await?.result().await;
+    match offline {
+        Err(Failure::Failed(message)) => println!("Offline skeleton stopped: {message}"),
+        other => panic!("expected the unimplemented rebuild step, got {other:?}"),
+    }
     pool.online_disk(disks[0].clone()).await?.result().await?;
     println!(
         "After offline/online (replica still Invalid): {:?}",

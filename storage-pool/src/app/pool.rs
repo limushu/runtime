@@ -1,5 +1,8 @@
 use crate::{
-    app::{coordination::PoolWorkflowCoordinator, workflows::*},
+    app::{
+        coordination::{PoolOperation, PoolRules, PoolWorkflowCoordinator, RulePolicy},
+        workflows::*,
+    },
     domain::{disk::DiskService, node::NodeService, ports::*, reject, vd::VdService},
     *,
 };
@@ -7,7 +10,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use workflow_foundation::{Coordinator, CoordinatorSnapshot};
+use workflow_foundation::{
+    AdmissionPolicy, Coordinator, CoordinatorSnapshot, TaskObserver, TaskSnapshot, WorkflowId,
+};
 
 /// A composition/lifecycle boundary, not an aggregate containing all domain data.
 pub struct Pool {
@@ -20,6 +25,7 @@ impl Pool {
         config: Config,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
+        policy: Arc<dyn AdmissionPolicy<PoolOperation>>,
     ) -> Outcome<Self> {
         let mut coordinator = Coordinator::start(id.as_str(), config)?;
         let disk = coordinator.register(
@@ -31,7 +37,7 @@ impl Pool {
         let vd = coordinator.register("vd", VdService::new(id.clone(), metadata, data_plane))?;
         let handle = PoolHandle {
             id,
-            coordinator: PoolWorkflowCoordinator::new(coordinator.client()),
+            coordinator: PoolWorkflowCoordinator::new(coordinator.client(), policy),
             domains: Domains { disk, node, vd },
         };
         Ok(Self {
@@ -57,6 +63,27 @@ pub struct PoolHandle {
 impl PoolHandle {
     pub fn id(&self) -> &PoolId {
         &self.id
+    }
+    pub fn tasks(&self) -> Vec<TaskSnapshot> {
+        self.coordinator.tasks()
+    }
+    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
+        self.coordinator.task(id)
+    }
+    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+        self.coordinator.observe_task(id)
+    }
+    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
+        self.coordinator.suspend(id)
+    }
+    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
+        self.coordinator.resume(id)
+    }
+    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
+        self.coordinator.cancel(id)
+    }
+    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
+        self.coordinator.wait_suspended(id).await
     }
     pub fn execution(&self) -> CoordinatorSnapshot {
         self.coordinator.snapshot()
@@ -109,10 +136,30 @@ impl PoolHandle {
             .await
     }
     pub async fn offline_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
+        let disk = self.domains.disk.query(Some(id.clone())).await?.remove(0);
         self.coordinator
             .submit(OfflineDiskWorkflow {
                 domains: self.domains.clone(),
                 id,
+                node: disk.node,
+            })
+            .await
+    }
+    pub async fn offline_node(&self, request: NodeTransitionRequest) -> Outcome<Run<PoolNode>> {
+        self.coordinator
+            .submit(OfflineNodeWorkflow {
+                specs: self.coordinator.node_disks(&request.node),
+                domains: self.domains.clone(),
+                request,
+            })
+            .await
+    }
+    pub async fn online_node(&self, request: NodeTransitionRequest) -> Outcome<Run<PoolNode>> {
+        self.coordinator
+            .submit(OnlineNodeWorkflow {
+                specs: self.coordinator.node_disks(&request.node),
+                domains: self.domains.clone(),
+                request,
             })
             .await
     }
@@ -149,6 +196,7 @@ pub struct PoolManager {
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
     stopped: bool,
+    policy: Arc<dyn AdmissionPolicy<PoolOperation>>,
 }
 impl PoolManager {
     pub fn new(
@@ -163,7 +211,19 @@ impl PoolManager {
             metadata,
             data_plane,
             stopped: false,
+            policy: Arc::new(RulePolicy::default()),
         }
+    }
+    /// Policy is fixed for this manager before any Pool is created.
+    pub fn with_policy(mut self, policy: Arc<dyn AdmissionPolicy<PoolOperation>>) -> Outcome<Self> {
+        if !self.pools.is_empty() {
+            return Err(reject("configure policy before creating pools"));
+        }
+        self.policy = policy;
+        Ok(self)
+    }
+    pub fn with_rules(self, rules: PoolRules) -> Outcome<Self> {
+        self.with_policy(Arc::new(RulePolicy::new(rules)?))
     }
     pub fn create_pool(&mut self, id: PoolId) -> Outcome<PoolHandle> {
         if self.stopped {
@@ -179,6 +239,7 @@ impl PoolManager {
             self.config.clone(),
             self.metadata.clone(),
             self.data_plane.clone(),
+            self.policy.clone(),
         )?;
         let handle = pool.handle();
         self.pools.insert(id, pool);
@@ -208,6 +269,7 @@ impl PoolManager {
         }
         // Reserve before await. Cancellation or an uncertain commit must never
         // make the same physical disk available to a different Pool.
+        handle.coordinator.register_disk(&spec)?;
         self.disk_owners.insert(spec.id.clone(), pool.clone());
         handle
             .coordinator

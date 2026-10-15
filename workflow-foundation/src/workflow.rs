@@ -55,6 +55,8 @@ pub struct RunControl {
     state: watch::Receiver<RunState>,
     max_signal_bytes: usize,
     pause: watch::Sender<bool>,
+    pub(crate) progress: watch::Receiver<TaskProgress>,
+    pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
 }
 impl RunControl {
     /// Request a pause at the next safe boundary, not preemption of external IO.
@@ -72,6 +74,9 @@ impl RunControl {
         }
         self.pause.send_replace(value);
         Ok(())
+    }
+    pub fn progress(&self) -> TaskProgress {
+        self.progress.borrow().clone()
     }
     pub fn pause_requested(&self) -> bool {
         *self.pause.borrow()
@@ -218,6 +223,8 @@ pub struct WorkflowContext {
     _signal_sender: mpsc::Sender<Signal>,
     state: watch::Sender<RunState>,
     tracker: Tracker,
+    progress: watch::Sender<TaskProgress>,
+    objects: Arc<Mutex<Vec<ObjectKey>>>,
     next_activity: u64,
     pause: watch::Receiver<bool>,
     _pause_sender: watch::Sender<bool>,
@@ -231,6 +238,18 @@ impl WorkflowContext {
     }
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancel
+    }
+    /// Observational only. Invalid/oversized reports are ignored, never failing business work.
+    pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
+        let stage = stage.into();
+        if stage.trim().is_empty() || stage.len() > 256 || total.is_some_and(|t| completed > t) {
+            return;
+        }
+        self.progress.send_replace(TaskProgress {
+            stage: Some(stage),
+            completed,
+            total,
+        });
     }
     pub fn checkpoint(&self) -> Outcome<()> {
         if self.cancel.is_cancelled() || self.scope.is_closed() {
@@ -384,6 +403,8 @@ pub(crate) fn execution<W: Workflow>(
     let (signals, signal_rx) = mpsc::channel(config.capacity);
     let (state, state_rx) = watch::channel(RunState::WaitingObjects);
     let (pause, pause_rx) = watch::channel(false);
+    let (progress, progress_rx) = watch::channel(TaskProgress::default());
+    let objects = Arc::new(Mutex::new(Vec::new()));
     let control = RunControl {
         id,
         name: W::NAME,
@@ -392,6 +413,8 @@ pub(crate) fn execution<W: Workflow>(
         state: state_rx,
         max_signal_bytes: config.max_signal_bytes,
         pause: pause.clone(),
+        progress: progress_rx,
+        objects: objects.clone(),
     };
     let mut completion = Completion {
         reply: Some(reply),
@@ -407,6 +430,8 @@ pub(crate) fn execution<W: Workflow>(
         _signal_sender: signals,
         state,
         tracker: Tracker::default(),
+        progress,
+        objects,
         next_activity: 0,
         pause: pause_rx,
         _pause_sender: pause,
@@ -415,11 +440,9 @@ pub(crate) fn execution<W: Workflow>(
         // Include declaration/constructor panics in the workflow boundary.
         let mut ownership = None;
         let result = AssertUnwindSafe(async {
-            let objects = workflow
-                .objects()
-                .into_iter()
-                .map(ResourceAccess::write)
-                .collect();
+            let declared = workflow.objects();
+            *context.objects.lock().unwrap() = declared.clone();
+            let objects = declared.into_iter().map(ResourceAccess::write).collect();
             ownership = Some(
                 context
                     .broker

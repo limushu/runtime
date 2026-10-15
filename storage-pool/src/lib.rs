@@ -3,9 +3,11 @@ pub mod app;
 pub mod domain;
 pub mod infrastructure;
 
-pub use app::{CreateVolume, Pool, PoolHandle, PoolManager};
+pub use app::{CreateVolume, NodeTransitionRequest, Pool, PoolHandle, PoolManager};
 pub use domain::{PoolId, TierId, disk::*, node::*, vd::*};
-pub use workflow_foundation::{Config, Failure, Outcome, Run};
+pub use workflow_foundation::{
+    Config, Failure, Outcome, Run, TaskObserver, TaskSnapshot, WorkflowId,
+};
 
 // Preserve the existing public module paths for callers.
 pub use app::{coordination, workflows};

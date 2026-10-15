@@ -138,6 +138,8 @@ pub struct Config {
     pub capacity: usize,
     pub max_workflows: usize,
     pub max_signal_bytes: usize,
+    /// Ordinary completed task records. Uncertain records are retained separately.
+    pub task_history: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -145,6 +147,7 @@ impl Default for Config {
             capacity: 64,
             max_workflows: 256,
             max_signal_bytes: 64 * 1024,
+            task_history: 256,
         }
     }
 }
