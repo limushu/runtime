@@ -117,48 +117,6 @@ async fn signal_is_buffered_while_paused_and_resume_does_not_restart_run() {
     pool.shutdown().await.unwrap();
 }
 
-struct QueuePolicy;
-impl AdmissionPolicy<u32> for QueuePolicy {
-    fn decide(&self, _: &u32, _: &u32) -> AdmissionDecision {
-        AdmissionDecision::Queue
-    }
-}
-struct MixedPolicy;
-impl AdmissionPolicy<u32> for MixedPolicy {
-    fn decide(&self, _: &u32, existing: &u32) -> AdmissionDecision {
-        if *existing == 1 {
-            AdmissionDecision::CancelExisting
-        } else {
-            AdmissionDecision::Reject("second conflict cannot be replaced".into())
-        }
-    }
-}
-#[tokio::test]
-async fn any_rejection_prevents_all_partial_cancellation_decisions() {
-    let (mut pool, _, _) = setup();
-    let client = pool.client();
-    let mut a = client
-        .submit_with_policy(Wait { timer: false }, 1u32, Arc::new(QueuePolicy))
-        .await
-        .unwrap();
-    let mut b = client
-        .submit_with_policy(Wait { timer: false }, 2u32, Arc::new(QueuePolicy))
-        .await
-        .unwrap();
-    assert!(matches!(
-        client
-            .submit_with_policy(Wait { timer: false }, 3u32, Arc::new(MixedPolicy))
-            .await,
-        Err(Failure::Rejected(_))
-    ));
-    assert!(!a.control.cancellation_requested());
-    assert!(!b.control.cancellation_requested());
-    a.control.cancel();
-    b.control.cancel();
-    assert_eq!(finish(&mut a).await, Err(Failure::Cancelled));
-    assert_eq!(finish(&mut b).await, Err(Failure::Cancelled));
-    pool.shutdown().await.unwrap();
-}
 #[tokio::test]
 async fn expired_timer_waits_for_resume_and_cancellation_wakes_paused_run() {
     let (mut pool, _, _) = setup();
@@ -220,19 +178,50 @@ async fn pause_withdraws_pending_resource_request_and_shutdown_cancels_pause() {
     assert_eq!(finish(&mut waiter).await, Err(Failure::Cancelled));
 }
 
-struct Policy;
-impl AdmissionPolicy<u32> for Policy {
-    fn decide(&self, incoming: &u32, existing: &u32) -> AdmissionDecision {
-        if incoming == existing {
-            AdmissionDecision::Reject("duplicate".into())
-        } else {
-            AdmissionDecision::CancelExisting
-        }
-    }
-}
 #[tokio::test]
-async fn rejected_or_over_capacity_replacement_does_not_cancel_old_run() {
-    let mut pool = Coordinator::start(
+async fn deferred_execution_requires_explicit_start_and_obeys_pause() {
+    let (mut runtime, _, _) = setup();
+    let (mut run, permit) = runtime.client().defer(Wait { timer: false }).await.unwrap();
+    assert_eq!(run.control.state(), RunState::WaitingObjects);
+    run.control.pause().unwrap();
+    permit.start();
+    tokio::time::timeout(LIMIT, run.control.wait_paused())
+        .await
+        .unwrap()
+        .unwrap();
+    run.control.signal(Signal::new("finish", "")).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), run.result())
+            .await
+            .is_err()
+    );
+    run.control.resume().unwrap();
+    finish(&mut run).await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deferred_execution_can_be_cancelled_rejected_or_abandoned_without_running() {
+    let (mut runtime, _, _) = setup();
+    let (mut cancelled, permit) = runtime.client().defer(Wait { timer: false }).await.unwrap();
+    cancelled.control.cancel();
+    assert_eq!(finish(&mut cancelled).await, Err(Failure::Cancelled));
+    permit.start();
+    let (mut rejected, permit) = runtime.client().defer(Wait { timer: false }).await.unwrap();
+    permit.reject(Failure::Rejected("fenced".into()));
+    assert_eq!(
+        finish(&mut rejected).await,
+        Err(Failure::Rejected("fenced".into()))
+    );
+    let (mut abandoned, permit) = runtime.client().defer(Wait { timer: false }).await.unwrap();
+    drop(permit);
+    assert_eq!(finish(&mut abandoned).await, Err(Failure::Unavailable));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deferred_execution_counts_toward_capacity_and_shutdown_cancels_it() {
+    let mut runtime = WorkflowRuntime::start(
         "limited",
         Config {
             max_workflows: 1,
@@ -240,76 +229,42 @@ async fn rejected_or_over_capacity_replacement_does_not_cancel_old_run() {
         },
     )
     .unwrap();
-    let client = pool.client();
-    let mut first = client
-        .submit_with_policy(Wait { timer: false }, 1u32, Arc::new(Policy))
-        .await
-        .unwrap();
-    state(&first.control, RunState::WaitingSignal).await;
+    let (mut first, _permit) = runtime.client().defer(Wait { timer: false }).await.unwrap();
     assert!(matches!(
-        client
-            .submit_with_policy(Wait { timer: false }, 2u32, Arc::new(Policy))
-            .await,
+        runtime.client().defer(Wait { timer: false }).await,
         Err(Failure::Busy)
     ));
     assert!(!first.control.cancellation_requested());
-    first.control.cancel();
+    runtime.shutdown().await.unwrap();
     assert_eq!(finish(&mut first).await, Err(Failure::Cancelled));
-    pool.shutdown().await.unwrap();
-
-    let (mut pool, _, _) = setup();
-    let client = pool.client();
-    let mut first = client
-        .submit_with_policy(Wait { timer: false }, 1u32, Arc::new(Policy))
-        .await
-        .unwrap();
-    assert!(matches!(
-        client
-            .submit_with_policy(Wait { timer: false }, 1u32, Arc::new(Policy))
-            .await,
-        Err(Failure::Rejected(_))
-    ));
-    assert!(!first.control.cancellation_requested());
-    let mut replacement = client
-        .submit_with_policy(Wait { timer: false }, 2u32, Arc::new(Policy))
-        .await
-        .unwrap();
-    assert_eq!(finish(&mut first).await, Err(Failure::Cancelled));
-    replacement
-        .control
-        .signal(Signal::new("finish", ""))
-        .await
-        .unwrap();
-    finish(&mut replacement).await.unwrap();
-    pool.shutdown().await.unwrap();
 }
 
-struct PanickingPolicy;
-impl AdmissionPolicy<u32> for PanickingPolicy {
-    fn decide(&self, _: &u32, _: &u32) -> AdmissionDecision {
-        panic!("bad policy")
+struct MarkExecution(Arc<std::sync::atomic::AtomicBool>);
+#[async_trait]
+impl Workflow for MarkExecution {
+    type Output = ();
+    const NAME: &'static str = "passive-driver-proof";
+    async fn run(self, _: &mut WorkflowContext) -> Outcome<()> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }
 #[tokio::test]
-async fn policy_panic_rejects_submission_without_killing_existing_execution() {
-    let (mut pool, _, _) = setup();
-    let client = pool.client();
-    let mut first = client
-        .submit_with_policy(Wait { timer: false }, 1u32, Arc::new(Policy))
-        .await
-        .unwrap();
-    assert!(matches!(
-        client
-            .submit_with_policy(Wait { timer: false }, 2u32, Arc::new(PanickingPolicy))
-            .await,
-        Err(Failure::Rejected(_))
-    ));
-    assert!(!first.control.cancellation_requested());
-    first
-        .control
-        .signal(Signal::new("finish", ""))
-        .await
-        .unwrap();
-    finish(&mut first).await.unwrap();
-    pool.shutdown().await.unwrap();
+async fn driver_executes_only_when_polled_by_its_owner() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let ran = Arc::new(AtomicBool::new(false));
+    let mut driver = WorkflowDriver::new("embedded", Config::default()).unwrap();
+    let (mut run, permit) = driver.defer(MarkExecution(ran.clone())).unwrap();
+    permit.start();
+    // A spawned host would execute during this yield. The passive driver cannot.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(run.control.state(), RunState::WaitingObjects);
+    assert_eq!(
+        tokio::time::timeout(LIMIT, driver.tick()).await.unwrap(),
+        Some(run.id())
+    );
+    assert!(ran.load(Ordering::SeqCst));
+    finish(&mut run).await.unwrap();
+    driver.shutdown().await.unwrap();
 }

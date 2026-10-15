@@ -118,7 +118,7 @@ pub enum Lifecycle {
     Stopped,
 }
 #[derive(Debug, Clone)]
-pub struct CoordinatorSnapshot {
+pub struct RuntimeSnapshot {
     pub pool: String,
     pub lifecycle: Lifecycle,
     pub workflows: usize,

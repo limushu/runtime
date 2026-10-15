@@ -1,15 +1,15 @@
-//! Pool-scoped workflow coordination, without storage-domain dependencies.
-mod admission;
-mod coordinator;
+//! Business-free execution mechanics; applications can drive workflows in their own event loop.
+mod driver;
 mod locks;
 mod model;
 mod service;
+mod standalone;
 mod tasks;
 mod workflow;
 
-pub use admission::{AdmissionDecision, AdmissionEvaluation, AdmissionPolicy};
-pub use coordinator::{Coordinator, CoordinatorClient};
+pub use driver::{ExecutionView, StartPermit, WorkflowDriver};
 pub use model::*;
-pub use service::{ActivityContext, DomainService, ServiceClient};
-pub use tasks::{AdmissionMatch, TaskObserver, TaskProgress, TaskSnapshot};
+pub use service::{ActivityClient, ActivityContext, ServiceClient, ServiceHandler};
+pub use standalone::{RuntimeHandle, WorkflowRuntime};
+pub use tasks::{TaskObserver, TaskProgress, TaskSnapshot};
 pub use workflow::{Run, RunControl, Workflow, WorkflowContext};

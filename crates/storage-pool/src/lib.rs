@@ -1,15 +1,15 @@
-//! Storage application built on the business-free workflow foundation.
-pub mod app;
-pub mod domain;
-pub mod infrastructure;
+//! Storage-pool application, organized by business capability.
+pub mod adapters;
+pub mod domains;
+mod pool;
+pub mod ports;
+mod requests;
+mod support;
+pub mod task_center;
+pub mod workflows;
 
-pub use app::{CreateVolume, NodeTransitionRequest, Pool, PoolHandle, PoolManager};
-pub use domain::{PoolId, TierId, disk::*, node::*, vd::*};
-pub use workflow_foundation::{
-    Config, Failure, Outcome, Run, TaskObserver, TaskSnapshot, WorkflowId,
-};
-
-// Preserve the existing public module paths for callers.
-pub use app::{coordination, workflows};
-pub use domain::ports;
-pub use infrastructure::adapters;
+pub use domains::{PoolId, TierId, disk::*, node::*, vd::*};
+pub use pool::{Pool, PoolHandle, PoolManager};
+pub use requests::{CreateVolume, NodeTransitionRequest};
+pub use task_center::{TaskObserver, TaskSnapshot};
+pub use workflow_foundation::{Config, Failure, Outcome, Run, WorkflowId};

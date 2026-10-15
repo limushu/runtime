@@ -3,6 +3,8 @@
 当前代码只有两个 workspace 成员，入口以本页和根 README 为准。
 
 - [当前架构与目录边界](architecture.md)
+- [TaskCenter 冲突规则开发说明](task-center.md)
+- [TaskCenter 重构规格与证据](changes/2026-10-15-task-center.md)
 - [构建与验证](verification.md)
 - [本次目录迁移规格与证据](changes/2026-10-15-workspace-layout.md)
 - [基础库接口与语义](../crates/workflow-foundation/README.md)

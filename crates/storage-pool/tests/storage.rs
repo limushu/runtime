@@ -1042,8 +1042,9 @@ async fn pool_shutdown_waits_for_inflight_operation_and_is_retryable() {
 
 #[test]
 fn conflict_policy_is_explicit_and_testable_without_running_services() {
-    use storage_pool::coordination::*;
-    use workflow_foundation::{AdmissionDecision::*, AdmissionPolicy, ObjectKey};
+    use storage_pool::task_center::ConflictDecision::*;
+    use storage_pool::task_center::*;
+    use workflow_foundation::ObjectKey;
     let node = node_id("n");
     let operation = |kind| PoolOperation {
         kind,
@@ -1059,27 +1060,30 @@ fn conflict_policy_is_explicit_and_testable_without_running_services() {
         sequence: 4,
         connected: false,
     });
-    assert_eq!(PoolConflictPolicy.decide(&new, &old), CancelExisting);
-    assert!(matches!(PoolConflictPolicy.decide(&old, &new), Reject(_)));
+    assert_eq!(TaskCenter::conflict(&new, &old).decision, CancelThenWait);
+    assert!(matches!(
+        TaskCenter::conflict(&old, &new).decision,
+        Reject(_)
+    ));
     assert_eq!(
-        PoolConflictPolicy.decide(&new, &operation(OperationKind::LoadNode(node))),
-        CancelExisting
+        TaskCenter::conflict(&new, &operation(OperationKind::LoadNode(node))).decision,
+        CancelThenWait
     );
     let create = operation(OperationKind::CreateVolume(volume_id("v")));
     let offline = operation(OperationKind::OfflineDisk(disk_id("d")));
-    assert_eq!(PoolConflictPolicy.decide(&offline, &create), Queue);
+    assert_eq!(TaskCenter::conflict(&offline, &create).decision, Wait);
 }
 
 #[test]
 fn workflows_do_not_bypass_activity_with_direct_domain_queries() {
     for source in [
-        include_str!("../src/app/workflows/observe_node.rs"),
-        include_str!("../src/app/workflows/load_node.rs"),
-        include_str!("../src/app/workflows/online_disk.rs"),
-        include_str!("../src/app/workflows/offline_disk.rs"),
-        include_str!("../src/app/workflows/create_volume.rs"),
-        include_str!("../src/app/workflows/offline_node.rs"),
-        include_str!("../src/app/workflows/online_node.rs"),
+        include_str!("../src/workflows/observe_node.rs"),
+        include_str!("../src/workflows/load_node.rs"),
+        include_str!("../src/workflows/online_disk.rs"),
+        include_str!("../src/workflows/offline_disk.rs"),
+        include_str!("../src/workflows/create_volume.rs"),
+        include_str!("../src/workflows/offline_node.rs"),
+        include_str!("../src/workflows/online_node.rs"),
     ] {
         assert!(!source.contains(".query("));
     }
@@ -1444,76 +1448,10 @@ async fn batch_io_publishes_all_confirmed_items_even_when_one_item_fails() {
     manager.shutdown().await.unwrap();
 }
 
-#[test]
-fn configured_rules_are_ordered_named_and_cannot_override_stale_node_guard() {
-    use storage_pool::coordination::*;
-    use workflow_foundation::{AdmissionDecision, AdmissionPolicy, ObjectKey};
-    let mut rules = PoolRules::default();
-    rules.rules.insert(
-        0,
-        CoordinationRule::new(
-            "disk-offline-waits-for-online",
-            OperationSelector::Class(OperationClass::OfflineDisk),
-            OperationSelector::Class(OperationClass::OnlineDisk),
-            RuleRelation::SameDisk,
-            AdmissionDecision::Queue,
-        ),
-    );
-    rules.duplicate = AdmissionDecision::Queue;
-    let policy = RulePolicy::new(rules).unwrap();
-    let operation = |kind| PoolOperation {
-        kind,
-        objects: vec![ObjectKey::new("disk", "d1"), ObjectKey::new("node", "n1")],
-    };
-    let offline = operation(OperationKind::OfflineDisk(disk_id("d1")));
-    let online = operation(OperationKind::OnlineDisk(disk_id("d1")));
-    let decision = policy.evaluate(&offline, &online);
-    assert_eq!(
-        decision.rule.as_deref(),
-        Some("disk-offline-waits-for-online")
-    );
-    assert_eq!(decision.decision, AdmissionDecision::Queue);
-    assert_eq!(policy.decide(&offline, &offline), AdmissionDecision::Queue);
-    let stale = operation(OperationKind::OnlineNode {
-        id: node_id("n1"),
-        sequence: 1,
-    });
-    let newer = operation(OperationKind::OfflineNode {
-        id: node_id("n1"),
-        sequence: 2,
-    });
-    assert_eq!(
-        policy.evaluate(&stale, &newer).rule.as_deref(),
-        Some("stale-node-guard")
-    );
-    assert!(matches!(
-        policy.decide(&stale, &newer),
-        AdmissionDecision::Reject(_)
-    ));
-    let mut invalid = PoolRules::default();
-    invalid.rules.push(invalid.rules[0].clone());
-    assert!(RulePolicy::new(invalid).is_err());
-}
-
 #[tokio::test]
-async fn pool_uses_configured_queue_rule_and_exposes_id_controls_and_reason() {
-    use storage_pool::coordination::*;
-    use workflow_foundation::AdmissionDecision;
+async fn task_center_explains_replacement_and_controls_waiting_task_by_id() {
     let plane = Arc::new(ControlledPlane::default());
-    let mut rules = PoolRules::default();
-    rules.rules.insert(
-        0,
-        CoordinationRule::new(
-            "disk-offline-waits-for-online",
-            OperationSelector::Class(OperationClass::OfflineDisk),
-            OperationSelector::Class(OperationClass::OnlineDisk),
-            RuleRelation::SameDisk,
-            AdmissionDecision::Queue,
-        ),
-    );
-    let mut manager = manager(Arc::new(MemoryMetadata::default()), plane.clone())
-        .with_rules(rules)
-        .unwrap();
+    let mut manager = manager(Arc::new(MemoryMetadata::default()), plane.clone());
     let pool = manager.create_pool(pool_id("a")).unwrap();
     add(&mut manager, &pool, "d1", "n1", 2).await;
     let gate = Gate::new();
@@ -1521,65 +1459,63 @@ async fn pool_uses_configured_queue_rule_and_exposes_id_controls_and_reason() {
     let online = pool.online_disk(disk_id("d1")).await.unwrap();
     gate.wait().await;
     let offline = pool.offline_disk(disk_id("d1")).await.unwrap();
-    assert!(!online.control.cancellation_requested());
+    assert!(online.control.cancellation_requested());
     let snapshot = pool.task(offline.id()).unwrap();
+    assert_eq!(snapshot.conflicts.len(), 1);
     assert_eq!(
-        snapshot.admission[0].evaluation.rule.as_deref(),
-        Some("disk-offline-waits-for-online")
+        snapshot.conflicts[0].conflict.reason,
+        "disk-down-cancels-disk-up"
     );
-    assert_eq!(snapshot.admission[0].existing, online.id());
+    assert_eq!(snapshot.conflicts[0].existing, online.id());
     assert_eq!(snapshot.state, RunState::WaitingObjects);
     pool.cancel(offline.id()).unwrap();
     assert_eq!(result(offline).await, Err(Failure::Cancelled));
     gate.open();
-    result(online).await.unwrap();
+    assert_eq!(result(online).await, Err(Failure::Cancelled));
     manager.shutdown().await.unwrap();
 }
 
-struct CustomQueuePolicy;
-impl workflow_foundation::AdmissionPolicy<coordination::PoolOperation> for CustomQueuePolicy {
-    fn decide(
-        &self,
-        _: &coordination::PoolOperation,
-        _: &coordination::PoolOperation,
-    ) -> workflow_foundation::AdmissionDecision {
-        workflow_foundation::AdmissionDecision::Queue
+#[test]
+fn vertical_modules_preserve_model_service_runtime_dependencies() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for domain in ["disk", "node", "vd"] {
+        let folder = src.join("domains").join(domain);
+        let model = std::fs::read_to_string(folder.join("model.rs")).unwrap();
+        for term in [
+            "workflow_foundation",
+            "tokio",
+            "ActivityContext",
+            "::service",
+            "::runtime",
+            "crate::support",
+        ] {
+            assert!(!model.contains(term), "{domain}/model depends on {term}");
+        }
+        let service = std::fs::read_to_string(folder.join("service.rs")).unwrap();
+        for term in [
+            "ServiceHandler",
+            "ActivityContext",
+            "::runtime",
+            "ResourceAccess",
+            "task_center",
+        ] {
+            assert!(
+                !service.contains(term),
+                "{domain}/service depends on {term}"
+            );
+        }
     }
-    fn evaluate(
-        &self,
-        incoming: &coordination::PoolOperation,
-        existing: &coordination::PoolOperation,
-    ) -> workflow_foundation::AdmissionEvaluation {
-        workflow_foundation::AdmissionEvaluation::named(
-            "custom-maintenance-policy",
-            self.decide(incoming, existing),
-        )
+    for entry in std::fs::read_dir(src.join("workflows")).unwrap() {
+        let source = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        for term in ["::runtime", "Host", "AdmissionPolicy"] {
+            assert!(!source.contains(term), "workflow depends on {term}");
+        }
     }
-}
-#[tokio::test]
-async fn pool_accepts_coded_policy_without_workflow_changes() {
-    let plane = Arc::new(ControlledPlane::default());
-    let mut manager = manager(Arc::new(MemoryMetadata::default()), plane.clone())
-        .with_policy(Arc::new(CustomQueuePolicy))
-        .unwrap();
-    let pool = manager.create_pool(pool_id("a")).unwrap();
-    add(&mut manager, &pool, "d1", "n1", 2).await;
-    let gate = Gate::new();
-    *plane.open_gate.lock().unwrap() = Some(gate.clone());
-    let online = pool.online_disk(disk_id("d1")).await.unwrap();
-    gate.wait().await;
-    let offline = pool.offline_disk(disk_id("d1")).await.unwrap();
-    assert!(!online.control.cancellation_requested());
-    assert_eq!(
-        pool.task(offline.id()).unwrap().admission[0]
-            .evaluation
-            .rule
-            .as_deref(),
-        Some("custom-maintenance-policy")
-    );
-    pool.cancel(offline.id()).unwrap();
-    assert_eq!(result(offline).await, Err(Failure::Cancelled));
-    gate.open();
-    result(online).await.unwrap();
-    manager.shutdown().await.unwrap();
+    let pool = std::fs::read_to_string(src.join("pool.rs")).unwrap();
+    assert!(!pool.contains("WorkflowRuntime"));
+    assert!(!pool.contains("RuntimeHandle"));
+    let center = std::fs::read_to_string(src.join("task_center/mod.rs")).unwrap();
+    assert_eq!(center.matches("tokio::spawn(").count(), 1);
+    assert!(center.contains("driver.tick()"));
+    assert!(!center.contains("RuntimeHandle"));
 }

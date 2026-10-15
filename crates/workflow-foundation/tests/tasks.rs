@@ -122,35 +122,14 @@ async fn observer_wakes_on_progress_even_without_run_state_transition() {
     pool.shutdown().await.unwrap();
 }
 
-struct NamedPolicy;
-impl AdmissionPolicy<u32> for NamedPolicy {
-    fn decide(&self, _: &u32, _: &u32) -> AdmissionDecision {
-        AdmissionDecision::Queue
-    }
-    fn evaluate(&self, _: &u32, _: &u32) -> AdmissionEvaluation {
-        AdmissionEvaluation::named("maintenance-waits", AdmissionDecision::Queue)
-    }
-}
 #[tokio::test]
-async fn waiting_task_exposes_admission_explanation_and_is_cancelable_by_id() {
+async fn waiting_task_is_observable_and_cancelable_by_id() {
     let (mut pool, _, _) = setup();
     let client = pool.client();
-    let mut first = client
-        .submit_with_policy(Waiting, 1u32, Arc::new(NamedPolicy))
-        .await
-        .unwrap();
+    let mut first = client.submit(Waiting).await.unwrap();
     state(&first.control, RunState::WaitingSignal).await;
-    let mut second = client
-        .submit_with_policy(Waiting, 2u32, Arc::new(NamedPolicy))
-        .await
-        .unwrap();
+    let mut second = client.submit(Waiting).await.unwrap();
     let snapshot = client.task(second.id()).unwrap();
-    assert_eq!(snapshot.admission.len(), 1);
-    assert_eq!(snapshot.admission[0].existing, first.id());
-    assert_eq!(
-        snapshot.admission[0].evaluation.rule.as_deref(),
-        Some("maintenance-waits")
-    );
     assert_eq!(snapshot.state, RunState::WaitingObjects);
     client.cancel(second.id()).unwrap();
     assert_eq!(finish(&mut second).await, Err(Failure::Cancelled));
@@ -174,7 +153,7 @@ impl Workflow for Immediate {
 }
 #[tokio::test]
 async fn history_is_bounded_but_uncertain_tasks_and_existing_observers_are_retained() {
-    let mut pool = Coordinator::start(
+    let mut pool = WorkflowRuntime::start(
         "p",
         Config {
             task_history: 1,
@@ -206,7 +185,7 @@ async fn history_is_bounded_but_uncertain_tasks_and_existing_observers_are_retai
 
 #[tokio::test]
 async fn rejected_admission_is_not_registered_as_an_accepted_task() {
-    let mut pool = Coordinator::start(
+    let mut pool = WorkflowRuntime::start(
         "p",
         Config {
             max_workflows: 1,

@@ -1,38 +1,65 @@
-# 当前架构与目录边界
+# 当前架构与依赖边界
 
-仓库是虚拟 Cargo workspace，根目录不再承载第三份业务实现。
+## 组合结构
 
 ```text
-runtime/
-├─ Cargo.toml / Cargo.lock       # 唯一 workspace 与依赖锁
-├─ crates/
-│  ├─ workflow-foundation/       # 业务无关的执行基础
-│  │  ├─ src/                   # Workflow、服务宿主、准入、占用、任务观测
-│  │  ├─ tests/                 # 基础语义集成测试
-│  │  └─ examples/              # 无存储业务的用法示例
-│  └─ storage-pool/              # 存储池业务
-│     ├─ src/
-│     │  ├─ app/                # Pool 装配、请求、协调策略与具名 Workflow
-│     │  ├─ domain/             # disk / node / vd 对象及领域能力、外部端口
-│     │  └─ infrastructure/     # 元数据、数据面适配器
-│     ├─ tests/                 # 业务、交接与可观测性验证
-│     └─ examples/              # 生命周期、缩容命令、协调规则
-├─ docs/                       # 当前导航、架构、验证、变更记录
-│  └─ archive/legacy/           # 历史理论、草案与配图，不参与构建
-└─ scripts/verify.ps1           # workspace 统一检查入口
+PoolManager
+└─ Pool（组合根 pool.rs）
+   ├─ TaskCenter（一个事件循环）
+   │  ├─ 冲突判断、队列、逻辑对象占用与隔离
+   │  └─ 直接推进 Workflow Future（嵌入通用执行驱动，无独立 task）
+   ├─ DiskService + DiskHost（独立服务宿主）
+   ├─ NodeService + NodeHost（独立服务宿主）
+   └─ VdService + VdHost（独立服务宿主）
 ```
 
-依赖方向：`storage-pool → workflow-foundation`，基础库不得反向依赖存储对象。
+Task 是一次完整 Workflow 执行，Activity 是其步骤。硬盘上线是一个流程，Add/Open/Enable
+是内部步骤。业务请求只经 PoolHandle/PoolManager，不能向 Pool 注入任意 Workflow 或策略。
+Pool 没有单独的 runtime 字段，也不使用 RuntimeHandle 向另一条协调队列提交。
 
-- PoolManager 管路由与生命周期，Pool 是组合和隔离边界。
-- PoolWorkflowCoordinator 定义应用协调策略；Runtime 执行准入、取消、等待停稳等机制。
-- Workflow 表达完整业务目标；领域读写步骤经 Activity，外部观察通过 Query。
-- 各领域拥有自己的实体与状态，通过显式端口访问外部能力，不自行维护冲突排队器。
-- 当前领域服务实现基础库的 DomainService 契约，尚未进一步拆分纯领域与执行适配层。
+## 按业务组织，而不是把同一领域拆散
 
-本轮只整理物理目录、构建配置与导航，不改公开 Rust crate 名称、模块兼容导出和业务语义。
-保留分支已有的配置化规则、任务观察/控制、节点与磁盘交接及占位失败语义。
-没有为了目录美观额外拆出 types、ports 等小 crate，也没有添加未实现的生产应用目录。
+domains 表示“业务领域分组”，不是声称其中所有文件都是 DDD 纯领域层。
 
-旧 service-sdk-next、根 src 和旧根 tests 已移除，不在仓库内保留第二套可编译实现。
-旧源码可从 Git 历史恢复；迁移前未提交文件另存于仓库外本地备份。
+- `domains/{disk,node,vd}/model.rs`：对象、不变量、状态规则，只依赖标准库及其他领域模型。
+- `domains/{disk,node,vd}/service.rs`：能力与已确认状态；组织领域校验、数据面操作、元数据提交。
+  不实现 ServiceHandler、不使用 ActivityContext、不认识托管自己的 runtime、不维护对象冲突队列。
+- `domains/{disk,node,vd}/runtime.rs`：服务托管适配，声明步骤资源并转发能力调用；runtime 依赖 service，
+  service 依赖 model，不能反向依赖。
+- `domains/mod.rs`：公共身份和 DomainError；错误转换放在最外层 support.rs。
+- `ports.rs` / `adapters.rs`：外部接口与模拟实现。取消/IO 是应用能力边界，不进入领域模型。
+- `workflows/`：通过 ActivityClient 的类型化能力通道调用步骤，不知道具体服务宿主类型。
+- `task_center/`：同一具体组件的协调状态与普通业务判断；conflicts.rs 不是插件策略系统。
+- `pool.rs`：组合根，装配 TaskCenter 和领域服务。不把组合逻辑放入模型。
+
+自动测试检查 model 不引用 Tokio/执行框架，service 不依赖 runtime，Workflow 不引用服务宿主。
+当前 service/ports 使用执行层 Outcome 和取消令牌，model 返回独立 DomainError。
+
+## 一个循环协调并执行
+
+TaskCenter 的 select 同时处理新请求、停止请求和 driver.tick()。
+WorkflowDriver 是一组可轮询的执行状态/Future，本身没有提交队列，也不会 spawn 执行宿主。
+defer() 是同步登记，不是发消息给另一个 Runtime。TaskCenter 持有启动许可，冲突消除后放行；
+在同一个循环内轮询多个 Workflow，因此不需要 await 整个流程才接收下一条请求。
+
+WorkflowRuntime/RuntimeHandle 仅是基础库给无自有事件循环的示例使用的可选独立封装，
+代码位于 standalone.rs，存储 Pool 不构造它。ExecutionView 只共享观察/控制状态，
+不调度、不提交、不启动 task。
+
+TaskCenter 检查全部在途冲突及容量。只有成功登记才实施取消；旧流程和 Activity 实际终态前
+不释放逻辑对象。排队任务计入容量、可取消；丢弃调用者/Run 不丢失已接受执行。
+不确定结果保留逻辑对象隔离；被隔离的新任务不会取消其他活动任务，被拒绝的后继不扩散隔离。
+
+受控执行不再重复取得 Workflow 对象锁。驱动保留 Activity 资源读写保护、停稳跟踪与资源隔离，
+尤其保护 VD 反向引用索引等共享结构。服务内部没有业务对象排队器。
+通用独立 submit 仍提供简单对象互斥供示例/测试使用，不能绕过 Pool 正式入口混用。
+
+暂停仍保留逻辑对象；排队任务只记录暂停请求，获准到达安全边界才确认 Paused。
+pool.scheduling() 表示业务排队/运行/逻辑隔离；pool.execution() 表示底层执行与资源计数。
+pool.task(id).conflicts 是准入时解释，不是实时等待图。
+
+## 限制
+
+没有持久化任务历史、确定性重放、跨主恢复、自动重试、动态扩展对象集合、真实重建/成员删除。
+拓扑身份不可变；节点关联盘集合包含已预约但未提交的盘。资源声明仍较保守，同节点的部分
+磁盘流程会串行，本轮不改变原有冲突范围。强制 Drop 不能证明远端 IO 已停止。

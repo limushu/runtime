@@ -91,7 +91,7 @@ impl Probe {
     }
 }
 #[async_trait]
-impl DomainService for Probe {
+impl ServiceHandler for Probe {
     type Request = Work;
     type Reply = usize;
     type Query = ();
@@ -125,11 +125,11 @@ impl DomainService for Probe {
     }
 }
 pub fn setup() -> (
-    Coordinator,
+    WorkflowRuntime,
     ServiceClient<Probe>,
     mpsc::UnboundedReceiver<&'static str>,
 ) {
-    let mut pool = Coordinator::start("test-pool", Config::default()).unwrap();
+    let mut pool = WorkflowRuntime::start("test-pool", Config::default()).unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
     let service = pool.register("probe", Probe::new(tx)).unwrap();
     (pool, service, rx)

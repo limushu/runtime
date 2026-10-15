@@ -8,11 +8,6 @@ pub struct TaskProgress {
     pub completed: u64,
     pub total: Option<u64>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmissionMatch {
-    pub existing: WorkflowId,
-    pub evaluation: AdmissionEvaluation,
-}
 #[derive(Debug, Clone)]
 pub struct TaskSnapshot {
     pub pool: String,
@@ -23,14 +18,11 @@ pub struct TaskSnapshot {
     pub progress: TaskProgress,
     pub pause_requested: bool,
     pub cancellation_requested: bool,
-    /// Admission-time explanation, not a live list of current blockers.
-    pub admission: Vec<AdmissionMatch>,
 }
 #[derive(Clone)]
 pub(crate) struct TaskRecord {
     pub control: RunControl,
     pub pool: String,
-    pub admission: Vec<AdmissionMatch>,
 }
 impl TaskRecord {
     fn snapshot(&self) -> TaskSnapshot {
@@ -43,7 +35,6 @@ impl TaskRecord {
             progress: self.control.progress(),
             pause_requested: self.control.pause_requested(),
             cancellation_requested: self.control.cancellation_requested(),
-            admission: self.admission.clone(),
         }
     }
 }
@@ -89,15 +80,9 @@ impl TaskRegistry {
             limit,
         }
     }
-    pub fn insert(&mut self, pool: String, control: RunControl, admission: Vec<AdmissionMatch>) {
-        self.entries.insert(
-            control.id,
-            TaskRecord {
-                control,
-                pool,
-                admission,
-            },
-        );
+    pub fn insert(&mut self, pool: String, control: RunControl) {
+        self.entries
+            .insert(control.id, TaskRecord { control, pool });
     }
     pub fn finish(&mut self, id: WorkflowId) {
         if self.entries.get(&id).is_some_and(|record| {

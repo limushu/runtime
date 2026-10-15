@@ -6,7 +6,7 @@ use workflow_foundation::*;
 
 struct Source;
 #[async_trait]
-impl DomainService for Source {
+impl ServiceHandler for Source {
     type Request = u64;
     type Reply = String;
     type Query = ();
@@ -29,7 +29,7 @@ struct Sink {
     values: Mutex<Vec<String>>,
 }
 #[async_trait]
-impl DomainService for Sink {
+impl ServiceHandler for Sink {
     type Request = String;
     type Reply = usize;
     type Query = ();
@@ -77,7 +77,7 @@ impl Workflow for Transfer {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Outcome<()> {
-    let mut pool = Coordinator::start("pool-example", Config::default())?;
+    let mut pool = WorkflowRuntime::start("pool-example", Config::default())?;
     let source = pool.register("source", Source)?;
     let sink = pool.register("sink", Sink::default())?;
     let mut run = pool

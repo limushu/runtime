@@ -8,9 +8,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// A domain owns its state and rules. It declares access, never arbitrates locks.
+/// Runtime adapter protocol, not a DDD domain service. Business capabilities live behind it.
 #[async_trait]
-pub trait DomainService: Send + Sync + 'static {
+pub trait ServiceHandler: Send + Sync + 'static {
     type Request: Send + 'static;
     type Reply: Send + 'static;
     type Query: Send + 'static;
@@ -32,39 +32,51 @@ impl ActivityContext {
         &self.cancel
     }
 }
-enum Message<S: DomainService> {
+/// Optional shorthand when the caller knows the concrete host type.
+pub type ServiceClient<S> = ActivityClient<
+    <S as ServiceHandler>::Request,
+    <S as ServiceHandler>::Reply,
+    <S as ServiceHandler>::Query,
+    <S as ServiceHandler>::View,
+>;
+/// Typed capability channel. Application code need not know the concrete host.
+enum Message<R, P, Q, V> {
     Execute {
-        request: S::Request,
+        request: R,
         context: ActivityContext,
         guard: ActivityGuard,
-        reply: oneshot::Sender<Outcome<S::Reply>>,
+        reply: oneshot::Sender<Outcome<P>>,
     },
     Query {
-        query: S::Query,
-        reply: oneshot::Sender<Outcome<S::View>>,
+        query: Q,
+        reply: oneshot::Sender<Outcome<V>>,
     },
 }
-pub struct ServiceClient<S: DomainService> {
+pub struct ActivityClient<R, P, Q, V> {
     pub(crate) scope: Arc<Scope>,
-    tx: mpsc::Sender<Message<S>>,
+    pub(crate) resources: fn(&R) -> Vec<ResourceAccess>,
+    tx: mpsc::Sender<Message<R, P, Q, V>>,
     stop: CancellationToken,
     state: watch::Receiver<ServiceSnapshot>,
 }
-impl<S: DomainService> Clone for ServiceClient<S> {
+impl<R, P, Q, V> Clone for ActivityClient<R, P, Q, V> {
     fn clone(&self) -> Self {
         Self {
             scope: self.scope.clone(),
+            resources: self.resources,
             tx: self.tx.clone(),
             stop: self.stop.clone(),
             state: self.state.clone(),
         }
     }
 }
-impl<S: DomainService> ServiceClient<S> {
+impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
+    ActivityClient<R, P, Q, V>
+{
     pub fn snapshot(&self) -> ServiceSnapshot {
         self.state.borrow().clone()
     }
-    pub async fn query(&self, query: S::Query) -> Outcome<S::View> {
+    pub async fn query(&self, query: Q) -> Outcome<V> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Message::Query { query, reply })
@@ -85,10 +97,10 @@ impl<S: DomainService> ServiceClient<S> {
     }
     pub(crate) async fn dispatch(
         &self,
-        request: S::Request,
+        request: R,
         context: ActivityContext,
         guard: ActivityGuard,
-    ) -> Outcome<S::Reply> {
+    ) -> Outcome<P> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Message::Execute {
@@ -140,12 +152,12 @@ impl Drop for StateGuard {
     }
 }
 
-pub(crate) fn spawn<S: DomainService>(
+pub(crate) fn spawn<S: ServiceHandler>(
     service: S,
     scope: Arc<Scope>,
     capacity: usize,
 ) -> (ServiceClient<S>, ServiceOwner) {
-    let (tx, mut rx) = mpsc::channel::<Message<S>>(capacity);
+    let (tx, mut rx) = mpsc::channel::<Message<S::Request, S::Reply, S::Query, S::View>>(capacity);
     let stop = CancellationToken::new();
     let (state_tx, state) = watch::channel(ServiceSnapshot {
         lifecycle: Lifecycle::Running,
@@ -215,8 +227,9 @@ pub(crate) fn spawn<S: DomainService>(
         }
     });
     (
-        ServiceClient {
+        ActivityClient {
             scope,
+            resources: S::resources,
             tx,
             stop: stop.clone(),
             state,

@@ -15,7 +15,7 @@ struct ShrinkService {
     finish_first: Arc<Semaphore>,
 }
 #[async_trait]
-impl DomainService for ShrinkService {
+impl ServiceHandler for ShrinkService {
     type Request = u32;
     type Reply = u32;
     type Query = ();
@@ -101,7 +101,7 @@ fn unknown() -> Failure {
     Failure::Rejected("unknown or consumed operation id".into())
 }
 async fn commands(
-    mut pool: Coordinator,
+    mut pool: WorkflowRuntime,
     service: ServiceClient<ShrinkService>,
     mut rx: mpsc::Receiver<Command>,
 ) -> Outcome<()> {
@@ -174,7 +174,7 @@ async fn request<T>(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Outcome<()> {
-    let mut pool = Coordinator::start("demo-pool", Config::default())?;
+    let mut pool = WorkflowRuntime::start("demo-pool", Config::default())?;
     let started = Arc::new(Semaphore::new(0));
     let finish_first = Arc::new(Semaphore::new(0));
     let service = pool.register(

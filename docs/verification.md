@@ -10,7 +10,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p workflow-foundation --example two_services
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example shrink_commands
-cargo run --locked -p storage-pool --example coordination_rules
+cargo run --locked -p storage-pool --example task_center
 ```
 
 PowerShell 可执行 `./scripts/verify.ps1`，依次检查格式、测试、文档测试和 Clippy。

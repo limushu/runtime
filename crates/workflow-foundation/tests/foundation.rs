@@ -137,7 +137,7 @@ async fn resource_sets_are_atomic_and_conflicting_waiters_are_fifo() {
     assert_eq!(next(&mut rx).await, "b");
     pool.shutdown().await.unwrap();
 }
-async fn wait_counts(client: &CoordinatorClient, waiting: usize) {
+async fn wait_counts(client: &RuntimeHandle, waiting: usize) {
     tokio::time::timeout(LIMIT, async {
         while client.snapshot().waiting < waiting {
             tokio::task::yield_now().await;
@@ -306,7 +306,7 @@ impl Workflow for Waiting {
 }
 #[tokio::test]
 async fn timer_and_signal_waits_are_cancelable_without_activity_execution() {
-    let mut pool = Coordinator::start("p", Config::default()).unwrap();
+    let mut pool = WorkflowRuntime::start("p", Config::default()).unwrap();
     for timer in [true, false] {
         let mut run = pool.submit(Waiting { timer }).await.unwrap();
         state(
@@ -626,9 +626,9 @@ async fn independent_service_shutdown_waits_for_its_activity_without_stopping_po
 
 #[tokio::test]
 async fn invalid_configuration_names_objects_and_signal_payloads_are_rejected() {
-    assert!(Coordinator::start(" ", Config::default()).is_err());
+    assert!(WorkflowRuntime::start(" ", Config::default()).is_err());
     assert!(
-        Coordinator::start(
+        WorkflowRuntime::start(
             "p",
             Config {
                 capacity: 0,
@@ -637,7 +637,7 @@ async fn invalid_configuration_names_objects_and_signal_payloads_are_rejected() 
         )
         .is_err()
     );
-    let mut pool = Coordinator::start(
+    let mut pool = WorkflowRuntime::start(
         "p",
         Config {
             max_signal_bytes: 4,
@@ -664,7 +664,7 @@ async fn invalid_configuration_names_objects_and_signal_payloads_are_rejected() 
 
 #[tokio::test]
 async fn workflow_admission_has_a_total_inflight_limit() {
-    let mut pool = Coordinator::start(
+    let mut pool = WorkflowRuntime::start(
         "p",
         Config {
             max_workflows: 1,
@@ -722,7 +722,7 @@ async fn invalid_object_declarations_are_rejected_before_calling_a_service() {
 
 #[tokio::test]
 async fn bounded_signal_buffer_applies_backpressure_and_cancel_releases_sender() {
-    let mut pool = Coordinator::start(
+    let mut pool = WorkflowRuntime::start(
         "p",
         Config {
             capacity: 1,
@@ -751,7 +751,7 @@ async fn bounded_signal_buffer_applies_backpressure_and_cancel_releases_sender()
 
 #[tokio::test]
 async fn dropping_the_last_run_handle_does_not_end_a_signal_wait() {
-    let mut pool = Coordinator::start("p", Config::default()).unwrap();
+    let mut pool = WorkflowRuntime::start("p", Config::default()).unwrap();
     let run = pool.submit(Waiting { timer: false }).await.unwrap();
     state(&run.control, RunState::WaitingSignal).await;
     drop(run);
@@ -798,7 +798,7 @@ struct SerialCheck {
     commits: std::sync::atomic::AtomicUsize,
 }
 #[async_trait]
-impl DomainService for SerialCheck {
+impl ServiceHandler for SerialCheck {
     type Request = ();
     type Reply = usize;
     type Query = ();
@@ -833,7 +833,7 @@ impl Workflow for Increment {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_thread_contention_keeps_domain_mutations_serial_without_domain_locks() {
-    let mut pool = Coordinator::start("p", Config::default()).unwrap();
+    let mut pool = WorkflowRuntime::start("p", Config::default()).unwrap();
     let service = pool
         .register(
             "counter",

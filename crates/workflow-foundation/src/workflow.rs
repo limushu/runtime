@@ -1,7 +1,7 @@
 use crate::{
     locks::{Broker, Kind, Permit},
     model::Scope,
-    service::{DomainService, ServiceClient},
+    service::ActivityClient,
     *,
 };
 use async_trait::async_trait;
@@ -302,18 +302,23 @@ impl WorkflowContext {
             }
         }
     }
-    pub async fn activity<S: DomainService>(
+    pub async fn activity<
+        R: Send + 'static,
+        P: Send + 'static,
+        Q: Send + 'static,
+        V: Send + 'static,
+    >(
         &mut self,
-        service: &ServiceClient<S>,
-        request: S::Request,
-    ) -> Outcome<S::Reply> {
+        service: &ActivityClient<R, P, Q, V>,
+        request: R,
+    ) -> Outcome<P> {
         self.safe_point().await?;
         if !Arc::ptr_eq(&self.scope, &service.scope) {
             return Err(Failure::Rejected(
                 "service belongs to another Pool instance".into(),
             ));
         }
-        let resources = S::resources(&request);
+        let resources = (service.resources)(&request);
         let permit = loop {
             self.safe_point().await?;
             self.state.send_replace(RunState::WaitingResources);
@@ -383,6 +388,7 @@ pub(crate) struct ExecutionEnv {
     pub broker: Broker,
     pub cancel: CancellationToken,
     pub config: Config,
+    pub start: Option<oneshot::Receiver<Outcome<()>>>,
 }
 pub(crate) fn execution<W: Workflow>(
     workflow: W,
@@ -398,6 +404,7 @@ pub(crate) fn execution<W: Workflow>(
         broker,
         cancel,
         config,
+        start,
     } = env;
     let (reply, result) = oneshot::channel();
     let (signals, signal_rx) = mpsc::channel(config.capacity);
@@ -442,13 +449,26 @@ pub(crate) fn execution<W: Workflow>(
         let result = AssertUnwindSafe(async {
             let declared = workflow.objects();
             *context.objects.lock().unwrap() = declared.clone();
-            let objects = declared.into_iter().map(ResourceAccess::write).collect();
-            ownership = Some(
-                context
-                    .broker
-                    .acquire(Kind::Workflow, objects, &context.cancel)
-                    .await?,
-            );
+            for object in &declared {
+                object.validate()?;
+            }
+            if let Some(start) = start {
+                // The application owns logical objects for a managed run.
+                tokio::select! {
+                    biased;
+                    _ = context.cancel.cancelled() => return Err(Failure::Cancelled),
+                    allowed = start => allowed.unwrap_or(Err(Failure::Unavailable))?,
+                }
+            } else {
+                // Standalone runtime use retains low-level ownership mechanics.
+                let objects = declared.into_iter().map(ResourceAccess::write).collect();
+                ownership = Some(
+                    context
+                        .broker
+                        .acquire(Kind::Workflow, objects, &context.cancel)
+                        .await?,
+                );
+            }
             context.safe_point().await?;
             workflow.run(&mut context).await
         })
