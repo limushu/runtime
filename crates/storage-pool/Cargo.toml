@@ -1,0 +1,10 @@
+[package]
+name = "storage-pool"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+workflow-foundation.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
