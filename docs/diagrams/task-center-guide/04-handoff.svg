@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+<defs><marker id="ink" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#252b32" stroke-width="1.5"/></marker><marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#245e87" stroke-width="1.5"/></marker><marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#28715a" stroke-width="1.5"/></marker><marker id="orange" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#9c5b24" stroke-width="1.5"/></marker><marker id="gray" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#65717c" stroke-width="1.5"/></marker><style>text{font-family:"Microsoft YaHei","Segoe UI",sans-serif}</style></defs>
+<rect width="1600" height="1000" fill="white"/>
+<text x="50" y="42" font-size="18" fill="#65717c" text-anchor="start" font-weight="400">TASKCENTER / 系统导读 / 4 OF 5</text>
+<text x="50" y="88" font-size="34" fill="#252b32" text-anchor="start" font-weight="600">展开业务冲突：上线未结束，下线请求来了怎么办？</text>
+<text x="50" y="125" font-size="22" fill="#65717c" text-anchor="start" font-weight="400">示例：同一块磁盘的 OfflineDisk 遇到 OnlineDisk。当前规则是 CancelThenWait，而不是立即抢占。</text>
+
+<path d="M900 290 V365" fill="none" stroke="white" stroke-width="7"/><path d="M900 290 V365" fill="none" stroke="#9c5b24" stroke-width="2.3"  marker-end="url(#orange)"/>
+<path d="M1110 585 H1160" fill="none" stroke="white" stroke-width="7"/><path d="M1110 585 H1160" fill="none" stroke="#28715a" stroke-width="2.3"  marker-end="url(#green)"/>
+<path d="M1110 745 H1160" fill="none" stroke="white" stroke-width="7"/><path d="M1110 745 H1160" fill="none" stroke="#28715a" stroke-width="2.3"  marker-end="url(#green)"/>
+<path d="M1330 290 V535" fill="none" stroke="white" stroke-width="7"/><path d="M1330 290 V535" fill="none" stroke="#28715a" stroke-width="2.3"  marker-end="url(#green)"/>
+<rect x="300" y="190" width="340" height="100" rx="5" fill="white" stroke="#245e87" stroke-width="2"/><text x="470" y="224" font-size="25" fill="#245e87" text-anchor="middle" font-weight="600">① 上线正在运行</text><text x="470" y="256" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">磁盘对象归上线流程占用</text>
+<rect x="730" y="190" width="340" height="100" rx="5" fill="white" stroke="#9c5b24" stroke-width="2"/><text x="900" y="224" font-size="25" fill="#9c5b24" text-anchor="middle" font-weight="600">② 收到同盘下线</text><text x="900" y="256" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">检查全部冲突与容量，再登记</text>
+<rect x="1160" y="190" width="340" height="100" rx="5" fill="white" stroke="#28715a" stroke-width="2"/><text x="1330" y="224" font-size="25" fill="#28715a" text-anchor="middle" font-weight="600">③ 旧流程已停稳</text><text x="1330" y="256" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">确认终态后才能交接对象</text>
+<rect x="300" y="365" width="810" height="110" rx="5" fill="white" stroke="#245e87" stroke-width="2"/><text x="705" y="399" font-size="25" fill="#245e87" text-anchor="middle" font-weight="600">当前步骤执行 → 收到取消 → 步骤停稳 → Workflow 终态</text>
+<rect x="730" y="535" width="380" height="100" rx="5" fill="white" stroke="#9c5b24" stroke-width="2"/><text x="920" y="569" font-size="25" fill="#9c5b24" text-anchor="middle" font-weight="600">等待旧流程退出</text><text x="920" y="601" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">已经接受，不代表已经启动</text>
+<rect x="1160" y="535" width="340" height="100" rx="5" fill="white" stroke="#28715a" stroke-width="2"/><text x="1330" y="569" font-size="25" fill="#28715a" text-anchor="middle" font-weight="600">开始下线 Workflow</text><text x="1330" y="601" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">pump 发出 StartPermit</text>
+<rect x="300" y="705" width="810" height="80" rx="5" fill="white" stroke="#9c5b24" stroke-width="2"/><text x="705" y="739" font-size="25" fill="#9c5b24" text-anchor="middle" font-weight="600">始终属于上线流程；取消请求本身不释放占用</text>
+<rect x="1160" y="705" width="340" height="80" rx="5" fill="white" stroke="#28715a" stroke-width="2"/><text x="1330" y="739" font-size="25" fill="#28715a" text-anchor="middle" font-weight="600">交接给下线流程</text>
+<rect x="300" y="835" width="1200" height="75" rx="5" fill="white" stroke="#9c5b24" stroke-width="2"/><text x="900" y="869" font-size="25" fill="#9c5b24" text-anchor="middle" font-weight="600">如果旧步骤结果不确定：保留对象隔离，后继不能直接执行</text>
+<text x="70" y="415" font-size="24" fill="#245e87" text-anchor="start" font-weight="400">上线流程</text>
+<text x="70" y="585" font-size="24" fill="#28715a" text-anchor="start" font-weight="400">下线流程</text>
+<text x="70" y="755" font-size="24" fill="#9c5b24" text-anchor="start" font-weight="400">对象占用</text>
+<text x="900" y="333" text-anchor="middle" font-size="21" fill="#9c5b24" stroke="white" stroke-width="6" paint-order="stroke">成功登记后请求取消</text>
+<text x="1330" y="410" text-anchor="middle" font-size="21" fill="#28715a" stroke="white" stroke-width="6" paint-order="stroke">reap 确认终态</text>
+<text x="1330" y="444" text-anchor="middle" font-size="21" fill="#28715a" stroke="white" stroke-width="6" paint-order="stroke">pump 放行后继</text>
+<path d="M50 942 H1550" stroke="#d7dde3"/><text x="50" y="977" font-size="22" fill="#252b32" text-anchor="start" font-weight="400">其他规则：无对象交集可并行；重复流程拒绝；普通重叠等待。此图只说明准入，不表示重建 / 删除已实现。</text>
+</svg>

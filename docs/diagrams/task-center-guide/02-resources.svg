@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+<defs><marker id="ink" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#252b32" stroke-width="1.5"/></marker><marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#245e87" stroke-width="1.5"/></marker><marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#28715a" stroke-width="1.5"/></marker><marker id="orange" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#9c5b24" stroke-width="1.5"/></marker><marker id="gray" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#65717c" stroke-width="1.5"/></marker><style>text{font-family:"Microsoft YaHei","Segoe UI",sans-serif}</style></defs>
+<rect width="1600" height="1000" fill="white"/>
+<text x="50" y="42" font-size="18" fill="#65717c" text-anchor="start" font-weight="400">TASKCENTER / 系统导读 / 2 OF 5</text>
+<text x="50" y="88" font-size="34" fill="#252b32" text-anchor="start" font-weight="600">展开资源保护：一个步骤怎样获得执行许可？</text>
+<text x="50" y="125" font-size="22" fill="#65717c" text-anchor="start" font-weight="400">时间从上往下：申请后当前 Future 等待；Permit 唤醒它，再由同一个 Driver 继续轮询。</text>
+
+<path d="M210 270 V920" fill="none" stroke="#65717c" stroke-width="1.5" stroke-dasharray="6 7"/>
+<path d="M600 270 V920" fill="none" stroke="#65717c" stroke-width="1.5" stroke-dasharray="6 7"/>
+<path d="M1000 270 V920" fill="none" stroke="#65717c" stroke-width="1.5" stroke-dasharray="6 7"/>
+<path d="M1400 270 V920" fill="none" stroke="#65717c" stroke-width="1.5" stroke-dasharray="6 7"/>
+<path d="M210 325 H600" fill="none" stroke="white" stroke-width="7"/><path d="M210 325 H600" fill="none" stroke="#9c5b24" stroke-width="2.3"  marker-end="url(#orange)"/>
+<path d="M600 405 H1000" fill="none" stroke="white" stroke-width="7"/><path d="M600 405 H1000" fill="none" stroke="#9c5b24" stroke-width="2.3"  marker-end="url(#orange)"/>
+<path d="M1000 505 H210" fill="none" stroke="white" stroke-width="7"/><path d="M1000 505 H210" fill="none" stroke="#9c5b24" stroke-width="2.3"  marker-end="url(#orange)"/>
+<path d="M210 590 H1400" fill="none" stroke="white" stroke-width="7"/><path d="M210 590 H1400" fill="none" stroke="#245e87" stroke-width="2.3"  marker-end="url(#blue)"/>
+<path d="M1400 710 H600" fill="none" stroke="white" stroke-width="7"/><path d="M1400 710 H600" fill="none" stroke="#9c5b24" stroke-width="2.3"  marker-end="url(#orange)"/>
+<path d="M1400 790 H210" fill="none" stroke="white" stroke-width="7"/><path d="M1400 790 H210" fill="none" stroke="#28715a" stroke-width="2.3" stroke-dasharray="7 5" marker-end="url(#green)"/>
+<path d="M600 870 H1000" fill="none" stroke="white" stroke-width="7"/><path d="M600 870 H1000" fill="none" stroke="#9c5b24" stroke-width="2.3"  marker-end="url(#orange)"/>
+<rect x="60" y="180" width="300" height="90" rx="5" fill="white" stroke="#245e87" stroke-width="2"/><text x="210" y="214" font-size="25" fill="#245e87" text-anchor="middle" font-weight="600">WorkflowContext</text><text x="210" y="246" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">准备执行一个步骤</text>
+<rect x="450" y="180" width="300" height="90" rx="5" fill="white" stroke="#9c5b24" stroke-width="2"/><text x="600" y="214" font-size="25" fill="#9c5b24" text-anchor="middle" font-weight="600">Broker / 事件队列</text><text x="600" y="246" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">发送端 / mpsc</text>
+<rect x="850" y="180" width="300" height="90" rx="5" fill="white" stroke="#9c5b24" stroke-width="2"/><text x="1000" y="214" font-size="25" fill="#9c5b24" text-anchor="middle" font-weight="600">Driver / LockTable</text><text x="1000" y="246" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">唯一修改资源表的循环</text>
+<rect x="1250" y="180" width="300" height="90" rx="5" fill="white" stroke="#28715a" stroke-width="2"/><text x="1400" y="214" font-size="25" fill="#28715a" text-anchor="middle" font-weight="600">服务 Activity / Guard</text><text x="1400" y="246" font-size="21" fill="#252b32" text-anchor="middle" font-weight="400">实际执行与停稳</text>
+<text x="405" y="307" text-anchor="middle" font-size="21" fill="#9c5b24" stroke="white" stroke-width="6" paint-order="stroke">① Acquire：资源读 / 写声明</text>
+<text x="800" y="387" text-anchor="middle" font-size="21" fill="#9c5b24" stroke="white" stroke-width="6" paint-order="stroke">② tick 收事件 → event / pump</text>
+<text x="1020" y="447" font-size="20" fill="#9c5b24" text-anchor="middle" font-weight="400">有冲突：留在 waiting，不发许可</text>
+<text x="605" y="487" text-anchor="middle" font-size="21" fill="#9c5b24" stroke="white" stroke-width="6" paint-order="stroke">③ oneshot 返回 Permit → 唤醒等待中的 Workflow</text>
+<text x="800" y="572" text-anchor="middle" font-size="21" fill="#245e87" stroke="white" stroke-width="6" paint-order="stroke">④ Driver 再次 poll Workflow → 得到 Permit → 发送 Execute</text>
+<text x="1400" y="640" font-size="20" fill="#28715a" text-anchor="middle" font-weight="400">执行 → 结果确认 → Guard 释放</text>
+<text x="1000" y="691" text-anchor="middle" font-size="21" fill="#9c5b24" stroke="white" stroke-width="6" paint-order="stroke">⑤ Permit drop → Release(uncertain)</text>
+<text x="800" y="772" text-anchor="middle" font-size="21" fill="#28715a" stroke="white" stroke-width="6" paint-order="stroke">⑥ oneshot 返回步骤结果，唤醒 Workflow</text>
+<text x="800" y="852" text-anchor="middle" font-size="21" fill="#9c5b24" stroke="white" stroke-width="6" paint-order="stroke">⑦ Driver 处理 Release，放行等待者</text>
+<path d="M50 942 H1550" stroke="#d7dde3"/><text x="50" y="977" font-size="22" fill="#252b32" text-anchor="start" font-weight="400">Release 先入队再由 Driver 处理；结果不确定时转为资源隔离，不是正常释放。实际处理时机可与回复交错。</text>
+</svg>

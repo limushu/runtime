@@ -3,6 +3,7 @@
 当前代码只有两个 workspace 成员，入口以本页和根 README 为准。
 
 - [当前架构与目录边界](architecture.md)
+- [TaskCenter 五图导读：先总览，再展开执行机制](runtime-guide.md)
 - [TaskCenter 关键组件协作图（含缩放版）](runtime-collaboration.md)
 - [TaskCenter 冲突规则开发说明](task-center.md)
 - [TaskCenter 重构规格与证据](changes/2026-10-15-task-center.md)
