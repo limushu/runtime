@@ -112,4 +112,3 @@ watch 会合并更新，不能被当作无损或持久化的业务日志。
 验证通过：源码对照、浏览器渲染与逐图检查；五份 SVG XML、文档链接和 HTML 嵌入一致性检查；
 真实浏览器检查五页切换、页签/hash、上一页、键盘翻页、缩放、画布边界与唯一 DOM id。
 外围工程 `npm run verify` 通过（Harness、lint、TypeScript 和生产构建）。未修改 Rust，未重跑 Rust 测试。
-
