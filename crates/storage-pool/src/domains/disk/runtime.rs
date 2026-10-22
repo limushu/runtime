@@ -11,6 +11,19 @@ impl ServiceHandler for DiskHost {
     type Reply = DiskReply;
     type Query = Option<DiskId>;
     type View = Vec<MemberDisk>;
+    fn activity_name(request: &DiskCommand) -> &'static str {
+        match request {
+            DiskCommand::Inspect(_) => "disk.inspect",
+            DiskCommand::InspectMany(_) => "disk.inspect-many",
+            DiskCommand::SetIoMany(_, _) => "disk.set-io-many",
+            DiskCommand::RemoveMany(_) => "disk.remove-many",
+            DiskCommand::Add(_) => "disk.add",
+            DiskCommand::Open(_) => "disk.open",
+            DiskCommand::SetIo(_, _) => "disk.set-io",
+            DiskCommand::Allocate(_, _) => "disk.allocate",
+            DiskCommand::Remove(_) => "disk.remove",
+        }
+    }
     fn resources(request: &DiskCommand) -> Vec<ResourceAccess> {
         if let DiskCommand::InspectMany(ids)
         | DiskCommand::SetIoMany(ids, _)

@@ -2,6 +2,7 @@ use crate::{
     locks::{Broker, Kind, Permit},
     model::Scope,
     service::ActivityClient,
+    tasks::ActivityObservation,
     *,
 };
 use async_trait::async_trait;
@@ -56,6 +57,7 @@ pub struct RunControl {
     max_signal_bytes: usize,
     pause: watch::Sender<bool>,
     pub(crate) progress: watch::Receiver<TaskProgress>,
+    pub(crate) activities: watch::Receiver<ActivityHistory>,
     pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
 }
 impl RunControl {
@@ -77,6 +79,9 @@ impl RunControl {
     }
     pub fn progress(&self) -> TaskProgress {
         self.progress.borrow().clone()
+    }
+    pub fn activities(&self) -> ActivityHistory {
+        self.activities.borrow().clone()
     }
     pub fn pause_requested(&self) -> bool {
         *self.pause.borrow()
@@ -162,12 +167,13 @@ impl Tracker {
             Ok(())
         }
     }
-    fn register(&self, permit: Permit) -> ActivityGuard {
+    fn register(&self, permit: Permit, observation: ActivityObservation) -> ActivityGuard {
         self.state.lock().unwrap().pending += 1;
         ActivityGuard {
             tracker: self.clone(),
             permit,
             uncertain: false,
+            observation,
         }
     }
     async fn settle(&self, cancel: &CancellationToken) -> bool {
@@ -190,19 +196,24 @@ pub(crate) struct ActivityGuard {
     tracker: Tracker,
     permit: Permit,
     uncertain: bool,
+    observation: ActivityObservation,
 }
 impl ActivityGuard {
     pub fn started(&mut self) {
         self.uncertain = true;
         self.permit.started();
+        self.observation.started();
     }
     pub fn settled<T>(&mut self, result: &Outcome<T>) {
         self.uncertain = result.as_ref().is_err_and(|e| e.uncertain());
         self.permit.settled(result);
+        self.observation.settled(result);
     }
 }
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
+        // Publish the final observation before waking a workflow settling its guards.
+        self.observation.abandon();
         let mut state = self.tracker.state.lock().unwrap();
         state.pending -= 1;
         state.uncertain |= self.uncertain;
@@ -224,6 +235,8 @@ pub struct WorkflowContext {
     state: watch::Sender<RunState>,
     tracker: Tracker,
     progress: watch::Sender<TaskProgress>,
+    activities: watch::Sender<ActivityHistory>,
+    activity_history: usize,
     objects: Arc<Mutex<Vec<ObjectKey>>>,
     next_activity: u64,
     pause: watch::Receiver<bool>,
@@ -319,27 +332,46 @@ impl WorkflowContext {
             ));
         }
         let resources = (service.resources)(&request);
-        let permit = loop {
-            self.safe_point().await?;
-            self.state.send_replace(RunState::WaitingResources);
-            let broker = self.broker.clone();
-            tokio::select! {
-                biased;
-                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-                permit = broker.acquire(Kind::Activity, resources.clone(), &self.cancel) => {
-                    let permit = permit?;
-                    if *self.pause.borrow() { drop(permit); continue; }
-                    break permit;
-                }
-            }
-        };
-        self.checkpoint()?;
         self.next_activity += 1;
         let id = ActivityId {
             workflow: self.id,
             sequence: self.next_activity,
         };
-        let guard = self.tracker.register(permit);
+        let mut observation = ActivityObservation::new(
+            self.activities.clone(),
+            self.activity_history,
+            id,
+            service.name.to_string(),
+            (service.activity_name)(&request),
+            resources.clone(),
+        );
+        let permit: Outcome<Permit> = async {
+            loop {
+                self.safe_point().await?;
+                self.state.send_replace(RunState::WaitingResources);
+                let broker = self.broker.clone();
+                tokio::select! {
+                    biased;
+                    changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                    permit = broker.acquire(Kind::Activity, resources.clone(), &self.cancel) => {
+                        let permit = permit?;
+                        if *self.pause.borrow() { drop(permit); continue; }
+                        self.checkpoint()?;
+                        break Ok(permit);
+                    }
+                }
+            }
+        }
+        .await;
+        let permit = match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                observation.settled(&Err::<(), _>(error.clone()));
+                return Err(error);
+            }
+        };
+        observation.queued();
+        let guard = self.tracker.register(permit, observation);
         self.state.send_replace(RunState::Activity(id));
         let result = service
             .dispatch(
@@ -411,6 +443,7 @@ pub(crate) fn execution<W: Workflow>(
     let (state, state_rx) = watch::channel(RunState::WaitingObjects);
     let (pause, pause_rx) = watch::channel(false);
     let (progress, progress_rx) = watch::channel(TaskProgress::default());
+    let (activities, activities_rx) = watch::channel(ActivityHistory::default());
     let objects = Arc::new(Mutex::new(Vec::new()));
     let control = RunControl {
         id,
@@ -421,6 +454,7 @@ pub(crate) fn execution<W: Workflow>(
         max_signal_bytes: config.max_signal_bytes,
         pause: pause.clone(),
         progress: progress_rx,
+        activities: activities_rx,
         objects: objects.clone(),
     };
     let mut completion = Completion {
@@ -438,6 +472,8 @@ pub(crate) fn execution<W: Workflow>(
         state,
         tracker: Tracker::default(),
         progress,
+        activities,
+        activity_history: config.activity_history,
         objects,
         next_activity: 0,
         pause: pause_rx,

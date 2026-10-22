@@ -7,7 +7,7 @@ use std::{
 use storage_pool::{adapters::*, ports::*, *};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use workflow_foundation::{Lifecycle, RunState};
+use workflow_foundation::{ActivityState, Lifecycle, RunState};
 
 fn pool_id(s: &str) -> PoolId {
     PoolId::new(s).unwrap()
@@ -858,6 +858,20 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     let mut run = manager.online_disk(pool.id(), spec.clone()).await.unwrap();
     gate.wait().await;
     assert_eq!(run.control.name, "storage.online-disk");
+    let id = run.id();
+    let live = pool.task(id).unwrap();
+    assert_eq!(
+        live.activities
+            .entries
+            .iter()
+            .map(|a| (a.name, a.state.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("node.inspect", ActivityState::Completed),
+            ("disk.add", ActivityState::Completed),
+            ("disk.open", ActivityState::Running),
+        ]
+    );
     // InspectNode is Activity #1 too, not an unmanaged direct query.
     assert_eq!(
         run.control.state(),
@@ -875,6 +889,16 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     );
     gate.open();
     assert_eq!(result(run).await.unwrap().io, IoState::Up);
+    let history = pool.task(id).unwrap();
+    assert_eq!(history.activities.total, 4);
+    assert_eq!(history.activities.entries[3].name, "disk.set-io");
+    assert!(
+        history
+            .activities
+            .entries
+            .iter()
+            .all(|a| a.state == ActivityState::Completed && a.finished_at.is_some())
+    );
     assert_eq!(
         plane.disk_calls.lock().unwrap().as_slice(),
         ["open", "enable"]

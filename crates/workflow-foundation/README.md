@@ -66,6 +66,39 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 - 任务索引按 ID 提供观察/控制。普通终态历史有界，Uncertain 保留；watch 可能合并事件。
   业务冲突解释属于 TaskCenter，不再由 Runtime 记录或解释。
 
+## 逐 Activity 观测
+
+每次通过 `WorkflowContext::activity()` 发起的步骤自动进入 `TaskSnapshot.activities`，
+不需要在 Workflow 中手工上报开始/结束。每条记录包含稳定的 `ActivityId`（Workflow ID + 调用序号）、
+注册服务名、步骤名、资源声明、当前状态和创建/实际开始/实际结束时间。
+
+```rust,ignore
+let task = client.task(id)?; // 运行中或仍保留的历史 task
+for activity in &task.activities.entries {
+    println!("{} {:?}: {:?}", activity.name, activity.id, activity.state);
+}
+let mut observer = client.observe_task(id)?;
+let updated = observer.changed().await?; // Activity 更新也会唤醒，不依赖 Workflow 状态变化
+```
+
+状态为 `WaitingResources -> Queued -> Running -> Completed / Failed(Failure)`。
+`Queued` 包含等待服务邮箱容量；取消、拒绝、服务不可用可以在实际开始前结束，
+此时 `started_at` 为 None。取消请求不会提前标记完成；调用方丢弃 Activity 等待 Future 后，
+记录仍由服务端实际执行更新。handler panic 或执行中强制终止记录为 Uncertain，不能误报成功。
+
+`ServiceHandler::activity_name(&request)` 可返回稳定步骤名；默认使用 handler 类型名，
+无须修改已有实现。名称不包含请求/回复载荷。存储适配器按命令命名，例如 `disk.open`。
+循环中的同名步骤通过调用序号区分；失败后显式再次调用也有新序号，框架不自动重试。
+
+`Config::activity_history` 默认每 task 保留最近 1024 条，必须大于零。
+`activities.total` 是累计调用数，`activities.omitted` 明确给出因上限淘汰的条数；当前在途步骤始终保留。
+记录随 task 一起按 `Config::task_history` 淘汰，已有 observer/RunControl 仍可读取自身记录。
+`task_ids()` 可只列出 ID，避免复制所有步骤历史。
+
+这里记录实际发起过的调用；普通 async Workflow 的未来分支、未发起或跳过的步骤无法自动推断。
+watch 仍会合并通知，但合并不会抹掉历史上限内已结束的 Activity 记录。
+历史只存在当前进程内，关闭后保留在已有句柄中；重启后查询需要另外接入持久化存储。
+
 没有持久化历史、确定性重放、跨主恢复、自动重试或完整 Temporal 引擎能力。
 不可把重新创建同名实例当作恢复，也不提供执行不可信代码的沙箱。
 

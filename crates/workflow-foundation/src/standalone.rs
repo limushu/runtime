@@ -103,13 +103,17 @@ impl WorkflowRuntime {
             return Err(Failure::Unavailable);
         }
         let name = name.into();
-        if name.trim().is_empty() || !self.names.insert(name) {
+        if name.trim().is_empty() || !self.names.insert(name.clone()) {
             return Err(Failure::Rejected(
                 "service name empty or already registered".into(),
             ));
         }
-        let (client, owner) =
-            service::spawn(service, self.handle.view.scope.clone(), self.capacity);
+        let (client, owner) = service::spawn(
+            service,
+            name.into(),
+            self.handle.view.scope.clone(),
+            self.capacity,
+        );
         self.services.push(owner);
         Ok(client)
     }

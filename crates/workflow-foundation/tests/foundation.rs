@@ -414,6 +414,10 @@ async fn dropped_activity_response_keeps_resource_and_typed_result_waiting_until
         .unwrap();
     assert_eq!(next(&mut returned).await, "body-returned");
     state(&run.control, RunState::Settling).await;
+    assert_eq!(
+        pool.client().task(run.id()).unwrap().activities.entries[0].state,
+        ActivityState::Running
+    );
     let mut next_run = pool
         .submit(Call::new(&service, Work::write("next", "r")))
         .await
@@ -423,6 +427,10 @@ async fn dropped_activity_response_keeps_resource_and_typed_result_waiting_until
     gate.add_permits(1);
     finish(&mut run).await.unwrap();
     finish(&mut next_run).await.unwrap();
+    assert_eq!(
+        pool.client().task(run.id()).unwrap().activities.entries[0].state,
+        ActivityState::Completed
+    );
     assert_eq!(service.query(()).await.unwrap().0, 2);
     pool.shutdown().await.unwrap();
 }

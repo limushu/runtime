@@ -27,6 +27,10 @@ impl ExecutionView {
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.tasks.lock().unwrap().snapshots()
     }
+    /// List retained tasks without copying their Activity histories.
+    pub fn task_ids(&self) -> Vec<WorkflowId> {
+        self.tasks.lock().unwrap().ids()
+    }
     pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
         Ok(self.observe_task(id)?.snapshot())
     }
@@ -140,13 +144,17 @@ impl WorkflowDriver {
             return Err(Failure::Unavailable);
         }
         let name = name.into();
-        if name.trim().is_empty() || !self.names.insert(name) {
+        if name.trim().is_empty() || !self.names.insert(name.clone()) {
             return Err(Failure::Rejected(
                 "service name empty or already registered".into(),
             ));
         }
-        let (client, owner) =
-            service::spawn(service, self.view.scope.clone(), self.config.capacity);
+        let (client, owner) = service::spawn(
+            service,
+            name.into(),
+            self.view.scope.clone(),
+            self.config.capacity,
+        );
         self.services.push(owner);
         Ok(client)
     }

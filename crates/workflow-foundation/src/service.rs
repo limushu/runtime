@@ -15,6 +15,10 @@ pub trait ServiceHandler: Send + Sync + 'static {
     type Reply: Send + 'static;
     type Query: Send + 'static;
     type View: Send + 'static;
+    /// Stable observation label; never include request payloads or secrets.
+    fn activity_name(_request: &Self::Request) -> &'static str {
+        std::any::type_name::<Self>()
+    }
     fn resources(request: &Self::Request) -> Vec<ResourceAccess>;
     async fn execute(
         &self,
@@ -55,6 +59,8 @@ enum Message<R, P, Q, V> {
 pub struct ActivityClient<R, P, Q, V> {
     pub(crate) scope: Arc<Scope>,
     pub(crate) resources: fn(&R) -> Vec<ResourceAccess>,
+    pub(crate) activity_name: fn(&R) -> &'static str,
+    pub(crate) name: Arc<str>,
     tx: mpsc::Sender<Message<R, P, Q, V>>,
     stop: CancellationToken,
     state: watch::Receiver<ServiceSnapshot>,
@@ -64,6 +70,8 @@ impl<R, P, Q, V> Clone for ActivityClient<R, P, Q, V> {
         Self {
             scope: self.scope.clone(),
             resources: self.resources,
+            activity_name: self.activity_name,
+            name: self.name.clone(),
             tx: self.tx.clone(),
             stop: self.stop.clone(),
             state: self.state.clone(),
@@ -102,7 +110,8 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
         guard: ActivityGuard,
     ) -> Outcome<P> {
         let (reply, response) = oneshot::channel();
-        self.tx
+        if let Err(error) = self
+            .tx
             .send(Message::Execute {
                 request,
                 context,
@@ -110,7 +119,12 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
                 reply,
             })
             .await
-            .map_err(|_| Failure::Unavailable)?;
+        {
+            if let Message::Execute { mut guard, .. } = error.0 {
+                guard.settled(&Err::<(), _>(Failure::Unavailable));
+            }
+            return Err(Failure::Unavailable);
+        }
         response
             .await
             .unwrap_or_else(|_| Err(Failure::Uncertain("activity response lost".into())))
@@ -154,6 +168,7 @@ impl Drop for StateGuard {
 
 pub(crate) fn spawn<S: ServiceHandler>(
     service: S,
+    name: Arc<str>,
     scope: Arc<Scope>,
     capacity: usize,
 ) -> (ServiceClient<S>, ServiceOwner) {
@@ -190,7 +205,11 @@ pub(crate) fn spawn<S: ServiceHandler>(
                     closing = true; rx.close();
                     while let Ok(message) = rx.try_recv() {
                         match message {
-                            Message::Execute { reply, .. } => { let _ = reply.send(Err(Failure::Cancelled)); },
+                            Message::Execute { mut guard, reply, .. } => {
+                                guard.settled(&Err::<(), _>(Failure::Cancelled));
+                                drop(guard);
+                                let _ = reply.send(Err(Failure::Cancelled));
+                            },
                             Message::Query { reply, .. } => { let _ = reply.send(Err(Failure::Unavailable)); },
                         }
                     }
@@ -230,6 +249,8 @@ pub(crate) fn spawn<S: ServiceHandler>(
         ActivityClient {
             scope,
             resources: S::resources,
+            activity_name: S::activity_name,
+            name,
             tx,
             stop: stop.clone(),
             state,

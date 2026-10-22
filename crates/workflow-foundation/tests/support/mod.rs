@@ -96,6 +96,9 @@ impl ServiceHandler for Probe {
     type Reply = usize;
     type Query = ();
     type View = (usize, Vec<ActivityId>);
+    fn activity_name(work: &Work) -> &'static str {
+        work.name
+    }
     fn resources(work: &Work) -> Vec<ResourceAccess> {
         work.access.clone()
     }

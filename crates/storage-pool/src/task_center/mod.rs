@@ -225,7 +225,7 @@ impl TaskCenter {
                 state.pump();
                 *schedule.lock().unwrap() = state.snapshot();
                 // Keep only records still retained by runtime history.
-                let retained: BTreeSet<_> = driver.view().tasks().iter().map(|t| t.id).collect();
+                let retained: BTreeSet<_> = driver.view().task_ids().into_iter().collect();
                 notes.lock().unwrap().retain(|id, _| retained.contains(id));
                 if closing && driver.is_idle() {
                     break;

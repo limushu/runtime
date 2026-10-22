@@ -11,6 +11,16 @@ impl ServiceHandler for VdHost {
     type Reply = VdReply;
     type Query = Option<VolumeId>;
     type View = Vec<VirtualDisk>;
+    fn activity_name(request: &VdCommand) -> &'static str {
+        match request {
+            VdCommand::RequireAbsent(_) => "vd.require-absent",
+            VdCommand::Create { .. } => "vd.create",
+            VdCommand::Invalidate(_) => "vd.invalidate",
+            VdCommand::InvalidateMany(_) => "vd.invalidate-many",
+            VdCommand::WaitRebuildMany(_) => "vd.wait-rebuild-many",
+            VdCommand::WaitRebuild(_) => "vd.wait-rebuild",
+        }
+    }
     fn resources(request: &VdCommand) -> Vec<ResourceAccess> {
         if matches!(request, VdCommand::RequireAbsent(_)) {
             return vec![ResourceAccess::read(object("vd", "reference-index"))];

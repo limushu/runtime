@@ -140,6 +140,8 @@ pub struct Config {
     pub max_signal_bytes: usize,
     /// Ordinary completed task records. Uncertain records are retained separately.
     pub task_history: usize,
+    /// Most recent Activity invocations retained per task (including its current Activity).
+    pub activity_history: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -148,12 +150,17 @@ impl Default for Config {
             max_workflows: 256,
             max_signal_bytes: 64 * 1024,
             task_history: 256,
+            activity_history: 1024,
         }
     }
 }
 impl Config {
     pub(crate) fn validate(&self) -> Outcome<()> {
-        if self.capacity == 0 || self.max_workflows == 0 || self.max_signal_bytes == 0 {
+        if self.capacity == 0
+            || self.max_workflows == 0
+            || self.max_signal_bytes == 0
+            || self.activity_history == 0
+        {
             Err(Failure::Rejected("limits must be nonzero".into()))
         } else {
             Ok(())

@@ -11,6 +11,13 @@ impl ServiceHandler for NodeHost {
     type Reply = PoolNode;
     type Query = Option<NodeId>;
     type View = Vec<PoolNode>;
+    fn activity_name(request: &NodeCommand) -> &'static str {
+        match request {
+            NodeCommand::Inspect(_) => "node.inspect",
+            NodeCommand::Observe { .. } => "node.observe",
+            NodeCommand::Load(_) => "node.load",
+        }
+    }
     fn resources(request: &NodeCommand) -> Vec<ResourceAccess> {
         let id = match request {
             NodeCommand::Inspect(id) => {

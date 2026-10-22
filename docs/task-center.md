@@ -56,10 +56,22 @@ TaskCenter 先看完整冲突集合，再通过嵌入的执行驱动同步登记
 
 ## 可观察性
 
-`pool.task(id)`：执行状态、进度、对象及 conflicts（已有任务 ID、决定、原因）。
-`pool.observe_task(id)`：状态/进度订阅；不会保证保留每个中间事件。
+`pool.task(id)`：执行状态、进度、对象、逐 Activity 历史及 conflicts（已有任务 ID、决定、原因）。
+`pool.observe_task(id)`：状态/进度/Activity 更新订阅；不会保证保留每个中间事件。
 `pool.scheduling()`：TaskCenter 排队、运行、逻辑隔离计数。
 `pool.execution()`：Runtime 的底层资源/生命周期计数，不能代替业务队列计数。
 
 conflicts 是准入时的解释，不是实时阻塞列表。普通执行历史有界，已有 observer 可在记录淘汰后
 继续观察；不确定记录与隔离保留。本轮没有自动解除隔离或跨进程恢复。
+
+`snapshot.activities.entries` 按调用序号列出每个步骤的名称、服务、资源、状态和时间戳。
+例如 OnlineDisk 执行期间可以看到 `node.inspect`、`disk.add` 已完成，`disk.open` 正在执行；
+执行完成后，同一 task ID 仍可查到这三步及后续 `disk.set-io` 的结果。
+Activity 记录由框架自动产生，TaskCenter 直接透传，不依赖业务 `report_progress()`。
+取消请求不等于 Activity 已结束；其终态由实际执行停稳后的结果决定。
+
+`Config::activity_history` 限制每个 task 保留的步骤数（默认 1024），
+`activities.total` / `activities.omitted` 表示累计调用与已淘汰数量。
+这与 task 级历史上限独立；两者都是当前进程内的历史，不支持重启恢复。
+未走到的动态分支不会被列为“未完成步骤”。具体语义见
+[Workflow Foundation 逐 Activity 观测](../crates/workflow-foundation/README.md#逐-activity-观测)。
