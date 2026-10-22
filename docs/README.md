@@ -4,6 +4,8 @@
 
 - [当前架构与目录边界](architecture.md)
 - [TaskCenter 五图导读：先总览，再展开执行机制](runtime-guide.md)
+- [TaskCenter 动态演示：一次完整磁盘上线](diagrams/task-center-simulation/index.html)（离线教学模拟）
+- [动态演示范围、使用与验证](changes/2026-10-22-task-center-simulation.md)
 - [TaskCenter 关键组件协作图（含缩放版）](runtime-collaboration.md)
 - [TaskCenter 冲突规则开发说明](task-center.md)
 - [TaskCenter 重构规格与证据](changes/2026-10-15-task-center.md)
