@@ -8,11 +8,12 @@
 | 位置 | 职责 |
 | --- | --- |
 | [pool.rs](src/pool.rs) | 组合根、Pool 生命周期、对外业务入口 |
+| [manager](src/manager/mod.rs) | 多索引句柄目录、公平扇出与逐池汇聚；业务由 Pool 推进 |
 | [task_center](src/task_center/mod.rs) | 协调状态、队列、占用和交接 |
 | [conflicts.rs](src/task_center/conflicts.rs) | 单一业务冲突判断入口 |
 | [workflows](src/workflows/mod.rs) | 完整业务流程，读写步骤均经 Activity |
 | [disk/service.rs](src/domains/disk/service.rs) | 磁盘能力、状态与外部效果协调 |
-| [domains](src/domains/mod.rs) | 按 disk / node / vd 聚合 model、service、runtime |
+| [domains](src/domains/mod.rs) | 按 disk / node / tier / vd 聚合领域服务与托管适配 |
 | [ports.rs](src/ports.rs) | 元数据/数据面端口及失败契约 |
 | [disk/runtime.rs](src/domains/disk/runtime.rs) | 磁盘服务托管协议与调用适配 |
 
@@ -22,11 +23,12 @@ model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的
 ## 业务范围
 
 - 节点连通事实不等于 Pool 已加载。观测序号单调，同序异值拒绝，断连撤销 loaded，重连须再加载。
-- 磁盘上线只有一个 Run：InspectNode → Add/确认成员 → Open → Enable IO 并提交 Up。
+- 磁盘上线只有一个 Run：InspectTier → InspectNode → Add/确认成员 → Open → Enable IO 并提交 Up。
   首次通过 PoolManager 路由，已有盘通过 PoolHandle.online_disk 进入同一流程。
 - 创建 VD 当前只支持一个镜像 BG、2 或 3 个副本、同 Tier 不同 Node、每副本一个 BLK。
   先校验、再提交分配、确认初始化，最后发布 BG 引用。分配凭据不能由外部调用者伪造。
-- 已分配但未引用的空间在失败/取消后保守保留，不回收、不复用；尚无释放与对账流程。
+- 已分配但未引用的空间在失败/取消后保守保留，不回收、不复用；尚无孤立空间对账流程。
+  确认 Volume 删除后可按原分配凭据释放空间；空闲且无引用的成员盘可显式移除。
 - 离线：失效引用 → 关闭 IO 并提交 Down → 等待重建 → 移除成员。重建/成员移除仍为
   明确失败的占位能力，不假装业务完成。上线不恢复失效数据，也不释放空间。
 - 节点上下线组织批量磁盘步骤；节点交接需等待旧流程及批量动作真正停稳。
@@ -37,10 +39,11 @@ model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的
 ## 使用与观察
 
 ```rust,ignore
-let mut manager = PoolManager::new(config, metadata, data_plane);
+let manager = PoolManager::new(config, metadata, data_plane);
 let pool = manager.create_pool(PoolId::new("pool-a")?)?;
-pool.observe_node(node.clone(), 1, true).await?.result().await?;
+pool.attach_node(node.clone(), 1, true).await?.result().await?;
 pool.load_node(node.clone()).await?.result().await?;
+pool.create_tier(spec.tier.clone()).await?.result().await?;
 let run = manager.online_disk(pool.id(), spec).await?;
 let id = run.id();
 let snapshot = pool.task(id)?;
@@ -61,6 +64,7 @@ execution() 提供 Runtime 执行计数。ID 只在当前 Pool 实例内唯一�
 
 规则扩展见 [TaskCenter 开发说明](../../docs/task-center.md)。本轮删除 with_policy/with_rules、
 PoolConflictPolicy、RulePolicy 和选择器引擎，不保留兼容的第二套协调路径。
+多池接口、生命周期及持久化边界见 [PoolManager 当前实现](../../docs/pool-manager.md)。
 
 ## 验证
 

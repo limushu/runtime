@@ -3,6 +3,9 @@
 当前代码只有两个 workspace 成员，入口以本页和根 README 为准。
 
 - [当前架构与目录边界](architecture.md)
+- [PoolManager 当前实现与限制](pool-manager.md)
+- [PoolManager 接口、多索引与创建/删除设计](pool-manager-design.md)（含后续持久化目标）
+- [TaskCenter TUI：任务列表、Activity 时间线与历史](task-center-tui.md)（界面建议）
 - [TaskCenter 五图导读：先总览，再展开执行机制](runtime-guide.md)
 - [TaskCenter 动态演示：一次完整磁盘上线](diagrams/task-center-simulation/index.html)（离线教学模拟）
 - [动态演示范围、使用与验证](changes/2026-10-22-task-center-simulation.md)

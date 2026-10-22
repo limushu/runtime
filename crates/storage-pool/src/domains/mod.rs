@@ -35,4 +35,5 @@ identity!(TierId);
 
 pub mod disk;
 pub mod node;
+pub mod tier;
 pub mod vd;

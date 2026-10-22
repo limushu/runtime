@@ -4,16 +4,20 @@ use storage_pool::{adapters::*, *};
 #[tokio::main]
 async fn main() -> Outcome<()> {
     let metadata = Arc::new(MemoryMetadata::default());
-    let mut manager = PoolManager::new(
+    let manager = PoolManager::new(
         Config::default(),
         metadata.clone(),
         Arc::new(SimulatedDataPlane),
     );
     let pool = manager.create_pool(PoolId::new("pool-a")?)?;
+    pool.create_tier(TierId::new("ssd")?)
+        .await?
+        .result()
+        .await?;
     let mut disks = Vec::new();
     for index in 1..=2 {
         let node = NodeId::new(format!("node-{index}"))?;
-        pool.observe_node(node.clone(), 1, true)
+        pool.attach_node(node.clone(), 1, true)
             .await?
             .result()
             .await?;

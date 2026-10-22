@@ -11,6 +11,7 @@ pub struct OnlineNodeWorkflow {
     pub(crate) domains: Domains,
     pub(crate) request: NodeTransitionRequest,
     pub(crate) specs: Vec<DiskSpec>,
+    pub(crate) reservations: Vec<crate::manager::DiskReservation>,
 }
 
 impl PoolWorkflow for OnlineNodeWorkflow {
@@ -32,7 +33,7 @@ impl Workflow for OnlineNodeWorkflow {
     fn objects(&self) -> Vec<ObjectKey> {
         node_objects(&self.request, &self.specs)
     }
-    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<PoolNode> {
+    async fn run(mut self, ctx: &mut WorkflowContext) -> Outcome<PoolNode> {
         ctx.report_progress(Self::NAME, 0, None);
         let node = ctx
             .activity(
@@ -51,9 +52,13 @@ impl Workflow for OnlineNodeWorkflow {
             .activity(&self.domains.node, NodeCommand::Load(self.request.node))
             .await?;
         let ids: Vec<_> = self.specs.iter().map(|s| s.id.clone()).collect();
-        for spec in self.specs {
-            ctx.activity(&self.domains.disk, DiskCommand::Add(spec.clone()))
-                .await?;
+        for (spec, reservation) in self.specs.into_iter().zip(&mut self.reservations) {
+            reservation.begin();
+            let added = ctx
+                .activity(&self.domains.disk, DiskCommand::Add(spec.clone()))
+                .await;
+            reservation.settled(&added);
+            added?;
             ctx.activity(&self.domains.disk, DiskCommand::Open(spec.id))
                 .await?;
         }

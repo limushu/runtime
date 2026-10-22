@@ -21,7 +21,13 @@ impl Conflict {
 }
 impl PoolOperation {
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
-        self.objects.iter().any(|key| other.objects.contains(key))
+        matches!(
+            self.kind,
+            OperationKind::DeletePool | OperationKind::UnloadPool | OperationKind::LoadPool
+        ) || matches!(
+            other.kind,
+            OperationKind::DeletePool | OperationKind::UnloadPool | OperationKind::LoadPool
+        ) || self.objects.iter().any(|key| other.objects.contains(key))
     }
 }
 impl OperationKind {

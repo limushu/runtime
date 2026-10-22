@@ -261,9 +261,14 @@ impl DataPlane for ControlledPlane {
 fn manager(store: Arc<dyn MetadataStore>, plane: Arc<dyn DataPlane>) -> PoolManager {
     PoolManager::new(Config::default(), store, plane)
 }
-async fn add(manager: &mut PoolManager, pool: &PoolHandle, disk: &str, node: &str, capacity: u32) {
+async fn add(manager: &PoolManager, pool: &PoolHandle, disk: &str, node: &str, capacity: u32) {
     let node = node_id(node);
-    result(pool.observe_node(node.clone(), 1, true).await.unwrap())
+    if pool.tiers().await.unwrap().is_empty() {
+        result(pool.create_tier(TierId::new("ssd").unwrap()).await.unwrap())
+            .await
+            .unwrap();
+    }
+    result(pool.attach_node(node.clone(), 1, true).await.unwrap())
         .await
         .unwrap();
     result(pool.load_node(node.clone()).await.unwrap())
@@ -291,10 +296,10 @@ async fn fixture(
     plane: Arc<dyn DataPlane>,
     capacity: u32,
 ) -> (PoolManager, PoolHandle) {
-    let mut manager = manager(store, plane);
+    let manager = manager(store, plane);
     let pool = manager.create_pool(pool_id("a")).unwrap();
-    add(&mut manager, &pool, "d1", "n1", capacity).await;
-    add(&mut manager, &pool, "d2", "n2", capacity).await;
+    add(&manager, &pool, "d1", "n1", capacity).await;
+    add(&manager, &pool, "d2", "n2", capacity).await;
     (manager, pool)
 }
 fn request(name: &str) -> CreateVolume {
@@ -322,7 +327,7 @@ async fn invariant(pool: &PoolHandle) {
 #[tokio::test]
 async fn lifecycle_and_commit_order() {
     let store = Arc::new(MemoryMetadata::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 8).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 8).await;
     let volume = result(pool.create_volume(request("v")).await.unwrap())
         .await
         .unwrap();
@@ -352,14 +357,14 @@ async fn lifecycle_and_commit_order() {
 
 #[tokio::test]
 async fn connectivity_is_not_loading_and_observations_are_ordered() {
-    let mut manager = manager(
+    let manager = manager(
         Arc::new(MemoryMetadata::default()),
         Arc::new(SimulatedDataPlane),
     );
     let pool = manager.create_pool(pool_id("a")).unwrap();
     let node = node_id("n");
     assert!(
-        !result(pool.observe_node(node.clone(), 1, true).await.unwrap())
+        !result(pool.attach_node(node.clone(), 1, true).await.unwrap())
             .await
             .unwrap()
             .serving()
@@ -406,7 +411,7 @@ async fn connectivity_is_not_loading_and_observations_are_ordered() {
 
 #[tokio::test]
 async fn online_does_not_restore_invalid_data_or_free_blocks() {
-    let (mut manager, pool) = fixture(
+    let (manager, pool) = fixture(
         Arc::new(MemoryMetadata::default()),
         Arc::new(SimulatedDataPlane),
         2,
@@ -431,7 +436,7 @@ async fn online_does_not_restore_invalid_data_or_free_blocks() {
 async fn rejects_bad_placement_capacity_duplicates_and_unknown_identity() {
     assert!(PoolId::new(" ").is_err());
     assert!(DiskId::new("x".repeat(129)).is_err());
-    let (mut manager, pool) = fixture(
+    let (manager, pool) = fixture(
         Arc::new(MemoryMetadata::default()),
         Arc::new(SimulatedDataPlane),
         1,
@@ -453,7 +458,7 @@ async fn rejects_bad_placement_capacity_duplicates_and_unknown_identity() {
         .await
         .is_err()
     );
-    add(&mut manager, &pool, "d3", "n1", 1).await;
+    add(&manager, &pool, "d3", "n1", 1).await;
     assert!(
         pool.create_volume(CreateVolume {
             id: volume_id("bad"),
@@ -482,7 +487,7 @@ async fn rejects_bad_placement_capacity_duplicates_and_unknown_identity() {
 
 #[tokio::test]
 async fn down_or_disconnected_replica_rejected_before_allocation() {
-    let (mut manager, pool) = fixture(
+    let (manager, pool) = fixture(
         Arc::new(MemoryMetadata::default()),
         Arc::new(SimulatedDataPlane),
         2,
@@ -522,7 +527,7 @@ async fn down_or_disconnected_replica_rejected_before_allocation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_creates_do_not_double_allocate() {
-    let (mut manager, pool) = fixture(
+    let (manager, pool) = fixture(
         Arc::new(MemoryMetadata::default()),
         Arc::new(SimulatedDataPlane),
         32,
@@ -555,7 +560,7 @@ async fn concurrent_creates_do_not_double_allocate() {
 #[tokio::test]
 async fn partial_allocation_failure_leaks_but_never_publishes_reference() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
     store.fail(
         Point::Allocate(disk_id("d2")),
         Failure::Failed("known rejection".into()),
@@ -580,7 +585,7 @@ async fn partial_allocation_failure_leaks_but_never_publishes_reference() {
 #[tokio::test]
 async fn publication_failure_keeps_allocations_and_allows_safe_new_work() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
     store.fail(
         Point::Create,
         Failure::Failed("not committed".into()),
@@ -610,7 +615,7 @@ async fn publication_failure_keeps_allocations_and_allows_safe_new_work() {
 #[tokio::test]
 async fn failed_initialization_never_marks_data_valid() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
     *plane.init_failure.lock().unwrap() = Some(Failure::Failed("not initialized".into()));
     assert!(
         result(pool.create_volume(request("v")).await.unwrap())
@@ -631,7 +636,7 @@ async fn failed_initialization_never_marks_data_valid() {
 #[tokio::test]
 async fn ambiguous_commit_fences_followers_and_does_not_publish_unconfirmed_view() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
     store.fail(
         Point::Create,
         Failure::Uncertain("reply lost after commit".into()),
@@ -660,7 +665,7 @@ async fn ambiguous_commit_fences_followers_and_does_not_publish_unconfirmed_view
 #[tokio::test]
 async fn io_success_then_metadata_failure_is_uncertain() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
     store.fail(
         Point::Io(disk_id("d1")),
         Failure::Failed("write refused".into()),
@@ -685,7 +690,7 @@ async fn io_success_then_metadata_failure_is_uncertain() {
 #[tokio::test]
 async fn metadata_in_flight_keeps_old_view_and_object_ownership() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
     let gate = store.pause(Point::Allocate(disk_id("d1")));
     let create = pool.create_volume(request("v")).await.unwrap();
     gate.wait().await;
@@ -710,7 +715,7 @@ async fn metadata_in_flight_keeps_old_view_and_object_ownership() {
 #[tokio::test]
 async fn cancellation_after_allocation_retains_safe_orphan_and_unblocks_next_run() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
     let gate = store.pause(Point::Allocate(disk_id("d1")));
     let mut run = pool.create_volume(request("v")).await.unwrap();
     gate.wait().await;
@@ -734,7 +739,7 @@ async fn cancellation_after_allocation_retains_safe_orphan_and_unblocks_next_run
 #[tokio::test]
 async fn cancelled_offline_waits_for_stable_io_before_online_and_other_disk_progresses() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
     let gate = Gate::new();
     *plane.down.lock().unwrap() = Some((disk_id("d1"), gate.clone()));
     let mut offline = pool.offline_disk(disk_id("d1")).await.unwrap();
@@ -761,10 +766,10 @@ async fn cancelled_offline_waits_for_stable_io_before_online_and_other_disk_prog
 #[tokio::test]
 async fn pools_isolate_execution_but_cannot_share_physical_disk() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, a) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
+    let (manager, a) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
     let b = manager.create_pool(pool_id("b")).unwrap();
-    add(&mut manager, &b, "b1", "n1", 2).await;
-    add(&mut manager, &b, "b2", "n2", 2).await;
+    add(&manager, &b, "b1", "n1", 2).await;
+    add(&manager, &b, "b2", "n2", 2).await;
     assert!(
         manager
             .online_disk(
@@ -805,7 +810,7 @@ async fn pools_isolate_execution_but_cannot_share_physical_disk() {
 #[tokio::test]
 async fn invalidation_failure_does_not_claim_offline_success() {
     let store = Arc::new(ControlledStore::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
     result(pool.create_volume(request("v")).await.unwrap())
         .await
         .unwrap();
@@ -830,10 +835,13 @@ async fn new_disk_fixture(
     store: Arc<dyn MetadataStore>,
     plane: Arc<dyn DataPlane>,
 ) -> (PoolManager, PoolHandle, DiskSpec) {
-    let mut manager = manager(store, plane);
+    let manager = manager(store, plane);
     let pool = manager.create_pool(pool_id("a")).unwrap();
     let node = node_id("n");
-    result(pool.observe_node(node.clone(), 1, true).await.unwrap())
+    result(pool.create_tier(TierId::new("ssd").unwrap()).await.unwrap())
+        .await
+        .unwrap();
+    result(pool.attach_node(node.clone(), 1, true).await.unwrap())
         .await
         .unwrap();
     result(pool.load_node(node.clone()).await.unwrap())
@@ -852,7 +860,7 @@ async fn new_disk_fixture(
 async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success() {
     let store = Arc::new(ControlledStore::default());
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, spec) = new_disk_fixture(store.clone(), plane.clone()).await;
+    let (manager, pool, spec) = new_disk_fixture(store.clone(), plane.clone()).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
     let mut run = manager.online_disk(pool.id(), spec.clone()).await.unwrap();
@@ -867,17 +875,18 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
             .map(|a| (a.name, a.state.clone()))
             .collect::<Vec<_>>(),
         vec![
+            ("tier.inspect", ActivityState::Completed),
             ("node.inspect", ActivityState::Completed),
             ("disk.add", ActivityState::Completed),
             ("disk.open", ActivityState::Running),
         ]
     );
-    // InspectNode is Activity #1 too, not an unmanaged direct query.
+    // Tier and Node validation are observable Activities too.
     assert_eq!(
         run.control.state(),
         RunState::Activity(workflow_foundation::ActivityId {
             workflow: run.id(),
-            sequence: 3
+            sequence: 4
         })
     );
     assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Down);
@@ -890,8 +899,8 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     gate.open();
     assert_eq!(result(run).await.unwrap().io, IoState::Up);
     let history = pool.task(id).unwrap();
-    assert_eq!(history.activities.total, 4);
-    assert_eq!(history.activities.entries[3].name, "disk.set-io");
+    assert_eq!(history.activities.total, 5);
+    assert_eq!(history.activities.entries[4].name, "disk.set-io");
     assert!(
         history
             .activities
@@ -924,7 +933,7 @@ async fn online_failure_matrix_never_enables_before_add_and_open_succeed() {
     for stage in 0..3 {
         let store = Arc::new(ControlledStore::default());
         let plane = Arc::new(ControlledPlane::default());
-        let (mut manager, pool, spec) = new_disk_fixture(store.clone(), plane.clone()).await;
+        let (manager, pool, spec) = new_disk_fixture(store.clone(), plane.clone()).await;
         let failure = Failure::Failed("known step failure".into());
         match stage {
             0 => store.fail(Point::Add, failure, false),
@@ -960,7 +969,7 @@ async fn online_failure_matrix_never_enables_before_add_and_open_succeed() {
 #[tokio::test]
 async fn pause_after_open_blocks_enable_and_resume_continues_same_online_run() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, spec) =
+    let (manager, pool, spec) =
         new_disk_fixture(Arc::new(MemoryMetadata::default()), plane.clone()).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
@@ -993,7 +1002,7 @@ async fn pause_after_open_blocks_enable_and_resume_continues_same_online_run() {
 #[tokio::test]
 async fn offline_policy_cancels_online_but_waits_for_open_to_settle() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, spec) =
+    let (manager, pool, spec) =
         new_disk_fixture(Arc::new(MemoryMetadata::default()), plane.clone()).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
@@ -1027,7 +1036,7 @@ async fn offline_policy_cancels_online_but_waits_for_open_to_settle() {
 #[tokio::test]
 async fn paused_online_can_be_cancelled_by_offline_without_resume() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, spec) =
+    let (manager, pool, spec) =
         new_disk_fixture(Arc::new(MemoryMetadata::default()), plane.clone()).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
@@ -1045,7 +1054,7 @@ async fn paused_online_can_be_cancelled_by_offline_without_resume() {
 #[tokio::test]
 async fn pool_shutdown_waits_for_inflight_operation_and_is_retryable() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, spec) =
+    let (manager, pool, spec) =
         new_disk_fixture(Arc::new(MemoryMetadata::default()), plane.clone()).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
@@ -1116,7 +1125,7 @@ fn workflows_do_not_bypass_activity_with_direct_domain_queries() {
 #[tokio::test]
 async fn ambiguous_open_fences_replacement_without_publishing_up() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, spec) =
+    let (manager, pool, spec) =
         new_disk_fixture(Arc::new(MemoryMetadata::default()), plane.clone()).await;
     *plane.open_failure.lock().unwrap() =
         Some(Failure::Uncertain("open acknowledgement lost".into()));
@@ -1136,8 +1145,8 @@ async fn ambiguous_open_fences_replacement_without_publishing_up() {
 #[tokio::test]
 async fn three_replica_layout_and_topology_and_revision_validation() {
     let store = Arc::new(MemoryMetadata::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
-    add(&mut manager, &pool, "d3", "n3", 3).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
+    add(&manager, &pool, "d3", "n3", 3).await;
     let mut req = request("three");
     req.disks.push(disk_id("d3"));
     assert_eq!(
@@ -1186,7 +1195,7 @@ async fn three_replica_layout_and_topology_and_revision_validation() {
 #[tokio::test]
 async fn offline_skeleton_keeps_member_and_blocks_removal_without_rebuild() {
     let store = Arc::new(MemoryMetadata::default());
-    let (mut manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
+    let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
     result(pool.create_volume(request("v")).await.unwrap())
         .await
         .unwrap();
@@ -1232,8 +1241,8 @@ fn transition(sequence: u64) -> NodeTransitionRequest {
 #[tokio::test]
 async fn coordinator_cancels_node_offline_and_waits_for_batch_rebuild_to_settle_before_online() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 3).await;
-    add(&mut manager, &pool, "d3", "n1", 3).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 3).await;
+    add(&manager, &pool, "d3", "n1", 3).await;
     let gate = Gate::new();
     let seen = Arc::new(Semaphore::new(0));
     *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
@@ -1288,7 +1297,7 @@ async fn coordinator_cancels_node_offline_and_waits_for_batch_rebuild_to_settle_
 #[tokio::test]
 async fn connected_observation_alone_cancels_down_workflow_without_claiming_loaded() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
     let gate = Gate::new();
     *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
     let offline = pool.offline_node(transition(2)).await.unwrap();
@@ -1312,8 +1321,8 @@ async fn connected_observation_alone_cancels_down_workflow_without_claiming_load
 #[tokio::test]
 async fn disk_online_then_disk_offline_then_node_offline_are_coordinated_without_parallel_io() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
-    add(&mut manager, &pool, "d3", "n1", 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    add(&manager, &pool, "d3", "n1", 2).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
     let online = pool.online_disk(disk_id("d1")).await.unwrap();
@@ -1352,7 +1361,7 @@ async fn disk_online_then_disk_offline_then_node_offline_are_coordinated_without
 #[tokio::test]
 async fn uncertain_rebuild_fences_node_online_after_cancellation() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
     let gate = Gate::new();
     *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
     plane
@@ -1372,7 +1381,7 @@ async fn uncertain_rebuild_fences_node_online_after_cancellation() {
 #[tokio::test]
 async fn stale_node_online_does_not_cancel_newer_offline() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
     let gate = Gate::new();
     *plane.rebuild_gate.lock().unwrap() = Some(gate.clone());
     let offline = pool.offline_node(transition(3)).await.unwrap();
@@ -1391,7 +1400,7 @@ async fn stale_node_online_does_not_cancel_newer_offline() {
 #[tokio::test]
 async fn malformed_batch_io_response_fences_node_and_does_not_publish_unconfirmed_states() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
     plane
         .malformed_batch
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1411,7 +1420,7 @@ async fn malformed_batch_io_response_fences_node_and_does_not_publish_unconfirme
 async fn node_offline_includes_member_whose_initial_add_is_still_committing() {
     let store = Arc::new(ControlledStore::default());
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool, mut spec) = new_disk_fixture(store.clone(), plane.clone()).await;
+    let (manager, pool, mut spec) = new_disk_fixture(store.clone(), plane.clone()).await;
     // Use the node observed by new_disk_fixture, which starts at sequence 1.
     spec.node = node_id("n");
     let gate = store.pause(Point::Add);
@@ -1448,8 +1457,8 @@ async fn node_offline_includes_member_whose_initial_add_is_still_committing() {
 #[tokio::test]
 async fn batch_io_publishes_all_confirmed_items_even_when_one_item_fails() {
     let plane = Arc::new(ControlledPlane::default());
-    let (mut manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
-    add(&mut manager, &pool, "d3", "n1", 2).await;
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    add(&manager, &pool, "d3", "n1", 2).await;
     plane
         .batch_failures
         .lock()
@@ -1475,9 +1484,9 @@ async fn batch_io_publishes_all_confirmed_items_even_when_one_item_fails() {
 #[tokio::test]
 async fn task_center_explains_replacement_and_controls_waiting_task_by_id() {
     let plane = Arc::new(ControlledPlane::default());
-    let mut manager = manager(Arc::new(MemoryMetadata::default()), plane.clone());
+    let manager = manager(Arc::new(MemoryMetadata::default()), plane.clone());
     let pool = manager.create_pool(pool_id("a")).unwrap();
-    add(&mut manager, &pool, "d1", "n1", 2).await;
+    add(&manager, &pool, "d1", "n1", 2).await;
     let gate = Gate::new();
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
     let online = pool.online_disk(disk_id("d1")).await.unwrap();

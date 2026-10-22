@@ -13,6 +13,9 @@ impl ServiceHandler for DiskHost {
     type View = Vec<MemberDisk>;
     fn activity_name(request: &DiskCommand) -> &'static str {
         match request {
+            DiskCommand::RequireTierEmpty(_) => "disk.require-tier-empty",
+            DiskCommand::RemoveEmpty(_) => "disk.remove-empty",
+            DiskCommand::Release { .. } => "disk.release-allocation",
             DiskCommand::Inspect(_) => "disk.inspect",
             DiskCommand::InspectMany(_) => "disk.inspect-many",
             DiskCommand::SetIoMany(_, _) => "disk.set-io-many",
@@ -25,6 +28,9 @@ impl ServiceHandler for DiskHost {
         }
     }
     fn resources(request: &DiskCommand) -> Vec<ResourceAccess> {
+        if let DiskCommand::RequireTierEmpty(tier) = request {
+            return vec![ResourceAccess::read(object("tier", tier.as_str()))];
+        }
         if let DiskCommand::InspectMany(ids)
         | DiskCommand::SetIoMany(ids, _)
         | DiskCommand::RemoveMany(ids) = request
@@ -42,6 +48,8 @@ impl ServiceHandler for DiskHost {
                 .collect();
         }
         let id = match request {
+            DiskCommand::RequireTierEmpty(_) => unreachable!(),
+            DiskCommand::Release { disk, .. } => disk,
             DiskCommand::Inspect(id) => {
                 return vec![ResourceAccess::read(object("disk", id.as_str()))];
             }
@@ -53,6 +61,7 @@ impl ServiceHandler for DiskHost {
             | DiskCommand::SetIo(id, _)
             | DiskCommand::Allocate(id, _)
             | DiskCommand::Remove(id) => id,
+            DiskCommand::RemoveEmpty(id) => id,
         };
         vec![ResourceAccess::write(object("disk", id.as_str()))]
     }

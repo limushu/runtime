@@ -2,6 +2,7 @@
 //! Construct through PoolHandle so callers cannot omit the required conflict set.
 use crate::domains::disk::service::{DiskCommand, DiskReply};
 use crate::domains::node::service::NodeCommand;
+use crate::domains::tier::{TierCommand, TierReply};
 use crate::domains::vd::service::{VdCommand, VdReply};
 use crate::support::object;
 use crate::*;
@@ -9,11 +10,13 @@ use workflow_foundation::{ActivityClient, ObjectKey};
 
 mod create_volume;
 mod load_node;
+mod manage_children;
 mod observe_node;
 mod offline_disk;
 mod offline_node;
 mod online_disk;
 mod online_node;
+pub(crate) use manage_children::*;
 
 pub use create_volume::CreateVolumeWorkflow;
 pub use load_node::LoadNodeWorkflow;
@@ -25,6 +28,7 @@ pub use online_node::OnlineNodeWorkflow;
 
 #[derive(Clone)]
 pub(crate) struct Domains {
+    pub tier: ActivityClient<TierCommand, TierReply, Option<TierId>, Vec<Tier>>,
     pub disk: ActivityClient<DiskCommand, DiskReply, Option<DiskId>, Vec<MemberDisk>>,
     pub node: ActivityClient<NodeCommand, PoolNode, Option<NodeId>, Vec<PoolNode>>,
     pub vd: ActivityClient<VdCommand, VdReply, Option<VolumeId>, Vec<VirtualDisk>>,

@@ -5,6 +5,7 @@ use crate::domains::{
     node::NodeId,
     vd::{BgEntry, VirtualDisk, VolumeId},
 };
+use crate::{Tier, TierId};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use workflow_foundation::{Failure, Outcome};
@@ -12,6 +13,25 @@ use workflow_foundation::{Failure, Outcome};
 /// Field-level mutations, not overwrites of stale MemberDisk snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataChange {
+    CreateTier(Tier),
+    DeleteTier {
+        id: TierId,
+        expected_revision: u64,
+    },
+    RemoveDisk {
+        disk: DiskId,
+        expected_revision: u64,
+    },
+    DeleteVolume {
+        volume: VolumeId,
+        expected_revision: u64,
+    },
+    ReleaseAllocation {
+        disk: DiskId,
+        expected_revision: u64,
+        volume: VolumeId,
+        blk: u32,
+    },
     AddDisk(MemberDisk),
     DiskIo {
         disk: DiskId,
@@ -43,6 +63,39 @@ pub trait MetadataStore: Send + Sync + 'static {
 /// A possibly applied effect must return Uncertain, never Failed/Unavailable.
 #[async_trait]
 pub trait DataPlane: Send + Sync + 'static {
+    /// Ok confirms that this Pool is no longer loaded on the node.
+    async fn unload_pool(
+        &self,
+        _pool: &PoolId,
+        _node: &NodeId,
+        _cancel: &CancellationToken,
+    ) -> Outcome<()> {
+        Err(Failure::Rejected(
+            "pool unload is not supported by this data plane".into(),
+        ))
+    }
+    /// Ok confirms no further IO can reference this disk through this Pool.
+    async fn close_disk(
+        &self,
+        _pool: &PoolId,
+        _disk: &DiskId,
+        _cancel: &CancellationToken,
+    ) -> Outcome<()> {
+        Err(Failure::Rejected(
+            "disk close is not supported by this data plane".into(),
+        ))
+    }
+    /// Ok confirms all volume access and outstanding IO have stopped.
+    async fn delete_volume(
+        &self,
+        _pool: &PoolId,
+        _volume: &VolumeId,
+        _cancel: &CancellationToken,
+    ) -> Outcome<()> {
+        Err(Failure::Rejected(
+            "volume deletion is not supported by this data plane".into(),
+        ))
+    }
     async fn load_pool(
         &self,
         pool: &PoolId,

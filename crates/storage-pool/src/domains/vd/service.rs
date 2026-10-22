@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 use workflow_foundation::Outcome;
 
 pub(crate) enum VdCommand {
+    RequireDiskUnreferenced(DiskId),
+    Delete(VolumeId),
     RequireAbsent(VolumeId),
     Create {
         id: VolumeId,
@@ -24,11 +26,13 @@ pub(crate) enum VdCommand {
     WaitRebuild(DiskId),
 }
 pub(crate) enum VdReply {
+    Deleted(VirtualDisk),
     Checked,
     Created(VirtualDisk),
     Invalidated,
 }
 pub(crate) struct VdService {
+    deleted: Mutex<BTreeMap<VolumeId, VirtualDisk>>,
     pool: PoolId,
     volumes: Mutex<BTreeMap<VolumeId, VirtualDisk>>,
     metadata: Arc<dyn MetadataStore>,
@@ -41,6 +45,7 @@ impl VdService {
         data_plane: Arc<dyn DataPlane>,
     ) -> Self {
         Self {
+            deleted: Mutex::default(),
             pool,
             volumes: Mutex::new(BTreeMap::new()),
             metadata,
@@ -53,15 +58,63 @@ impl VdService {
         cancel: &CancellationToken,
     ) -> Outcome<VdReply> {
         match request {
+            VdCommand::RequireDiskUnreferenced(id) => {
+                if self.volumes.lock().unwrap().values().any(|volume| {
+                    volume
+                        .groups
+                        .iter()
+                        .flat_map(|g| &g.entries)
+                        .any(|entry| entry.disk == id)
+                }) {
+                    return Err(reject("disk is still referenced by a volume"));
+                }
+                Ok(VdReply::Checked)
+            }
+            VdCommand::Delete(id) => {
+                if let Some(volume) = self.deleted.lock().unwrap().get(&id).cloned() {
+                    return Ok(VdReply::Deleted(volume));
+                }
+                let volume = self
+                    .volumes
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| reject("unknown volume"))?;
+                self.data_plane
+                    .delete_volume(&self.pool, &id, cancel)
+                    .await?;
+                self.metadata
+                    .commit(
+                        &self.pool,
+                        MetadataChange::DeleteVolume {
+                            volume: id.clone(),
+                            expected_revision: volume.revision,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::Failure::Uncertain(format!(
+                            "volume stopped but deletion not confirmed: {e}"
+                        ))
+                    })?;
+                self.volumes.lock().unwrap().remove(&id);
+                self.deleted.lock().unwrap().insert(id, volume.clone());
+                Ok(VdReply::Deleted(volume))
+            }
             VdCommand::RequireAbsent(id) => {
-                if self.volumes.lock().unwrap().contains_key(&id) {
+                if self.volumes.lock().unwrap().contains_key(&id)
+                    || self.deleted.lock().unwrap().contains_key(&id)
+                {
                     Err(reject("volume already exists"))
                 } else {
                     Ok(VdReply::Checked)
                 }
             }
             VdCommand::Create { id, allocations } => {
-                if self.volumes.lock().unwrap().contains_key(&id) {
+                if self.volumes.lock().unwrap().contains_key(&id)
+                    || self.deleted.lock().unwrap().contains_key(&id)
+                {
                     return Err(reject("volume already exists"));
                 }
                 let volume =
@@ -125,6 +178,7 @@ impl VdService {
                 volumes
                     .get(&id)
                     .cloned()
+                    .or_else(|| self.deleted.lock().unwrap().get(&id).cloned())
                     .ok_or_else(|| reject("unknown volume"))?,
             ]),
             None => Ok(volumes.values().cloned().collect()),

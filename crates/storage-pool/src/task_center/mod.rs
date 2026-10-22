@@ -1,6 +1,7 @@
 //! One concrete application service per Pool: admission, queue, ownership and handoff.
 //! Read conflict() in conflicts.rs for business rules; State below implements their lifecycle.
 use crate::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Deref,
@@ -37,6 +38,16 @@ pub enum OperationKind {
     OnlineDisk(DiskId),
     OfflineDisk(DiskId),
     CreateVolume(VolumeId),
+    AttachNode(NodeId),
+    DetachNode(NodeId),
+    CreateTier(TierId),
+    DeleteTier(TierId),
+    RemoveDisk(DiskId),
+    DeleteVolume(VolumeId),
+    DeletePool,
+    RenamePool,
+    UnloadPool,
+    LoadPool,
 }
 #[derive(Debug, Clone)]
 pub struct PoolOperation {
@@ -102,6 +113,7 @@ type Accept = Box<dyn FnOnce(Outcome<&mut WorkflowDriver>) -> Option<Accepted> +
 struct Submission {
     operation: PoolOperation,
     accept: Accept,
+    administrative: bool,
 }
 struct Entry {
     operation: PoolOperation,
@@ -202,6 +214,7 @@ pub struct TaskCenter {
     stop: CancellationToken,
     lifecycle: watch::Receiver<Lifecycle>,
     _host: Arc<Host>,
+    admission_closed: Arc<AtomicBool>,
 }
 impl TaskCenter {
     pub(crate) fn start(mut driver: WorkflowDriver, config: &Config) -> Self {
@@ -217,6 +230,8 @@ impl TaskCenter {
         let failure: Arc<Mutex<Option<Failure>>> = Arc::default();
         let shutdown_failure = failure.clone();
         let limit = config.max_workflows;
+        let admission_closed = Arc::new(AtomicBool::new(false));
+        let closed = admission_closed.clone();
         let task = tokio::spawn(async move {
             let mut state = State::default();
             let mut closing = false;
@@ -231,7 +246,6 @@ impl TaskCenter {
                     break;
                 }
                 tokio::select! {
-                    biased;
                     _ = stopping.cancelled(), if !closing => {
                         closing = true;
                         life.send_replace(Lifecycle::Stopping);
@@ -245,7 +259,8 @@ impl TaskCenter {
                     submission = rx.recv(), if !closing => {
                         let Some(submission) = submission else { stopping.cancel(); continue; };
                         state.reap();
-                        let decision = if state.entries.len() >= limit { Err(Failure::Busy) }
+                        let decision = if closed.load(Ordering::SeqCst) && !submission.administrative { Err(Failure::Unavailable) }
+                            else if state.entries.len() >= limit { Err(Failure::Busy) }
                             else { state.inspect(&submission.operation) };
                         let matches = match decision {
                             Ok(matches) => matches,
@@ -292,10 +307,32 @@ impl TaskCenter {
             stop,
             lifecycle,
             _host: Arc::new(Host(task)),
+            admission_closed,
         }
     }
     pub(crate) fn abort(&self) {
         self._host.0.abort();
+    }
+    pub(crate) fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn open_admission(&self) {
+        self.admission_closed.store(false, Ordering::SeqCst);
+    }
+    pub(crate) fn accepts(&self) -> bool {
+        !self.admission_closed.load(Ordering::SeqCst) && !self.stop.is_cancelled()
+    }
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.is_cancelled()
+    }
+    pub(crate) fn has_reservation(&self, id: &DiskId) -> bool {
+        self.routing.lock().unwrap().contains_key(id)
+    }
+    pub(crate) fn disk_spec(&self, id: &DiskId) -> Option<DiskSpec> {
+        self.routing.lock().unwrap().get(id).cloned()
+    }
+    pub(crate) fn disk_directory(&self) -> Arc<Mutex<BTreeMap<DiskId, DiskSpec>>> {
+        self.routing.clone()
     }
     pub(crate) fn stop(&self) {
         self.stop.cancel();
@@ -386,6 +423,19 @@ impl TaskCenter {
     }
 
     pub(crate) async fn submit<W: PoolWorkflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+        self.submit_with_access(workflow, false).await
+    }
+    pub(crate) async fn submit_admin<W: PoolWorkflow>(
+        &self,
+        workflow: W,
+    ) -> Outcome<Run<W::Output>> {
+        self.submit_with_access(workflow, true).await
+    }
+    async fn submit_with_access<W: PoolWorkflow>(
+        &self,
+        workflow: W,
+        administrative: bool,
+    ) -> Outcome<Run<W::Output>> {
         if self.stop.is_cancelled() {
             return Err(Failure::Unavailable);
         }
@@ -394,6 +444,7 @@ impl TaskCenter {
         self.tx
             .send(Submission {
                 operation,
+                administrative,
                 accept: Box::new(move |driver| {
                     let result = driver.and_then(|driver| driver.defer(workflow));
                     match result {
@@ -414,6 +465,38 @@ impl TaskCenter {
             .await
             .map_err(|_| Failure::Unavailable)?;
         response.await.unwrap_or(Err(Failure::Unavailable))
+    }
+    pub(crate) fn try_submit<W: PoolWorkflow>(
+        &self,
+        workflow: W,
+        callback: impl FnOnce(Outcome<Run<W::Output>>) + Send + 'static,
+    ) -> Outcome<()> {
+        if !self.accepts() {
+            return Err(Failure::Unavailable);
+        }
+        let operation = workflow.operation();
+        self.tx
+            .try_send(Submission {
+                operation,
+                administrative: false,
+                accept: Box::new(move |driver| {
+                    match driver.and_then(|driver| driver.defer(workflow)) {
+                        Err(error) => {
+                            callback(Err(error));
+                            None
+                        }
+                        Ok((run, start)) => Some(Accepted {
+                            control: run.control.clone(),
+                            start,
+                            publish: Box::new(move || callback(Ok(run))),
+                        }),
+                    }
+                }),
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Failure::Busy,
+                mpsc::error::TrySendError::Closed(_) => Failure::Unavailable,
+            })
     }
 }
 

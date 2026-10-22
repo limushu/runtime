@@ -5,13 +5,20 @@ use crate::domains::{
 };
 use crate::{ports::*, support::reject};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 use workflow_foundation::{Failure, Outcome};
 
 pub(crate) enum DiskCommand {
+    RequireTierEmpty(crate::TierId),
+    RemoveEmpty(DiskId),
+    Release {
+        disk: DiskId,
+        volume: VolumeId,
+        blk: u32,
+    },
     Inspect(DiskId),
     InspectMany(Vec<DiskId>),
     SetIoMany(Vec<DiskId>, IoState),
@@ -24,11 +31,15 @@ pub(crate) enum DiskCommand {
     Remove(DiskId),
 }
 pub(crate) enum DiskReply {
+    Checked,
     Disk(MemberDisk),
     Allocated(Allocation),
     Disks(Vec<MemberDisk>),
 }
 pub(crate) struct DiskService {
+    owners: Mutex<BTreeMap<(DiskId, u32), VolumeId>>,
+    released: Mutex<BTreeSet<(DiskId, u32, VolumeId)>>,
+    retired: Mutex<BTreeSet<DiskId>>,
     pool: PoolId,
     disks: Mutex<BTreeMap<DiskId, MemberDisk>>,
     metadata: Arc<dyn MetadataStore>,
@@ -41,6 +52,9 @@ impl DiskService {
         data_plane: Arc<dyn DataPlane>,
     ) -> Self {
         Self {
+            owners: Mutex::default(),
+            released: Mutex::default(),
+            retired: Mutex::default(),
             pool,
             disks: Mutex::new(BTreeMap::new()),
             metadata,
@@ -63,6 +77,77 @@ impl DiskService {
         // Only short in-memory access uses Mutex. No guard crosses an await;
         // object conflicts are resolved by the Pool TaskCenter before execution.
         match request {
+            DiskCommand::RequireTierEmpty(tier) => {
+                if self
+                    .disks
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|disk| disk.tier == tier)
+                {
+                    return Err(reject("tier still has member disks"));
+                }
+                Ok(DiskReply::Checked)
+            }
+            DiskCommand::Release {
+                disk: id,
+                volume,
+                blk,
+            } => {
+                let receipt = (id.clone(), blk, volume.clone());
+                if self.released.lock().unwrap().contains(&receipt) {
+                    return Ok(DiskReply::Checked);
+                }
+                if self.owners.lock().unwrap().get(&(id.clone(), blk)) != Some(&volume) {
+                    return Err(reject("allocation belongs to another volume"));
+                }
+                let mut disk = self.get(&id)?;
+                if !disk.allocated.contains(&blk) {
+                    return Err(reject("allocation is missing"));
+                }
+                self.metadata
+                    .commit(
+                        &self.pool,
+                        MetadataChange::ReleaseAllocation {
+                            disk: id.clone(),
+                            expected_revision: disk.revision,
+                            volume,
+                            blk,
+                        },
+                    )
+                    .await?;
+                disk.allocated.remove(&blk);
+                disk.revision += 1;
+                self.disks.lock().unwrap().insert(id.clone(), disk);
+                self.owners.lock().unwrap().remove(&(id, blk));
+                self.released.lock().unwrap().insert(receipt);
+                Ok(DiskReply::Checked)
+            }
+            DiskCommand::RemoveEmpty(id) => {
+                if self.retired.lock().unwrap().contains(&id) {
+                    return Ok(DiskReply::Checked);
+                }
+                let disk = self.get(&id)?;
+                if !disk.allocated.is_empty() || disk.io != IoState::Down {
+                    return Err(reject("disk must be down and have no allocations"));
+                }
+                self.data_plane.close_disk(&self.pool, &id, cancel).await?;
+                self.metadata
+                    .commit(
+                        &self.pool,
+                        MetadataChange::RemoveDisk {
+                            disk: id.clone(),
+                            expected_revision: disk.revision,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        Failure::Uncertain(format!("disk closed but removal not confirmed: {e}"))
+                    })?;
+                self.disks.lock().unwrap().remove(&id);
+                self.retired.lock().unwrap().insert(id);
+                Ok(DiskReply::Checked)
+            }
             DiskCommand::Inspect(id) => Ok(DiskReply::Disk(self.get(&id)?)),
             DiskCommand::InspectMany(ids) => {
                 // Routing also includes reserved disks whose Add never committed.
@@ -142,6 +227,9 @@ impl DiskService {
                 }
             }
             DiskCommand::Add(spec) => {
+                if self.retired.lock().unwrap().contains(&spec.id) {
+                    return Err(reject("disk membership identity is retired"));
+                }
                 if let Some(existing) = self.disks.lock().unwrap().get(&spec.id).cloned() {
                     existing.require_identity(&spec)?;
                     return Ok(DiskReply::Disk(existing));
@@ -207,6 +295,10 @@ impl DiskService {
                     )
                     .await?;
                 disk.allocated.insert(blk);
+                self.owners
+                    .lock()
+                    .unwrap()
+                    .insert((id.clone(), blk), volume.clone());
                 disk.revision += 1;
                 let receipt = Allocation {
                     pool: self.pool.clone(),

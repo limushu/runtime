@@ -1,3 +1,4 @@
+use crate::domains::tier::{TierService, runtime::TierHost};
 use crate::domains::{
     disk::{runtime::DiskHost, service::DiskService},
     node::{runtime::NodeHost, service::NodeService},
@@ -5,8 +6,8 @@ use crate::domains::{
 };
 use crate::{ports::*, support::reject, task_center::TaskCenter, workflows::*, *};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::BTreeSet,
+    sync::{Arc, Mutex, Weak},
 };
 use workflow_foundation::{RuntimeSnapshot, WorkflowDriver, WorkflowId};
 
@@ -15,13 +16,19 @@ pub struct Pool {
     handle: PoolHandle,
 }
 impl Pool {
-    fn start(
-        id: PoolId,
+    pub(crate) fn start(
+        descriptor: PoolDescriptor,
         config: Config,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
+        registry: Weak<Mutex<crate::manager::Registry>>,
     ) -> Outcome<Self> {
+        let id = descriptor.id.clone();
         let mut driver = WorkflowDriver::new(id.as_str(), config.clone())?;
+        let tier = driver.register(
+            "tier",
+            TierHost(TierService::new(id.clone(), metadata.clone())),
+        )?;
         let disk = driver.register(
             "disk",
             DiskHost(DiskService::new(
@@ -38,10 +45,28 @@ impl Pool {
             "vd",
             VdHost(VdService::new(id.clone(), metadata, data_plane)),
         )?;
+        let domains = Domains {
+            disk,
+            node,
+            vd,
+            tier,
+        };
+        let shared = Arc::new(crate::manager::PoolShared::new(
+            descriptor, registry, &config,
+        ));
+        let admin = driver.register(
+            "pool",
+            crate::manager::admin::AdminHost {
+                shared: shared.clone(),
+                domains: domains.clone(),
+            },
+        )?;
         let handle = PoolHandle {
             id,
             task_center: TaskCenter::start(driver, &config),
-            domains: Domains { disk, node, vd },
+            domains,
+            shared,
+            admin,
         };
         Ok(Self { handle })
     }
@@ -49,16 +74,18 @@ impl Pool {
         self.handle.clone()
     }
     pub async fn shutdown(&mut self) -> Outcome<()> {
-        self.handle.task_center.shutdown().await
+        self.handle.shutdown().await
     }
 }
 
 /// Public application facade: no raw service mutation or arbitrary submit escape.
 #[derive(Clone)]
 pub struct PoolHandle {
-    id: PoolId,
-    task_center: TaskCenter,
-    domains: Domains,
+    pub(crate) id: PoolId,
+    pub(crate) task_center: TaskCenter,
+    pub(crate) domains: Domains,
+    pub(crate) shared: Arc<crate::manager::PoolShared>,
+    pub(crate) admin: crate::manager::admin::AdminClient,
 }
 impl PoolHandle {
     pub fn id(&self) -> &PoolId {
@@ -106,6 +133,14 @@ impl PoolHandle {
         sequence: u64,
         connected: bool,
     ) -> Outcome<Run<PoolNode>> {
+        self.descriptor().active()?;
+        if !self.shared.nodes.lock().unwrap().contains(&id) {
+            return Err(reject("node is not attached to this pool"));
+        }
+        self.shared.serial.fetch_max(
+            sequence.saturating_add(1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         self.task_center
             .submit(ObserveNodeWorkflow {
                 domains: self.domains.clone(),
@@ -129,6 +164,7 @@ impl PoolHandle {
         self.task_center
             .submit(OnlineDiskWorkflow {
                 domains: self.domains.clone(),
+                reservation: None,
                 spec: DiskSpec {
                     id: disk.id.clone(),
                     node: disk.node.clone(),
@@ -158,9 +194,15 @@ impl PoolHandle {
             .await
     }
     pub async fn online_node(&self, request: NodeTransitionRequest) -> Outcome<Run<PoolNode>> {
+        let specs = self.task_center.node_disks(&request.node);
+        let reservations = specs
+            .iter()
+            .map(|spec| self.reserve_disk(spec))
+            .collect::<Outcome<Vec<_>>>()?;
         self.task_center
             .submit(OnlineNodeWorkflow {
-                specs: self.task_center.node_disks(&request.node),
+                specs,
+                reservations,
                 domains: self.domains.clone(),
                 request,
             })
@@ -187,103 +229,6 @@ impl PoolHandle {
                 nodes: nodes.into_iter().collect(),
             })
             .await
-    }
-}
-
-/// Global routing/lifetime plus ordinary physical-disk ownership. No workflow
-/// arbitration here: that belongs to each Pool's concrete TaskCenter.
-pub struct PoolManager {
-    pools: BTreeMap<PoolId, Pool>,
-    disk_owners: BTreeMap<DiskId, PoolId>,
-    config: Config,
-    metadata: Arc<dyn MetadataStore>,
-    data_plane: Arc<dyn DataPlane>,
-    stopped: bool,
-}
-impl PoolManager {
-    pub fn new(
-        config: Config,
-        metadata: Arc<dyn MetadataStore>,
-        data_plane: Arc<dyn DataPlane>,
-    ) -> Self {
-        Self {
-            pools: BTreeMap::new(),
-            disk_owners: BTreeMap::new(),
-            config,
-            metadata,
-            data_plane,
-            stopped: false,
-        }
-    }
-    pub fn create_pool(&mut self, id: PoolId) -> Outcome<PoolHandle> {
-        if self.stopped {
-            return Err(Failure::Unavailable);
-        }
-        if self.pools.contains_key(&id) {
-            return Err(reject(
-                "pool identity already used; recreation is not recovery",
-            ));
-        }
-        let pool = Pool::start(
-            id.clone(),
-            self.config.clone(),
-            self.metadata.clone(),
-            self.data_plane.clone(),
-        )?;
-        let handle = pool.handle();
-        self.pools.insert(id, pool);
-        Ok(handle)
-    }
-    pub fn pool(&self, id: &PoolId) -> Outcome<PoolHandle> {
-        self.pools
-            .get(id)
-            .map(Pool::handle)
-            .ok_or_else(|| reject("unknown pool"))
-    }
-    /// Routes a complete online operation, including initial membership if needed.
-    pub async fn online_disk(&mut self, pool: &PoolId, spec: DiskSpec) -> Outcome<Run<MemberDisk>> {
-        if self.stopped {
-            return Err(Failure::Unavailable);
-        }
-        let handle = self.pool(pool)?;
-        if spec.capacity_blks == 0 {
-            return Err(reject("disk capacity must be positive"));
-        }
-        if self
-            .disk_owners
-            .get(&spec.id)
-            .is_some_and(|owner| owner != pool)
-        {
-            return Err(reject("physical disk belongs to another pool"));
-        }
-        // Reserve before await. Cancellation or an uncertain commit must never
-        // make the same physical disk available to a different Pool.
-        handle.task_center.register_disk(&spec)?;
-        self.disk_owners.insert(spec.id.clone(), pool.clone());
-        handle
-            .task_center
-            .submit(OnlineDiskWorkflow {
-                domains: handle.domains,
-                spec,
-            })
-            .await
-    }
-    pub async fn shutdown_pool(&mut self, id: &PoolId) -> Outcome<()> {
-        self.pools
-            .get_mut(id)
-            .ok_or_else(|| reject("unknown pool"))?
-            .shutdown()
-            .await
-    }
-    pub async fn shutdown(&mut self) -> Outcome<()> {
-        self.stopped = true;
-        let mut failure = None;
-        for pool in self.pools.values_mut() {
-            if let Err(e) = pool.shutdown().await {
-                failure.get_or_insert(e);
-            }
-        }
-        failure.map_or(Ok(()), Err)
     }
 }
 

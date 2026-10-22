@@ -13,6 +13,8 @@ impl ServiceHandler for VdHost {
     type View = Vec<VirtualDisk>;
     fn activity_name(request: &VdCommand) -> &'static str {
         match request {
+            VdCommand::Delete(_) => "vd.delete",
+            VdCommand::RequireDiskUnreferenced(_) => "vd.require-disk-unreferenced",
             VdCommand::RequireAbsent(_) => "vd.require-absent",
             VdCommand::Create { .. } => "vd.create",
             VdCommand::Invalidate(_) => "vd.invalidate",
@@ -22,7 +24,10 @@ impl ServiceHandler for VdHost {
         }
     }
     fn resources(request: &VdCommand) -> Vec<ResourceAccess> {
-        if matches!(request, VdCommand::RequireAbsent(_)) {
+        if matches!(
+            request,
+            VdCommand::RequireAbsent(_) | VdCommand::RequireDiskUnreferenced(_)
+        ) {
             return vec![ResourceAccess::read(object("vd", "reference-index"))];
         }
         // Protect the reverse-reference index including newly created VDs. A

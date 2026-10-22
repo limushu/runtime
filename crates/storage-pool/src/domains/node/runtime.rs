@@ -13,6 +13,9 @@ impl ServiceHandler for NodeHost {
     type View = Vec<PoolNode>;
     fn activity_name(request: &NodeCommand) -> &'static str {
         match request {
+            NodeCommand::Attach { .. } => "node.attach",
+            NodeCommand::Detach(_) => "node.detach",
+            NodeCommand::Unload(_) => "node.unload",
             NodeCommand::Inspect(_) => "node.inspect",
             NodeCommand::Observe { .. } => "node.observe",
             NodeCommand::Load(_) => "node.load",
@@ -23,7 +26,11 @@ impl ServiceHandler for NodeHost {
             NodeCommand::Inspect(id) => {
                 return vec![ResourceAccess::read(object("node", id.as_str()))];
             }
-            NodeCommand::Observe { id, .. } | NodeCommand::Load(id) => id,
+            NodeCommand::Unload(id)
+            | NodeCommand::Attach { id, .. }
+            | NodeCommand::Detach(id)
+            | NodeCommand::Observe { id, .. }
+            | NodeCommand::Load(id) => id,
         };
         vec![ResourceAccess::write(object("node", id.as_str()))]
     }

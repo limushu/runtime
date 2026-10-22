@@ -8,3 +8,5 @@ workflow-foundation.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true
+uuid.workspace = true

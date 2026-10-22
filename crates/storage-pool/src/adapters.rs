@@ -2,7 +2,10 @@
 use crate::support::reject;
 use crate::{ports::*, *};
 use async_trait::async_trait;
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -11,6 +14,12 @@ pub struct MemoryMetadata {
 }
 #[derive(Default)]
 struct MemoryState {
+    tiers: BTreeMap<(PoolId, TierId), Tier>,
+    retired_tiers: BTreeSet<(PoolId, TierId)>,
+    retired_disks: BTreeSet<(PoolId, DiskId)>,
+    retired_volumes: BTreeSet<(PoolId, VolumeId)>,
+    allocations: BTreeMap<(PoolId, DiskId, u32), VolumeId>,
+    released: BTreeSet<(PoolId, DiskId, u32, VolumeId)>,
     log: Vec<(PoolId, MetadataChange)>,
     disks: BTreeMap<(PoolId, DiskId), MemberDisk>,
     volumes: BTreeMap<(PoolId, VolumeId), VirtualDisk>,
@@ -25,8 +34,114 @@ impl MetadataStore for MemoryMetadata {
     async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()> {
         let mut state = self.state.lock().unwrap();
         match &change {
+            MetadataChange::CreateTier(tier) => {
+                let key = (pool.clone(), tier.id.clone());
+                if tier.pool != *pool
+                    || state.tiers.contains_key(&key)
+                    || state.retired_tiers.contains(&key)
+                {
+                    return Err(reject("tier identity already used or wrong pool"));
+                }
+                state.tiers.insert(key, tier.clone());
+            }
+            MetadataChange::DeleteTier {
+                id,
+                expected_revision,
+            } => {
+                let key = (pool.clone(), id.clone());
+                let tier = state
+                    .tiers
+                    .get(&key)
+                    .ok_or_else(|| reject("unknown tier"))?;
+                if tier.revision != *expected_revision
+                    || state
+                        .disks
+                        .values()
+                        .any(|d| d.pool == *pool && d.tier == *id)
+                {
+                    return Err(reject("tier is referenced or revision is stale"));
+                }
+                state.tiers.remove(&key);
+                state.retired_tiers.insert(key);
+            }
+            MetadataChange::RemoveDisk {
+                disk,
+                expected_revision,
+            } => {
+                let key = (pool.clone(), disk.clone());
+                let member = state
+                    .disks
+                    .get(&key)
+                    .ok_or_else(|| reject("unknown disk"))?;
+                if member.revision != *expected_revision
+                    || member.io != IoState::Down
+                    || !member.allocated.is_empty()
+                    || state.volumes.values().any(|v| {
+                        v.pool == *pool
+                            && v.groups
+                                .iter()
+                                .flat_map(|g| &g.entries)
+                                .any(|e| e.disk == *disk)
+                    })
+                {
+                    return Err(reject("disk is in use or revision is stale"));
+                }
+                state.disks.remove(&key);
+                state.retired_disks.insert(key);
+            }
+            MetadataChange::DeleteVolume {
+                volume,
+                expected_revision,
+            } => {
+                let key = (pool.clone(), volume.clone());
+                let current = state
+                    .volumes
+                    .get(&key)
+                    .ok_or_else(|| reject("unknown volume"))?;
+                if current.revision != *expected_revision {
+                    return Err(reject("stale volume revision"));
+                }
+                state.volumes.remove(&key);
+                state.retired_volumes.insert(key);
+            }
+            MetadataChange::ReleaseAllocation {
+                disk,
+                expected_revision,
+                volume,
+                blk,
+            } => {
+                let receipt = (pool.clone(), disk.clone(), *blk, volume.clone());
+                if state.released.contains(&receipt) {
+                    return Ok(());
+                }
+                let key = (pool.clone(), disk.clone(), *blk);
+                if !state
+                    .retired_volumes
+                    .contains(&(pool.clone(), volume.clone()))
+                    || state.allocations.get(&key) != Some(volume)
+                {
+                    return Err(reject(
+                        "allocation owner or volume deletion proof does not match",
+                    ));
+                }
+                let member = state
+                    .disks
+                    .get_mut(&(pool.clone(), disk.clone()))
+                    .ok_or_else(|| reject("unknown disk"))?;
+                if member.revision != *expected_revision || !member.allocated.remove(blk) {
+                    return Err(reject("stale allocation release"));
+                }
+                member.revision += 1;
+                state.allocations.remove(&key);
+                state.released.insert(receipt);
+            }
             MetadataChange::AddDisk(disk) => {
-                if disk.pool != *pool || state.disks.keys().any(|(_, id)| *id == disk.id) {
+                if disk.pool != *pool
+                    || state.disks.keys().any(|(_, id)| *id == disk.id)
+                    || state
+                        .retired_disks
+                        .contains(&(pool.clone(), disk.id.clone()))
+                {
                     return Err(reject("disk identity already owned or wrong pool"));
                 }
                 state
@@ -52,8 +167,9 @@ impl MetadataStore for MemoryMetadata {
                 disk,
                 expected_revision,
                 blk,
-                ..
+                volume,
             } => {
+                let key = (pool.clone(), disk.clone(), *blk);
                 let disk = state
                     .disks
                     .get_mut(&(pool.clone(), disk.clone()))
@@ -67,10 +183,14 @@ impl MetadataStore for MemoryMetadata {
                 }
                 disk.allocated.insert(*blk);
                 disk.revision += 1;
+                state.allocations.insert(key, volume.clone());
             }
             MetadataChange::CreateVolume(volume) => {
                 let key = (pool.clone(), volume.id.clone());
-                if volume.pool != *pool || state.volumes.contains_key(&key) {
+                if volume.pool != *pool
+                    || state.volumes.contains_key(&key)
+                    || state.retired_volumes.contains(&key)
+                {
                     return Err(reject("volume exists or wrong pool"));
                 }
                 state.volumes.insert(key, volume.clone());
@@ -99,6 +219,20 @@ fn ready(cancel: &CancellationToken) -> Outcome<()> {
 }
 #[async_trait]
 impl DataPlane for SimulatedDataPlane {
+    async fn unload_pool(&self, _: &PoolId, _: &NodeId, cancel: &CancellationToken) -> Outcome<()> {
+        ready(cancel)
+    }
+    async fn close_disk(&self, _: &PoolId, _: &DiskId, cancel: &CancellationToken) -> Outcome<()> {
+        ready(cancel)
+    }
+    async fn delete_volume(
+        &self,
+        _: &PoolId,
+        _: &VolumeId,
+        cancel: &CancellationToken,
+    ) -> Outcome<()> {
+        ready(cancel)
+    }
     async fn open_disk(&self, _: &PoolId, _: &DiskId, cancel: &CancellationToken) -> Outcome<()> {
         ready(cancel)
     }
