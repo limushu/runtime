@@ -17,7 +17,7 @@
 | ServiceHandler | 基础设施的托管适配协议，不是 DDD DomainService |
 | StartPermit | 应用拥有的一次性启动许可，无冲突判断逻辑 |
 
-接口：[workflow.rs](src/workflow.rs)、[service.rs](src/service.rs)、
+接口：[workflow.rs](src/workflow.rs)、[Activity 状态机](src/workflow/activity.rs)、[控制通知](src/control.rs)、[service.rs](src/service.rs)、
 [driver.rs](src/driver.rs)、[standalone.rs](src/standalone.rs)、[model.rs](src/model.rs)、[tasks.rs](src/tasks.rs)。
 
 ## 应用管理的执行
@@ -58,8 +58,14 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 - Uncertain/panic 会保留步骤资源隔离，不能被 Workflow 忽略成成功。单纯被隔离的后继
   返回 Rejected，避免扩大隔离。在 defer 模式下，应用负责 Workflow 级对象隔离。
 - ActivityContext 是适配层执行上下文，不应进入纯领域对象。
-- pause 在 Activity/Signal/Timer 或 safe_point 边界确认；不抢占外部 IO，暂停不会回滚步骤。
+- pause 默认在 Activity/Signal/Timer 或 safe_point 边界确认；Activity 可注册异步控制钩子，在运行中委托领域服务暂停并等待确认。
   排队准入期间还不能即时确认 Paused。取消/关闭可以直接唤醒暂停。
+- `ActivityContext::register_pause` 注册本次步骤的 pause/resume，未注册时等待步骤完成。
+  `ActivityContext::control()` 提供统一控制 token；取消只走 token，由领域适配器主动感知，不再另设取消钩子。
+  Framework 不会在任意业务 Future 的每次 poll 中自动检查取消。暂停确认绑定控制代次及 Activity 取消作用域。
+  `cancellation_reason()` 区分用户 Requested 与宿主/服务 Interrupted，供适配器决定取消或停稳交接。
+  `Workflow::continuation_guard` 在首次执行、恢复和步骤边界检查业务条件；Wait 进入 WaitingConditions。
+  用户暂停与系统暂停独立，条件更新通过 recheck 唤醒；细节见 [控制机制](../../docs/activity-control.md)。
 - client 绑定 Runtime 实例，即使 Pool 名称相同也不能跨实例执行 Activity。
 - shutdown 拒绝新工作、请求取消、等待停稳、关闭服务；等待可取消后重试。
   强制 Drop 只保证本地任务回收，不能保证远端 IO 停止。
@@ -82,6 +88,7 @@ let updated = observer.changed().await?; // Activity 更新也会唤醒，不依
 ```
 
 状态为 `WaitingResources -> Queued -> Running -> Completed / Failed(Failure)`。
+支持中间暂停的步骤还会出现 `Pausing / Paused`，保持同一 ActivityId。
 `Queued` 包含等待服务邮箱容量；取消、拒绝、服务不可用可以在实际开始前结束，
 此时 `started_at` 为 None。取消请求不会提前标记完成；调用方丢弃 Activity 等待 Future 后，
 记录仍由服务端实际执行更新。handler panic 或执行中强制终止记录为 Uncertain，不能误报成功。
@@ -99,7 +106,10 @@ let updated = observer.changed().await?; // Activity 更新也会唤醒，不依
 watch 仍会合并通知，但合并不会抹掉历史上限内已结束的 Activity 记录。
 历史只存在当前进程内，关闭后保留在已有句柄中；重启后查询需要另外接入持久化存储。
 
-没有持久化历史、确定性重放、跨主恢复、自动重试或完整 Temporal 引擎能力。
+可通过 defer_with_options 注入 AuditSink 和 CheckpointWriter，由 TaskCenter/应用保存历史与显式业务检查点。
+AuditSink 在实际生命周期边界输出，步骤被内存历史淘汰后仍会输出最终结果；实现必须迅速返回并暴露记录失败。
+save_checkpoint 等待检查点写入确认，不负责序列化 Future 或解释业务状态；与同步 checkpoint() 不同。
+本库自身不提供数据库、确定性重放、跨主接管协议、自动重试或完整 Temporal 引擎能力。
 不可把重新创建同名实例当作恢复，也不提供执行不可信代码的沙箱。
 
 ## 验证

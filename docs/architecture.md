@@ -10,7 +10,9 @@ PoolManager
    │  └─ 直接推进 Workflow Future（嵌入通用执行驱动，无独立 task）
    ├─ DiskService + DiskHost（独立服务宿主）
    ├─ NodeService + NodeHost（独立服务宿主）
-   └─ VdService + VdHost（独立服务宿主）
+   ├─ VdService + VdHost（独立服务宿主）
+   ├─ TierService + TierHost（独立服务宿主）
+   └─ BalanceService + BalanceHost（外部均衡 job 的能力与控制适配）
 ```
 
 Task 是一次完整 Workflow 执行，Activity 是其步骤。硬盘上线是一个流程，Add/Open/Enable
@@ -21,10 +23,10 @@ Pool 没有单独的 runtime 字段，也不使用 RuntimeHandle 向另一条协
 
 domains 表示“业务领域分组”，不是声称其中所有文件都是 DDD 纯领域层。
 
-- `domains/{disk,node,vd}/model.rs`：对象、不变量、状态规则，只依赖标准库及其他领域模型。
-- `domains/{disk,node,vd}/service.rs`：能力与已确认状态；组织领域校验、数据面操作、元数据提交。
+- `domains/{disk,node,vd,balance}/model.rs`：对象、不变量、状态规则，身份序列化不引入执行框架。
+- `domains/{disk,node,vd,balance}/service.rs`：能力与已确认状态；组织领域校验、数据面操作、元数据提交。
   不实现 ServiceHandler、不使用 ActivityContext、不认识托管自己的 runtime、不维护对象冲突队列。
-- `domains/{disk,node,vd}/runtime.rs`：服务托管适配，声明步骤资源并转发能力调用；runtime 依赖 service，
+- `domains/{disk,node,vd,balance}/runtime.rs`：服务托管适配，声明步骤资源并转发能力调用；runtime 依赖 service，
   service 依赖 model，不能反向依赖。
 - `domains/mod.rs`：公共身份和 DomainError；错误转换放在最外层 support.rs。
 - `ports.rs` / `adapters.rs`：外部接口与模拟实现。取消/IO 是应用能力边界，不进入领域模型。
@@ -54,12 +56,17 @@ TaskCenter 检查全部在途冲突及容量。只有成功登记才实施取消
 尤其保护 VD 反向引用索引等共享结构。服务内部没有业务对象排队器。
 通用独立 submit 仍提供简单对象互斥供示例/测试使用，不能绕过 Pool 正式入口混用。
 
+完整缩容由 ShrinkDiskWorkflow 推进。一次排空 Activity 等待独立均衡 job，并转发实际进度；
+暂停钩子在适配层发送控制指令并确认停稳。均衡完成后的引用与分配读取权威元数据，
+防止领域缓存覆盖已提交的 remap。TaskCenter 协调 topo，均衡器不反向触发缩容状态切换。
+
 暂停仍保留逻辑对象；排队任务只记录暂停请求，获准到达安全边界才确认 Paused。
 pool.scheduling() 表示业务排队/运行/逻辑隔离；pool.execution() 表示底层执行与资源计数。
 pool.task(id).conflicts 是准入时解释，不是实时等待图。
 
 ## 限制
 
-没有持久化任务历史、确定性重放、跨主恢复、自动重试、动态扩展对象集合、真实重建/成员删除。
+任务历史可通过注入 TaskStore 持久化，指定用户 Task 可按业务检查点续办，见 [接入说明](task-persistence.md)。
+没有确定性重放、跨主所有权接管协议、自动重试、动态扩展对象集合或真实重建；空闲无引用成员盘可以显式移除。
 拓扑身份不可变；节点关联盘集合包含已预约但未提交的盘。资源声明仍较保守，同节点的部分
 磁盘流程会串行，本轮不改变原有冲突范围。强制 Drop 不能证明远端 IO 已停止。

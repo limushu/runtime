@@ -7,6 +7,8 @@ pub enum ConflictDecision {
     Independent,
     Wait,
     CancelThenWait,
+    /// Admit only after the existing shrink has actually acknowledged suspension.
+    SuspendThenWait,
     Reject(&'static str),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,16 +23,41 @@ impl Conflict {
 }
 impl PoolOperation {
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
-        matches!(
-            self.kind,
-            OperationKind::DeletePool | OperationKind::UnloadPool | OperationKind::LoadPool
-        ) || matches!(
-            other.kind,
-            OperationKind::DeletePool | OperationKind::UnloadPool | OperationKind::LoadPool
-        ) || self.objects.iter().any(|key| other.objects.contains(key))
+        (self.kind == OperationKind::Shrink
+            && (other.kind == OperationKind::Shrink || other.kind.is_topology()))
+            || (other.kind == OperationKind::Shrink && self.kind.is_topology())
+            || matches!(
+                self.kind,
+                OperationKind::DeletePool | OperationKind::UnloadPool | OperationKind::LoadPool
+            )
+            || matches!(
+                other.kind,
+                OperationKind::DeletePool | OperationKind::UnloadPool | OperationKind::LoadPool
+            )
+            || self.objects.iter().any(|key| other.objects.contains(key))
     }
 }
 impl OperationKind {
+    pub(crate) fn is_topology(&self) -> bool {
+        matches!(
+            self,
+            Self::Topology(_)
+                | Self::ObserveNode { .. }
+                | Self::LoadNode(_)
+                | Self::OnlineNode { .. }
+                | Self::OfflineNode { .. }
+                | Self::OnlineDisk(_)
+                | Self::OfflineDisk(_)
+                | Self::AttachNode(_)
+                | Self::DetachNode(_)
+                | Self::RemoveDisk(_)
+                | Self::CreateTier(_)
+                | Self::DeleteTier(_)
+                | Self::LoadPool
+                | Self::UnloadPool
+                | Self::DeletePool
+        )
+    }
     fn node_change(&self) -> Option<(&NodeId, u64)> {
         match self {
             Self::ObserveNode { id, sequence, .. }
@@ -46,6 +73,16 @@ impl TaskCenter {
     pub fn conflict(incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
         use ConflictDecision::*;
         use OperationKind::*;
+        // Pool-wide rules precede disjoint-object and duplicate detection.
+        if incoming.kind == Shrink && existing.kind == Shrink {
+            return Conflict::new(Wait, "one-shrink-per-pool");
+        }
+        if incoming.kind == Shrink && existing.kind.is_topology() {
+            return Conflict::new(Wait, "shrink-waits-topology");
+        }
+        if incoming.kind.is_topology() && existing.kind == Shrink {
+            return Conflict::new(SuspendThenWait, "topology-suspends-shrink");
+        }
         if !incoming.overlaps(existing) {
             return Conflict::new(Independent, "disjoint");
         }

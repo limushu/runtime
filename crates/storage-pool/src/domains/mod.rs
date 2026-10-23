@@ -12,7 +12,7 @@ pub type DomainResult<T> = Result<T, DomainError>;
 
 macro_rules! identity {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
         pub struct $name(String);
         impl $name {
             pub fn new(value: impl Into<String>) -> $crate::domains::DomainResult<Self> {
@@ -33,6 +33,7 @@ macro_rules! identity {
 identity!(PoolId);
 identity!(TierId);
 
+pub mod balance;
 pub mod disk;
 pub mod node;
 pub mod tier;

@@ -171,14 +171,13 @@ impl PoolHandle {
             .await
     }
     pub async fn delete_volume(&self, id: VolumeId) -> Outcome<Run<()>> {
-        let volume = self
-            .domains
-            .vd
-            .query(Some(id))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| reject("unknown volume"))?;
+        let volume = self.volumes().await?.into_iter().find(|v| v.id == id);
+        // Retain the confirmed deletion's allocation receipts for retrying cleanup.
+        // Active volumes must use canonical placement after an external remap.
+        let volume = match volume {
+            Some(volume) => volume,
+            None => self.domains.vd.query(Some(id)).await?.remove(0),
+        };
         let nodes = volume
             .groups
             .iter()
@@ -466,6 +465,7 @@ impl PoolHandle {
                         sequence,
                         connected: *connected,
                     },
+                    Some(event.id),
                     callback,
                 )
             }
@@ -477,6 +477,7 @@ impl PoolHandle {
                             spec,
                             reservation: None,
                         },
+                        Some(event.id),
                         move |result| {
                             let result = result.map(|run| run.control);
                             reply_disk(&decision, result);
@@ -488,6 +489,7 @@ impl PoolHandle {
                             id: disk.clone(),
                             node: spec.node,
                         },
+                        Some(event.id),
                         move |result| reply_disk(&decision, result.map(|run| run.control)),
                     ),
                     None => Err(reject("unknown disk membership")),

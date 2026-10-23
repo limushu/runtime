@@ -1511,7 +1511,7 @@ async fn task_center_explains_replacement_and_controls_waiting_task_by_id() {
 #[test]
 fn vertical_modules_preserve_model_service_runtime_dependencies() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for domain in ["disk", "node", "vd"] {
+    for domain in ["disk", "node", "vd", "balance"] {
         let folder = src.join("domains").join(domain);
         let model = std::fs::read_to_string(folder.join("model.rs")).unwrap();
         for term in [

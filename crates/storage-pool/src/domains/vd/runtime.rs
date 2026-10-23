@@ -13,6 +13,7 @@ impl ServiceHandler for VdHost {
     type View = Vec<VirtualDisk>;
     fn activity_name(request: &VdCommand) -> &'static str {
         match request {
+            VdCommand::Refresh => "vd.refresh-committed-placement",
             VdCommand::Delete(_) => "vd.delete",
             VdCommand::RequireDiskUnreferenced(_) => "vd.require-disk-unreferenced",
             VdCommand::RequireAbsent(_) => "vd.require-absent",
@@ -36,7 +37,7 @@ impl ServiceHandler for VdHost {
     }
 
     async fn execute(&self, request: Self::Request, ctx: ActivityContext) -> Outcome<Self::Reply> {
-        self.0.execute(request, ctx.cancellation()).await
+        self.0.execute(request, ctx.control().cancellation()).await
     }
     fn query(&self, query: Self::Query) -> Outcome<Self::View> {
         self.0.query(query)

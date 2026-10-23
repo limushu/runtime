@@ -51,10 +51,12 @@ Accepted 只表示任务已接受；完成、失败、队列满、不相关、�
 跨池 TaskRef 包含 Pool UUID、实例 UUID、WorkflowId；观测和控制均校验作用域。
 Manager 汇总本池 Task 快照，选中任务可以订阅 observer；历史与 Activity 均在内存中有界保留。
 删除池的运行历史另按 `Config::task_history` 限制保留的池数量；已有 observer 不受目录淘汰影响。
+可选注入 TaskStore 后，TaskCenter 另外提供 KV 历史查询与指定 Task 的检查点续办，不受热缓存淘汰影响，
+见 [持久化接入说明](task-persistence.md)。
 
 ## 当前边界
 
-目录、身份墓碑、事件去重及审计历史都没有跨进程持久化。
-尚无 PoolCatalog、崩溃恢复、持久 RequestId 或完整状态事件日志。
+目录、身份墓碑和事件去重仍没有跨进程持久化；审计历史可通过 TaskStore 配置持久化。
+尚无 PoolCatalog、通用崩溃恢复、持久 RequestId 或完整状态事件日志。
 [设计草案](pool-manager-design.md) 中更完整的持久化契约仍是后续目标，不能当作现有 API。
 [TUI 建议](task-center-tui.md) 说明如何呈现当前接口及其限制。

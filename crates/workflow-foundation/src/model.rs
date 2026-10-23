@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     sync::{
@@ -6,7 +7,7 @@ use std::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Failure {
     Cancelled,
     Rejected(String),
@@ -29,15 +30,15 @@ impl Failure {
 }
 pub type Outcome<T> = Result<T, Failure>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkflowId(pub u64);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityId {
     pub workflow: WorkflowId,
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectKey {
     pub namespace: String,
     pub id: String,
@@ -59,12 +60,12 @@ impl ObjectKey {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Access {
     Read,
     Write,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceAccess {
     pub object: ObjectKey,
     pub access: Access,
@@ -84,7 +85,7 @@ impl ResourceAccess {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signal {
     pub name: String,
     pub payload: String,
@@ -97,12 +98,15 @@ impl Signal {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunState {
     WaitingObjects,
     Running,
-    /// Acknowledged cooperative pause; no Activity is executing for this workflow.
+    /// Awaiting the current Activity's pause acknowledgement or its safe completion.
+    Pausing,
+    /// No new steps can start; any in-flight controlled Activity has acknowledged pause.
     Paused,
+    WaitingConditions(String),
     WaitingResources,
     WaitingSignal,
     WaitingTimer,
@@ -111,13 +115,13 @@ pub enum RunState {
     Completed,
     Failed(Failure),
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lifecycle {
     Running,
     Stopping,
     Stopped,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
     pub pool: String,
     pub lifecycle: Lifecycle,
@@ -126,14 +130,14 @@ pub struct RuntimeSnapshot {
     pub held: usize,
     pub fenced: usize,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSnapshot {
     pub lifecycle: Lifecycle,
     pub running: usize,
     pub completed: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub capacity: usize,
     pub max_workflows: usize,

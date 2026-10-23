@@ -1,3 +1,6 @@
+use crate::audit::AuditEmitter;
+use crate::control::ControlSource;
+mod activity;
 use crate::{
     locks::{Broker, Kind, Permit},
     model::Scope,
@@ -22,6 +25,9 @@ pub trait Workflow: Send + 'static {
     /// Logical ownership for this execution, not every resource a step will touch.
     fn objects(&self) -> Vec<ObjectKey> {
         vec![]
+    }
+    fn continuation_guard(&self) -> Option<Arc<dyn ContinuationGuard>> {
+        None
     }
     async fn run(self, context: &mut WorkflowContext) -> Outcome<Self::Output>;
 }
@@ -51,14 +57,16 @@ impl<T> Run<T> {
 pub struct RunControl {
     pub id: WorkflowId,
     pub name: &'static str,
-    cancel: CancellationToken,
+    source: ControlSource,
     signals: mpsc::Sender<Signal>,
     state: watch::Receiver<RunState>,
     max_signal_bytes: usize,
-    pause: watch::Sender<bool>,
+    status: watch::Sender<RunState>,
+    recheck: Arc<Notify>,
     pub(crate) progress: watch::Receiver<TaskProgress>,
     pub(crate) activities: watch::Receiver<ActivityHistory>,
     pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
+    audit: AuditEmitter,
 }
 impl RunControl {
     /// Request a pause at the next safe boundary, not preemption of external IO.
@@ -69,13 +77,55 @@ impl RunControl {
         self.set_pause(false)
     }
     fn set_pause(&self, value: bool) -> Outcome<()> {
-        if self.cancel.is_cancelled()
+        self.ensure_controllable()?;
+        self.source.set_pause(true, value)?;
+        self.audit.emit(AuditEvent::Control {
+            pause: Some(value),
+            cancel: false,
+        });
+        self.publish_control();
+        Ok(())
+    }
+    pub fn set_system_pause(&self, value: bool) -> Outcome<()> {
+        self.ensure_controllable()?;
+        if self.source.set_pause(false, value)? {
+            self.audit.emit(AuditEvent::SystemPause(value));
+            self.publish_control();
+        }
+        Ok(())
+    }
+    fn ensure_controllable(&self) -> Outcome<()> {
+        if self.source.is_cancelled()
             || matches!(self.state(), RunState::Completed | RunState::Failed(_))
         {
             return Err(Failure::Rejected("run is cancelled or terminal".into()));
         }
-        self.pause.send_replace(value);
         Ok(())
+    }
+    fn publish_control(&self) {
+        if !self.pause_requested() && self.state() == RunState::Paused {
+            self.status.send_replace(RunState::Running);
+            self.audit.emit(AuditEvent::State(RunState::Running));
+        } else {
+            self.status.send_modify(|_| {});
+        }
+    }
+    pub fn token(&self) -> ControlToken {
+        self.source.token()
+    }
+    pub fn user_pause_requested(&self) -> bool {
+        self.source.request().user_paused
+    }
+    pub fn system_pause_requested(&self) -> bool {
+        self.source.request().system_paused
+    }
+    pub fn pause_acknowledged(&self) -> bool {
+        self.state() == RunState::Paused && self.source.pause_acknowledged()
+    }
+    /// Wake a workflow waiting for a business precondition; never bypass its check.
+    pub fn recheck(&self) {
+        self.recheck.notify_one();
+        self.status.send_modify(|_| {});
     }
     pub fn progress(&self) -> TaskProgress {
         self.progress.borrow().clone()
@@ -84,40 +134,51 @@ impl RunControl {
         self.activities.borrow().clone()
     }
     pub fn pause_requested(&self) -> bool {
-        *self.pause.borrow()
+        self.source.request().pause_requested()
     }
     /// Cancellation-safe wait for acknowledgement, not merely request delivery.
     pub async fn wait_paused(&self) -> Outcome<()> {
         let mut state = self.state.clone();
-        let mut request = self.pause.subscribe();
+        let mut token = self.source.token();
+        let mut acknowledgements = self.source.acknowledgements();
         loop {
-            if self.cancel.is_cancelled() {
+            if token.is_cancelled() {
                 return Err(Failure::Cancelled);
             }
-            if !*request.borrow_and_update() {
+            if !token.request().pause_requested() {
                 return Err(Failure::Rejected("pause request is not active".into()));
             }
-            match state.borrow_and_update().clone() {
-                RunState::Paused => return Ok(()),
-                RunState::Completed | RunState::Failed(_) => {
-                    return Err(Failure::Rejected(
-                        "run ended before pause acknowledgement".into(),
-                    ));
-                }
-                _ => {}
+            if self.pause_acknowledged() {
+                return Ok(());
+            }
+            if matches!(
+                *state.borrow_and_update(),
+                RunState::Completed | RunState::Failed(_)
+            ) {
+                return Err(Failure::Rejected(
+                    "run ended before pause acknowledgement".into(),
+                ));
             }
             tokio::select! {
-                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
                 changed = state.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-                changed = request.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                changed = token.changed() => { changed?; }
+                changed = acknowledgements.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
             }
         }
     }
     pub fn cancel(&self) {
-        self.cancel.cancel();
+        self.audit.emit(AuditEvent::Control {
+            pause: None,
+            cancel: true,
+        });
+        self.source.cancel();
+        if self.state() == RunState::Paused {
+            self.status.send_replace(RunState::Settling);
+            self.audit.emit(AuditEvent::State(RunState::Settling));
+        }
     }
     pub fn cancellation_requested(&self) -> bool {
-        self.cancel.is_cancelled()
+        self.source.is_cancelled()
     }
     pub fn state(&self) -> RunState {
         self.state.borrow().clone()
@@ -153,6 +214,9 @@ pub(crate) struct Tracker {
     changed: Arc<Notify>,
 }
 impl Tracker {
+    fn mark_uncertain(&self) {
+        self.state.lock().unwrap().uncertain = true;
+    }
     fn ready(&self) -> Outcome<()> {
         let state = self.state.lock().unwrap();
         if state.uncertain {
@@ -228,7 +292,8 @@ pub struct WorkflowContext {
     pub(crate) scope: Arc<Scope>,
     pub(crate) pool: String,
     pub(crate) broker: Broker,
-    pub(crate) cancel: CancellationToken,
+    requests: ControlToken,
+    source: ControlSource,
     signals: mpsc::Receiver<Signal>,
     // Accepted execution lifetime is independent of the last public Run handle.
     _signal_sender: mpsc::Sender<Signal>,
@@ -239,8 +304,11 @@ pub struct WorkflowContext {
     activity_history: usize,
     objects: Arc<Mutex<Vec<ObjectKey>>>,
     next_activity: u64,
-    pause: watch::Receiver<bool>,
-    _pause_sender: watch::Sender<bool>,
+    audit: AuditEmitter,
+    checkpoints: Option<Arc<dyn CheckpointWriter>>,
+    wake: Arc<Notify>,
+    recheck: Arc<Notify>,
+    continuation: Option<Arc<dyn ContinuationGuard>>,
 }
 impl WorkflowContext {
     pub fn id(&self) -> WorkflowId {
@@ -249,23 +317,33 @@ impl WorkflowContext {
     pub fn pool(&self) -> &str {
         &self.pool
     }
-    pub fn cancellation(&self) -> &CancellationToken {
-        &self.cancel
+    pub fn control(&self) -> &ControlToken {
+        &self.requests
     }
     /// Observational only. Invalid/oversized reports are ignored, never failing business work.
     pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
-        let stage = stage.into();
-        if stage.trim().is_empty() || stage.len() > 256 || total.is_some_and(|t| completed > t) {
+        crate::tasks::report_progress(&self.progress, &self.audit, stage.into(), completed, total);
+    }
+    /// Persist a BUSINESS checkpoint; this does not serialize or replay the async future.
+    /// A pause is acknowledged at the next safe_point, AFTER the caller saves settled work.
+    pub async fn save_checkpoint(&self, checkpoint: Vec<u8>) -> Outcome<()> {
+        self.tracker.ready()?;
+        self.checkpoints
+            .as_ref()
+            .ok_or_else(|| Failure::Rejected("task has no checkpoint writer".into()))?
+            .save(checkpoint)
+            .await
+    }
+    fn transition(&self, state: RunState) {
+        if *self.state.borrow() == state {
             return;
         }
-        self.progress.send_replace(TaskProgress {
-            stage: Some(stage),
-            completed,
-            total,
-        });
+        self.audit.emit(AuditEvent::State(state.clone()));
+        self.state.send_replace(state);
+        self.wake.notify_one();
     }
     pub fn checkpoint(&self) -> Outcome<()> {
-        if self.cancel.is_cancelled() || self.scope.is_closed() {
+        if self.requests.is_cancelled() || self.scope.is_closed() {
             Err(Failure::Cancelled)
         } else {
             self.tracker.ready()
@@ -274,26 +352,59 @@ impl WorkflowContext {
     /// Cooperative boundary for custom computation; checkpoint() only checks cancel.
     pub async fn safe_point(&mut self) -> Outcome<()> {
         self.checkpoint()?;
-        while *self.pause.borrow_and_update() {
-            self.state.send_replace(RunState::Paused);
-            tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
-                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-            }
-            self.checkpoint()?;
-        }
-        self.state.send_replace(RunState::Running);
+        let token = self.requests.clone();
+        self.continue_when_ready(&token).await?;
+        self.transition(RunState::Running);
         Ok(())
     }
+    async fn continue_when_ready(&mut self, token: &ControlToken) -> Outcome<u64> {
+        let mut token = token.clone();
+        loop {
+            if token.is_cancelled() || self.scope.is_closed() {
+                return Err(Failure::Cancelled);
+            }
+            while token.request().pause_requested() {
+                let generation = token.request().generation;
+                if self.source.acknowledge_pause(generation, &token) {
+                    self.transition(RunState::Paused);
+                }
+                token.changed().await?;
+            }
+            let Some(guard) = self.continuation.clone() else {
+                return Ok(token.request().generation);
+            };
+            let generation = token.request().generation;
+            let decision = tokio::select! {
+                biased;
+                changed = token.changed() => { changed?; continue; }
+                result = AssertUnwindSafe(guard.check()).catch_unwind() => {
+                    result.unwrap_or_else(|_| Err(Failure::Uncertain("continuation check panicked".into())))?
+                },
+            };
+            if token.request().generation != generation || token.request().pause_requested() {
+                continue;
+            }
+            match decision {
+                ContinueDecision::Ready => return Ok(generation),
+                ContinueDecision::Wait(reason) => {
+                    self.transition(RunState::WaitingConditions(reason));
+                    tokio::select! {
+                        changed = token.changed() => { changed?; }
+                        _ = self.recheck.notified() => {}
+                    }
+                }
+            }
+        }
+    }
     pub async fn next_signal(&mut self) -> Outcome<Signal> {
+        let cancel = self.requests.cancellation().clone();
         loop {
             self.safe_point().await?;
-            self.state.send_replace(RunState::WaitingSignal);
+            self.transition(RunState::WaitingSignal);
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
-                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                _ = cancel.cancelled() => return Err(Failure::Cancelled),
+                changed = self.requests.changed() => { changed?; }
                 signal = self.signals.recv() => {
                     let signal = signal.ok_or(Failure::Unavailable)?;
                     self.safe_point().await?;
@@ -303,14 +414,15 @@ impl WorkflowContext {
         }
     }
     pub async fn sleep(&mut self, delay: Duration) -> Outcome<()> {
+        let cancel = self.requests.cancellation().clone();
         let deadline = tokio::time::Instant::now() + delay;
         loop {
             self.safe_point().await?;
-            self.state.send_replace(RunState::WaitingTimer);
+            self.transition(RunState::WaitingTimer);
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
-                changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                _ = cancel.cancelled() => return Err(Failure::Cancelled),
+                changed = self.requests.changed() => { changed?; }
                 _ = tokio::time::sleep_until(deadline) => return self.safe_point().await,
             }
         }
@@ -344,18 +456,20 @@ impl WorkflowContext {
             service.name.to_string(),
             (service.activity_name)(&request),
             resources.clone(),
+            self.audit.clone(),
         );
+        let cancel = self.requests.cancellation().clone();
         let permit: Outcome<Permit> = async {
             loop {
                 self.safe_point().await?;
-                self.state.send_replace(RunState::WaitingResources);
+                self.transition(RunState::WaitingResources);
                 let broker = self.broker.clone();
                 tokio::select! {
                     biased;
-                    changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-                    permit = broker.acquire(Kind::Activity, resources.clone(), &self.cancel) => {
+                    changed = self.requests.changed() => { changed?; }
+                    permit = broker.acquire(Kind::Activity, resources.clone(), &cancel) => {
                         let permit = permit?;
-                        if *self.pause.borrow() { drop(permit); continue; }
+                        if self.requests.request().pause_requested() { drop(permit); continue; }
                         self.checkpoint()?;
                         break Ok(permit);
                     }
@@ -371,33 +485,40 @@ impl WorkflowContext {
             }
         };
         observation.queued();
+        let reporter = observation.reporter();
         let guard = self.tracker.register(permit, observation);
-        self.state.send_replace(RunState::Activity(id));
-        let result = service
-            .dispatch(
-                request,
-                ActivityContext {
-                    id,
-                    cancel: self.cancel.child_token(),
-                },
-                guard,
-            )
-            .await;
-        self.state.send_replace(RunState::Running);
-        result
+        self.transition(RunState::Activity(id));
+        let (pause_hook, current_hook) = watch::channel(None);
+        let token = self.requests.child();
+        let operation = service.dispatch(
+            request,
+            ActivityContext {
+                id,
+                control: token.clone(),
+                pause_hook,
+                progress: self.progress.clone(),
+                audit: self.audit.clone(),
+            },
+            guard,
+        );
+        self.drive_activity(id, token, current_hook, reporter, operation)
+            .await
     }
 }
 
 struct Completion<T> {
     reply: Option<oneshot::Sender<Outcome<T>>>,
     state: watch::Sender<RunState>,
+    audit: AuditEmitter,
 }
 impl<T> Completion<T> {
     fn finish(&mut self, result: Outcome<T>) {
-        self.state.send_replace(match &result {
+        let state = match &result {
             Ok(_) => RunState::Completed,
             Err(e) => RunState::Failed(e.clone()),
-        });
+        };
+        self.audit.emit(AuditEvent::State(state.clone()));
+        self.state.send_replace(state);
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(result);
         }
@@ -421,6 +542,8 @@ pub(crate) struct ExecutionEnv {
     pub cancel: CancellationToken,
     pub config: Config,
     pub start: Option<oneshot::Receiver<Outcome<()>>>,
+    pub options: ExecutionOptions,
+    pub wake: Arc<Notify>,
 }
 pub(crate) fn execution<W: Workflow>(
     workflow: W,
@@ -437,36 +560,49 @@ pub(crate) fn execution<W: Workflow>(
         cancel,
         config,
         start,
+        options,
+        wake,
     } = env;
+    let audit = AuditEmitter {
+        workflow: id,
+        sink: options.audit,
+    };
+    audit.emit(AuditEvent::Registered { name: W::NAME });
     let (reply, result) = oneshot::channel();
     let (signals, signal_rx) = mpsc::channel(config.capacity);
     let (state, state_rx) = watch::channel(RunState::WaitingObjects);
-    let (pause, pause_rx) = watch::channel(false);
+    let source = ControlSource::new(cancel, wake.clone());
+    let token = source.token();
     let (progress, progress_rx) = watch::channel(TaskProgress::default());
     let (activities, activities_rx) = watch::channel(ActivityHistory::default());
     let objects = Arc::new(Mutex::new(Vec::new()));
+    let recheck = Arc::new(Notify::new());
     let control = RunControl {
         id,
         name: W::NAME,
-        cancel: cancel.clone(),
+        source: source.clone(),
         signals: signals.clone(),
         state: state_rx,
         max_signal_bytes: config.max_signal_bytes,
-        pause: pause.clone(),
+        status: state.clone(),
+        recheck: recheck.clone(),
         progress: progress_rx,
         activities: activities_rx,
         objects: objects.clone(),
+        audit: audit.clone(),
     };
     let mut completion = Completion {
         reply: Some(reply),
         state: state.clone(),
+        audit: audit.clone(),
     };
     let mut context = WorkflowContext {
         id,
         scope,
         pool,
         broker,
-        cancel,
+        requests: token,
+        source,
         signals: signal_rx,
         _signal_sender: signals,
         state,
@@ -476,13 +612,17 @@ pub(crate) fn execution<W: Workflow>(
         activity_history: config.activity_history,
         objects,
         next_activity: 0,
-        pause: pause_rx,
-        _pause_sender: pause,
+        audit,
+        checkpoints: options.checkpoints,
+        wake,
+        recheck,
+        continuation: None,
     };
     let future = Box::pin(async move {
         // Include declaration/constructor panics in the workflow boundary.
         let mut ownership = None;
         let result = AssertUnwindSafe(async {
+            context.continuation = workflow.continuation_guard();
             let declared = workflow.objects();
             *context.objects.lock().unwrap() = declared.clone();
             for object in &declared {
@@ -492,7 +632,7 @@ pub(crate) fn execution<W: Workflow>(
                 // The application owns logical objects for a managed run.
                 tokio::select! {
                     biased;
-                    _ = context.cancel.cancelled() => return Err(Failure::Cancelled),
+                    _ = context.requests.cancelled() => return Err(Failure::Cancelled),
                     allowed = start => allowed.unwrap_or(Err(Failure::Unavailable))?,
                 }
             } else {
@@ -501,7 +641,7 @@ pub(crate) fn execution<W: Workflow>(
                 ownership = Some(
                     context
                         .broker
-                        .acquire(Kind::Workflow, objects, &context.cancel)
+                        .acquire(Kind::Workflow, objects, context.requests.cancellation())
                         .await?,
                 );
             }
@@ -512,8 +652,11 @@ pub(crate) fn execution<W: Workflow>(
         .await
         .unwrap_or_else(|_| Err(Failure::Uncertain("workflow panicked".into())));
         context.signals.close();
-        context.state.send_replace(RunState::Settling);
-        let uncertain = context.tracker.settle(&context.cancel).await;
+        context.transition(RunState::Settling);
+        let uncertain = context
+            .tracker
+            .settle(context.requests.cancellation())
+            .await;
         let result = if uncertain {
             Err(Failure::Uncertain(
                 "activity outcome requires reconciliation".into(),

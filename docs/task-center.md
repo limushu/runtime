@@ -9,16 +9,17 @@
 没有策略 trait、OperationSelector、RuleRelation 或规则优先级。规则在同一个具体
 TaskCenter 的 conflict 方法中，是普通 Rust 业务代码。
 
-## 四个明确结果
+## 五个明确结果
 
 | 结果 | 意义 |
 | --- | --- |
 | Independent | 对象集合无交集，可并行；不再用 Queue 表示无冲突 |
 | Wait | 有冲突，按接受顺序等待；后来的重叠任务不能插队 |
 | CancelThenWait | 请求旧任务取消，但等其实际终态后才放行 |
+| SuspendThenWait | 请求缩容暂停，等实际暂停确认后放行 topo，保留原执行 |
 | Reject(reason) | 拒绝本次提交，不取消任何已有任务 |
 
-判断顺序是：对象关系 → 节点变更序号 → 重复请求 → 具名业务情况 → 默认等待。
+判断顺序是：池级缩容/topo 规则 → 对象关系 → 节点变更序号 → 重复请求 → 具名业务情况 → 默认等待。
 同一节点的新序号替换旧序号；旧序号/相同序号的在途节点变更拒绝。
 相同操作的重复任务拒绝，调用者应观察原 Run；本轮没有合并结果功能。
 
@@ -31,7 +32,7 @@ TaskCenter 的 conflict 方法中，是普通 Rust 业务代码。
 
 1. 在 OperationKind 增加业务操作，Workflow 的 operation() 返回该操作与 objects()。
 2. 明确所有受影响的 Disk/Node/Volume 对象。若涉及新增对象关系，先修正声明，不靠规则猜拓扑。
-3. 在 conflict() 的 match 增加带方向的业务分支，返回四种结果之一和可读 reason。
+3. 在 conflict() 的 match 增加带方向的业务分支，返回上述结果之一和可读 reason。
 4. 给正向、反向、不同对象、重复/陈旧请求补表格测试。
 5. 对 CancelThenWait 补实际交接测试：旧 Activity 未停稳时新流程绝不能产生副作用。
    同时测试新任务被其他冲突拒绝、容量不足或对象被隔离时，不会误取消旧任务。
@@ -62,7 +63,12 @@ TaskCenter 先看完整冲突集合，再通过嵌入的执行驱动同步登记
 `pool.execution()`：Runtime 的底层资源/生命周期计数，不能代替业务队列计数。
 
 conflicts 是准入时的解释，不是实时阻塞列表。普通执行历史有界，已有 observer 可在记录淘汰后
-继续观察；不确定记录与隔离保留。本轮没有自动解除隔离或跨进程恢复。
+继续观察；不确定记录与隔离保留，没有自动解除隔离。可配置的持久历史和显式可续办任务见 [持久化](task-persistence.md)。
+
+`topology_blockers` 是缩容当前等待的已受理 topo WorkflowId，包含排队任务。
+单 Pool 的前序缩容在暂停/等待条件时仍保留名额；topo 即使来自其他磁盘，也先请求暂停再等待确认。
+全部 topo 结束后清除系统原因，再执行业务条件检查，不会清除用户暂停。
+接口、控制钩子与资源要求见 [Activity 控制](activity-control.md) 和 [缩容流程](shrink-workflow.md)。
 
 `snapshot.activities.entries` 按调用序号列出每个步骤的名称、服务、资源、状态和时间戳。
 例如 OnlineDisk 执行期间可以看到 `node.inspect`、`disk.add` 已完成，`disk.open` 正在执行；
@@ -72,6 +78,6 @@ Activity 记录由框架自动产生，TaskCenter 直接透传，不依赖业务
 
 `Config::activity_history` 限制每个 task 保留的步骤数（默认 1024），
 `activities.total` / `activities.omitted` 表示累计调用与已淘汰数量。
-这与 task 级历史上限独立；两者都是当前进程内的历史，不支持重启恢复。
+这与 task 级历史上限独立；这里是进程内缓存，跨进程历史由配置的 TaskStore 保存。
 未走到的动态分支不会被列为“未完成步骤”。具体语义见
 [Workflow Foundation 逐 Activity 观测](../crates/workflow-foundation/README.md#逐-activity-观测)。

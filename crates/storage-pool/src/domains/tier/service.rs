@@ -6,11 +6,13 @@ use std::{
 };
 
 pub(crate) enum TierCommand {
+    Refresh,
     Create(TierId),
     Inspect(TierId),
     Delete(TierId),
 }
 pub(crate) enum TierReply {
+    Checked,
     Tier(Tier),
     Deleted,
 }
@@ -31,6 +33,15 @@ impl TierService {
     }
     pub async fn execute(&self, request: TierCommand) -> Outcome<TierReply> {
         match request {
+            TierCommand::Refresh => {
+                let snapshot = self.metadata.snapshot(&self.pool).await?;
+                *self.tiers.lock().unwrap() = snapshot
+                    .tiers
+                    .into_iter()
+                    .map(|t| (t.id.clone(), t))
+                    .collect();
+                Ok(TierReply::Checked)
+            }
             TierCommand::Create(id) => {
                 if self.deleted.lock().unwrap().contains(&id) {
                     return Err(reject("tier identity is retired"));

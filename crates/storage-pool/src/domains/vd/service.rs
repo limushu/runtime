@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use workflow_foundation::Outcome;
 
 pub(crate) enum VdCommand {
+    Refresh,
     RequireDiskUnreferenced(DiskId),
     Delete(VolumeId),
     RequireAbsent(VolumeId),
@@ -32,6 +33,7 @@ pub(crate) enum VdReply {
     Invalidated,
 }
 pub(crate) struct VdService {
+    authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
     deleted: Mutex<BTreeMap<VolumeId, VirtualDisk>>,
     pool: PoolId,
     volumes: Mutex<BTreeMap<VolumeId, VirtualDisk>>,
@@ -43,8 +45,10 @@ impl VdService {
         pool: PoolId,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
+        authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
+            authoritative_reads,
             deleted: Mutex::default(),
             pool,
             volumes: Mutex::new(BTreeMap::new()),
@@ -57,7 +61,28 @@ impl VdService {
         request: VdCommand,
         cancel: &CancellationToken,
     ) -> Outcome<VdReply> {
+        if self
+            .authoritative_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !matches!(request, VdCommand::Refresh)
+        {
+            let snapshot = self.metadata.snapshot(&self.pool).await?;
+            *self.volumes.lock().unwrap() = snapshot
+                .volumes
+                .into_iter()
+                .map(|v| (v.id.clone(), v))
+                .collect();
+        }
         match request {
+            VdCommand::Refresh => {
+                let snapshot = self.metadata.snapshot(&self.pool).await?;
+                *self.volumes.lock().unwrap() = snapshot
+                    .volumes
+                    .into_iter()
+                    .map(|v| (v.id.clone(), v))
+                    .collect();
+                Ok(VdReply::Checked)
+            }
             VdCommand::RequireDiskUnreferenced(id) => {
                 if self.volumes.lock().unwrap().values().any(|volume| {
                     volume

@@ -8,3 +8,4 @@ async-trait.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+serde.workspace = true

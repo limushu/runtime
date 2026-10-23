@@ -1,7 +1,9 @@
 use crate::{Outcome, PoolId, domains::DomainError, support::reject};
 use std::{fmt, str::FromStr};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PoolUuid(uuid::Uuid);
 impl PoolUuid {
     pub fn new() -> Self {

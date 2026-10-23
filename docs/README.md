@@ -6,6 +6,10 @@
 - [PoolManager 当前实现与限制](pool-manager.md)
 - [PoolManager 接口、多索引与创建/删除设计](pool-manager-design.md)（含后续持久化目标）
 - [TaskCenter TUI：任务列表、Activity 时间线与历史](task-center-tui.md)（界面建议）
+- [TaskCenter 持久历史、可配数据库与可选续办](task-persistence.md)（当前接口与示例）
+- [TaskCenter 任务历史与可选续办设计](task-recovery-design.md)（目标设计，具体范围以当前接口为准）
+- [Activity 可选暂停钩子与继续条件](activity-control.md)（当前接口与控制语义）
+- [缩容 Workflow 与拓扑任务协调](shrink-workflow.md)（完整业务流程、均衡端口与接管示例）
 - [TaskCenter 五图导读：先总览，再展开执行机制](runtime-guide.md)
 - [TaskCenter 动态演示：一次完整磁盘上线](diagrams/task-center-simulation/index.html)（离线教学模拟）
 - [动态演示范围、使用与验证](changes/2026-10-22-task-center-simulation.md)

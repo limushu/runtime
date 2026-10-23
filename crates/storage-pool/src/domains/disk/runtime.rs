@@ -13,6 +13,12 @@ impl ServiceHandler for DiskHost {
     type View = Vec<MemberDisk>;
     fn activity_name(request: &DiskCommand) -> &'static str {
         match request {
+            DiskCommand::Refresh => "disk.refresh-committed-state",
+            DiskCommand::ShrinkIntent(..) => "disk.request-shrink",
+            DiskCommand::DisableAllocation(..) => "disk.disable-allocation",
+            DiskCommand::ClearShrink(..) => "disk.clear-shrink-intent",
+            DiskCommand::RequireEmpty(..) => "disk.require-empty",
+            DiskCommand::FinalizeShrink(..) => "disk.down-and-remove",
             DiskCommand::RequireTierEmpty(_) => "disk.require-tier-empty",
             DiskCommand::RemoveEmpty(_) => "disk.remove-empty",
             DiskCommand::Release { .. } => "disk.release-allocation",
@@ -28,48 +34,66 @@ impl ServiceHandler for DiskHost {
         }
     }
     fn resources(request: &DiskCommand) -> Vec<ResourceAccess> {
-        if let DiskCommand::RequireTierEmpty(tier) = request {
-            return vec![ResourceAccess::read(object("tier", tier.as_str()))];
-        }
-        if let DiskCommand::InspectMany(ids)
-        | DiskCommand::SetIoMany(ids, _)
-        | DiskCommand::RemoveMany(ids) = request
-        {
-            return ids
-                .iter()
-                .map(|id| {
-                    let key = object("disk", id.as_str());
-                    if matches!(request, DiskCommand::InspectMany(_)) {
-                        ResourceAccess::read(key)
-                    } else {
-                        ResourceAccess::write(key)
-                    }
-                })
-                .collect();
-        }
-        let id = match request {
-            DiskCommand::RequireTierEmpty(_) => unreachable!(),
-            DiskCommand::Release { disk, .. } => disk,
-            DiskCommand::Inspect(id) => {
-                return vec![ResourceAccess::read(object("disk", id.as_str()))];
-            }
-            DiskCommand::InspectMany(_)
-            | DiskCommand::SetIoMany(_, _)
-            | DiskCommand::RemoveMany(_) => unreachable!(),
-            DiskCommand::Add(s) => &s.id,
-            DiskCommand::Open(id)
-            | DiskCommand::SetIo(id, _)
-            | DiskCommand::Allocate(id, _)
-            | DiskCommand::Remove(id) => id,
-            DiskCommand::RemoveEmpty(id) => id,
-        };
-        vec![ResourceAccess::write(object("disk", id.as_str()))]
+        let mut resources = disk_resources(request);
+        resources.push(if matches!(request, DiskCommand::Refresh) {
+            ResourceAccess::write(object("disk", "catalog"))
+        } else {
+            ResourceAccess::read(object("disk", "catalog"))
+        });
+        resources
     }
 
     async fn execute(&self, request: Self::Request, ctx: ActivityContext) -> Outcome<Self::Reply> {
-        self.0.execute(request, ctx.cancellation()).await
+        self.0.execute(request, ctx.control().cancellation()).await
     }
     fn query(&self, query: Self::Query) -> Outcome<Self::View> {
         self.0.query(query)
     }
+}
+
+fn disk_resources(request: &DiskCommand) -> Vec<ResourceAccess> {
+    if matches!(request, DiskCommand::Refresh) {
+        return vec![];
+    }
+    if let DiskCommand::RequireTierEmpty(tier) = request {
+        return vec![ResourceAccess::read(object("tier", tier.as_str()))];
+    }
+    if let DiskCommand::InspectMany(ids)
+    | DiskCommand::SetIoMany(ids, _)
+    | DiskCommand::RemoveMany(ids) = request
+    {
+        return ids
+            .iter()
+            .map(|id| {
+                let key = object("disk", id.as_str());
+                if matches!(request, DiskCommand::InspectMany(_)) {
+                    ResourceAccess::read(key)
+                } else {
+                    ResourceAccess::write(key)
+                }
+            })
+            .collect();
+    }
+    let id = match request {
+        DiskCommand::Refresh | DiskCommand::RequireTierEmpty(_) => unreachable!(),
+        DiskCommand::ShrinkIntent(id, _)
+        | DiskCommand::DisableAllocation(id, _)
+        | DiskCommand::ClearShrink(id, _)
+        | DiskCommand::RequireEmpty(id)
+        | DiskCommand::FinalizeShrink(id, _) => id,
+        DiskCommand::Release { disk, .. } => disk,
+        DiskCommand::Inspect(id) => {
+            return vec![ResourceAccess::read(object("disk", id.as_str()))];
+        }
+        DiskCommand::InspectMany(_) | DiskCommand::SetIoMany(_, _) | DiskCommand::RemoveMany(_) => {
+            unreachable!()
+        }
+        DiskCommand::Add(s) => &s.id,
+        DiskCommand::Open(id)
+        | DiskCommand::SetIo(id, _)
+        | DiskCommand::Allocate(id, _)
+        | DiskCommand::Remove(id) => id,
+        DiskCommand::RemoveEmpty(id) => id,
+    };
+    vec![ResourceAccess::write(object("disk", id.as_str()))]
 }

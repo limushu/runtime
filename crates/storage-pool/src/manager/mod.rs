@@ -32,6 +32,81 @@ pub(crate) struct Registry {
     pub history_limit: usize,
 }
 
+pub(crate) fn retire_disk(
+    shared: &PoolShared,
+    routing: &Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
+    id: &DiskId,
+) -> Outcome<()> {
+    if let Some(registry) = shared.registry.upgrade() {
+        let mut registry = registry.lock().unwrap();
+        let uuid = shared.descriptor.lock().unwrap().uuid;
+        if registry
+            .disks
+            .get(id)
+            .is_some_and(|owner| owner.owner == uuid)
+        {
+            registry.disks.remove(id);
+        }
+    }
+    routing.lock().unwrap().remove(id);
+    shared.retiring_disks.lock().unwrap().insert(id.clone());
+    Ok(())
+}
+pub(crate) fn restore_disk_directory(
+    shared: &PoolShared,
+    routing: &Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
+    disks: Vec<MemberDisk>,
+) -> Outcome<()> {
+    let registry = shared.registry.upgrade().ok_or(Failure::Unavailable)?;
+    let mut registry = registry.lock().unwrap();
+    let uuid = shared.descriptor.lock().unwrap().uuid;
+    for disk in &disks {
+        if disk.membership == DiskMembership::Member
+            && registry
+                .disks
+                .get(&disk.id)
+                .is_some_and(|owner| owner.owner != uuid)
+        {
+            return Err(reject("restored disk is owned by another pool"));
+        }
+    }
+    let mut directory = routing.lock().unwrap();
+    directory.clear();
+    for disk in disks {
+        if disk.membership == DiskMembership::Removed {
+            shared.retiring_disks.lock().unwrap().insert(disk.id);
+            continue;
+        }
+        registry.disks.insert(
+            disk.id.clone(),
+            ownership::DiskOwnership {
+                owner: uuid,
+                claims: 0,
+                confirmed: true,
+                uncertain: false,
+            },
+        );
+        shared.nodes.lock().unwrap().insert(disk.node.clone());
+        shared
+            .node_claims
+            .lock()
+            .unwrap()
+            .entry(disk.node.clone())
+            .or_default()
+            .confirmed = true;
+        directory.insert(
+            disk.id.clone(),
+            DiskSpec {
+                id: disk.id,
+                node: disk.node,
+                tier: disk.tier,
+                capacity_blks: disk.capacity_blks,
+            },
+        );
+    }
+    Ok(())
+}
+
 /// Clones share registry ownership. Pool handles remain bound to their original UUID.
 #[derive(Clone)]
 pub struct PoolManager {
@@ -39,9 +114,21 @@ pub struct PoolManager {
     config: Config,
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
+    balancer: Arc<dyn Balancer>,
     pub(crate) next_fanout: Arc<AtomicUsize>,
+    task_store: Option<(
+        Arc<dyn crate::task_center::persistence::TaskStore>,
+        crate::task_center::persistence::PersistenceConfig,
+    )>,
 }
 impl PoolManager {
+    pub fn with_balancer(mut self, balancer: Arc<dyn Balancer>) -> Outcome<Self> {
+        if !self.registry.lock().unwrap().pools.is_empty() {
+            return Err(reject("configure balancing before creating pools"));
+        }
+        self.balancer = balancer;
+        Ok(self)
+    }
     pub fn new(
         config: Config,
         metadata: Arc<dyn MetadataStore>,
@@ -55,8 +142,25 @@ impl PoolManager {
             config,
             metadata,
             data_plane,
+            balancer: Arc::new(crate::adapters::UnconfiguredBalancer),
             next_fanout: Arc::new(AtomicUsize::new(0)),
+            task_store: None,
         }
+    }
+    /// Configure before creating any Pool. The adapter can target your own database.
+    pub fn with_task_store(
+        mut self,
+        store: Arc<dyn crate::task_center::persistence::TaskStore>,
+        config: crate::task_center::persistence::PersistenceConfig,
+    ) -> Outcome<Self> {
+        if config.queue_capacity == 0
+            || config.max_resume_bytes == 0
+            || !self.registry.lock().unwrap().pools.is_empty()
+        {
+            return Err(reject("configure valid persistence before creating pools"));
+        }
+        self.task_store = Some((store, config));
+        Ok(self)
     }
     pub fn create(&self, request: CreatePool) -> Outcome<PoolHandle> {
         // Construction is synchronous and does no external IO. Publish all indexes together.
@@ -77,7 +181,9 @@ impl PoolManager {
             self.config.clone(),
             self.metadata.clone(),
             self.data_plane.clone(),
+            self.balancer.clone(),
             Arc::downgrade(&self.registry),
+            self.task_store.clone(),
         )?;
         let handle = pool.handle();
         registry

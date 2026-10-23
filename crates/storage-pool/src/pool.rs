@@ -21,9 +21,15 @@ impl Pool {
         config: Config,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
+        balancer: Arc<dyn Balancer>,
         registry: Weak<Mutex<crate::manager::Registry>>,
+        task_store: Option<(
+            Arc<dyn crate::task_center::persistence::TaskStore>,
+            crate::task_center::persistence::PersistenceConfig,
+        )>,
     ) -> Outcome<Self> {
         let id = descriptor.id.clone();
+        let authoritative_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut driver = WorkflowDriver::new(id.as_str(), config.clone())?;
         let tier = driver.register(
             "tier",
@@ -35,6 +41,7 @@ impl Pool {
                 id.clone(),
                 metadata.clone(),
                 data_plane.clone(),
+                authoritative_reads.clone(),
             )),
         )?;
         let node = driver.register(
@@ -43,9 +50,23 @@ impl Pool {
         )?;
         let vd = driver.register(
             "vd",
-            VdHost(VdService::new(id.clone(), metadata, data_plane)),
+            VdHost(VdService::new(
+                id.clone(),
+                metadata.clone(),
+                data_plane,
+                authoritative_reads.clone(),
+            )),
+        )?;
+        let balance = Arc::new(crate::domains::balance::service::BalanceService {
+            pool: id.clone(),
+            port: balancer,
+        });
+        let balance_client = driver.register(
+            "balance",
+            crate::domains::balance::runtime::BalanceHost(balance.clone()),
         )?;
         let domains = Domains {
+            balance: balance_client,
             disk,
             node,
             vd,
@@ -61,13 +82,51 @@ impl Pool {
                 domains: domains.clone(),
             },
         )?;
+        let task_center = match task_store {
+            Some((store, persistence_config)) => TaskCenter::with_task_store(
+                driver,
+                &config,
+                shared.descriptor.lock().unwrap().uuid,
+                shared.instance,
+                store,
+                persistence_config,
+            )?,
+            None => TaskCenter::start(driver, &config),
+        };
         let handle = PoolHandle {
+            authoritative_reads,
+            metadata,
+            balance,
             id,
-            task_center: TaskCenter::start(driver, &config),
+            task_center,
             domains,
             shared,
             admin,
         };
+        if handle.task_center.has_task_store() {
+            let domains = handle.domains.clone();
+            let metadata = handle.metadata.clone();
+            let balance = handle.balance.clone();
+            let shared = handle.shared.clone();
+            let routing = handle.task_center.disk_directory();
+            handle.register_task_recovery("storage.shrink-disk", 1, move |task| {
+                let domains = domains.clone();
+                let metadata = metadata.clone();
+                let balance = balance.clone();
+                let shared = shared.clone();
+                let routing = routing.clone();
+                async move {
+                    let resume = task
+                        .resume
+                        .ok_or_else(|| reject("missing shrink resume input"))?;
+                    let request: ShrinkRequest =
+                        serde_json::from_slice(&resume.input).map_err(|e| reject(e.to_string()))?;
+                    Ok(ShrinkDiskWorkflow::new(
+                        domains, request, metadata, balance, shared, routing, true,
+                    ))
+                }
+            })?;
+        }
         Ok(Self { handle })
     }
     pub fn handle(&self) -> PoolHandle {
@@ -81,6 +140,9 @@ impl Pool {
 /// Public application facade: no raw service mutation or arbitrary submit escape.
 #[derive(Clone)]
 pub struct PoolHandle {
+    pub(crate) authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) metadata: Arc<dyn MetadataStore>,
+    pub(crate) balance: Arc<crate::domains::balance::service::BalanceService>,
     pub(crate) id: PoolId,
     pub(crate) task_center: TaskCenter,
     pub(crate) domains: Domains,
@@ -106,6 +168,9 @@ impl PoolHandle {
     pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
         self.task_center.resume(id)
     }
+    pub fn recheck_task(&self, id: WorkflowId) -> Outcome<()> {
+        self.task_center.recheck(id)
+    }
     pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
         self.task_center.cancel(id)
     }
@@ -119,12 +184,31 @@ impl PoolHandle {
         self.task_center.snapshot()
     }
     pub async fn disks(&self) -> Outcome<Vec<MemberDisk>> {
+        if self
+            .authoritative_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(self
+                .metadata
+                .snapshot(&self.id)
+                .await?
+                .disks
+                .into_iter()
+                .filter(|d| d.membership == DiskMembership::Member)
+                .collect());
+        }
         self.domains.disk.query(None).await
     }
     pub async fn nodes(&self) -> Outcome<Vec<PoolNode>> {
         self.domains.node.query(None).await
     }
     pub async fn volumes(&self) -> Outcome<Vec<VirtualDisk>> {
+        if self
+            .authoritative_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(self.metadata.snapshot(&self.id).await?.volumes);
+        }
         self.domains.vd.query(None).await
     }
     pub async fn observe_node(
@@ -161,6 +245,9 @@ impl PoolHandle {
     pub async fn online_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
         let disks = self.domains.disk.query(Some(id)).await?;
         let disk = &disks[0];
+        if disk.membership == DiskMembership::Removed {
+            return Err(reject("disk is removed"));
+        }
         self.task_center
             .submit(OnlineDiskWorkflow {
                 domains: self.domains.clone(),

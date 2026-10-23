@@ -13,7 +13,8 @@ crates/
    ├─ domains/
    │  ├─ disk/               # model.rs / service.rs / runtime.rs
    │  ├─ node/               # model.rs / service.rs / runtime.rs
-   │  └─ vd/                 # model.rs / service.rs / runtime.rs
+   │  ├─ vd/                 # model.rs / service.rs / runtime.rs
+   │  └─ balance/            # 整盘排空端口、进度与暂停/恢复适配
    ├─ ports.rs               # 元数据与数据面接口
    └─ adapters.rs            # 内存/模拟实现
 docs/                        # 架构、开发说明、验证与历史归档
@@ -24,6 +25,8 @@ scripts/verify.ps1           # workspace 验证入口
 
 - [架构与依赖边界](docs/architecture.md)
 - [如何新增业务冲突规则](docs/task-center.md)
+- [Activity 暂停钩子与继续条件](docs/activity-control.md)
+- [完整缩容工作流与均衡模块接入](docs/shrink-workflow.md)
 - [存储业务与安全限制](crates/storage-pool/README.md)
 - [通用执行基础](crates/workflow-foundation/README.md)
 - [构建与验证](docs/verification.md)
@@ -34,7 +37,10 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
+cargo run --locked -p storage-pool --example shrink_disk
+cargo run --locked -p storage-pool --example shrink_topology
 ```
 
 本轮移除策略注入/规则引擎和旧分层目录，不保留第二套业务协调实现。旧代码可从 Git 历史恢复。
-当前仍是内存模型与模拟适配器，不是生产存储系统；没有持久历史、崩溃恢复或真实磁盘 IO。
+当前仍使用内存领域模型与模拟数据面，不是生产存储系统，没有真实磁盘 IO 或通用崩溃恢复。
+TaskCenter 可注入自有数据库保存任务历史，指定任务可按业务检查点续办，见 [接入说明](docs/task-persistence.md)。

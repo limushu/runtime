@@ -7,6 +7,34 @@ use std::{
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
+mod balancer;
+pub use balancer::SimulatedBalancer;
+pub(crate) struct UnconfiguredBalancer;
+#[async_trait]
+impl Balancer for UnconfiguredBalancer {
+    async fn check_shrink(
+        &self,
+        _: &PoolId,
+        _: &DiskId,
+    ) -> Outcome<crate::domains::balance::ShrinkReadiness> {
+        Err(reject("balancing service is not configured"))
+    }
+    async fn evacuate(
+        &self,
+        _: &PoolId,
+        _: &DiskId,
+        _: crate::domains::balance::EvacuationId,
+    ) -> Outcome<ArcJob> {
+        Err(reject("balancing service is not configured"))
+    }
+    async fn find(
+        &self,
+        _: &PoolId,
+        _: crate::domains::balance::EvacuationId,
+    ) -> Outcome<Option<ArcJob>> {
+        Err(reject("balancing service is not configured"))
+    }
+}
 
 #[derive(Default)]
 pub struct MemoryMetadata {
@@ -31,9 +59,190 @@ impl MemoryMetadata {
 }
 #[async_trait]
 impl MetadataStore for MemoryMetadata {
+    async fn snapshot(&self, pool: &PoolId) -> Outcome<MetadataSnapshot> {
+        let state = self.state.lock().unwrap();
+        Ok(MetadataSnapshot {
+            tiers: state
+                .tiers
+                .iter()
+                .filter(|((p, _), _)| p == pool)
+                .map(|(_, v)| v.clone())
+                .collect(),
+            disks: state
+                .disks
+                .iter()
+                .filter(|((p, _), _)| p == pool)
+                .map(|(_, v)| v.clone())
+                .collect(),
+            volumes: state
+                .volumes
+                .iter()
+                .filter(|((p, _), _)| p == pool)
+                .map(|(_, v)| v.clone())
+                .collect(),
+            allocations: state
+                .allocations
+                .iter()
+                .filter(|((p, _, _), _)| p == pool)
+                .map(|((_, disk, blk), volume)| AllocationOwner {
+                    disk: disk.clone(),
+                    blk: *blk,
+                    volume: volume.clone(),
+                })
+                .collect(),
+        })
+    }
     async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()> {
         let mut state = self.state.lock().unwrap();
         match &change {
+            MetadataChange::ShrinkIntent {
+                disk,
+                expected_revision,
+                job,
+            }
+            | MetadataChange::DisableAllocation {
+                disk,
+                expected_revision,
+                job,
+            }
+            | MetadataChange::ClearShrink {
+                disk,
+                expected_revision,
+                job,
+            }
+            | MetadataChange::MarkRemoved {
+                disk,
+                expected_revision,
+                job,
+            } => {
+                let key = (pool.clone(), disk.clone());
+                let mut member = state
+                    .disks
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| reject("unknown disk"))?;
+                if member.revision != *expected_revision
+                    || member.membership == DiskMembership::Removed
+                {
+                    return Err(reject("stale or removed disk"));
+                }
+                match &change {
+                    MetadataChange::ShrinkIntent { .. } => {
+                        if member.shrink.is_some_and(|existing| existing != *job) {
+                            return Err(reject("disk has another shrink intent"));
+                        }
+                        member.shrink = Some(*job);
+                    }
+                    _ if member.shrink != Some(*job) => {
+                        return Err(reject("shrink intent does not match"));
+                    }
+                    MetadataChange::DisableAllocation { .. } => {
+                        member.allocation = AllocationState::Inactive
+                    }
+                    MetadataChange::ClearShrink { .. } => {
+                        member.shrink = None;
+                        member.allocation = AllocationState::Inactive;
+                    }
+                    MetadataChange::MarkRemoved { .. } => {
+                        if member.io != IoState::Down
+                            || member.allocation != AllocationState::Inactive
+                            || !member.allocated.is_empty()
+                            || state.volumes.values().any(|v| {
+                                v.pool == *pool
+                                    && v.groups
+                                        .iter()
+                                        .flat_map(|g| &g.entries)
+                                        .any(|e| e.disk == *disk)
+                            })
+                        {
+                            return Err(reject(
+                                "removed requires down, inactive and no references or allocations",
+                            ));
+                        }
+                        member.membership = DiskMembership::Removed;
+                        state.retired_disks.insert(key.clone());
+                    }
+                    _ => unreachable!(),
+                }
+                member.revision += 1;
+                state.disks.insert(key, member);
+            }
+            MetadataChange::Remap {
+                volume,
+                expected_revision,
+                group,
+                source,
+                target,
+                source_revision,
+                target_revision,
+            } => {
+                let volume_key = (pool.clone(), volume.clone());
+                let mut vd = state
+                    .volumes
+                    .get(&volume_key)
+                    .cloned()
+                    .ok_or_else(|| reject("unknown volume"))?;
+                let mut from = state
+                    .disks
+                    .get(&(pool.clone(), source.disk.clone()))
+                    .cloned()
+                    .ok_or_else(|| reject("unknown source"))?;
+                let mut to = state
+                    .disks
+                    .get(&(pool.clone(), target.disk.clone()))
+                    .cloned()
+                    .ok_or_else(|| reject("unknown target"))?;
+                let bg = vd
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.index == *group)
+                    .ok_or_else(|| reject("unknown block group"))?;
+                let slot = bg
+                    .entries
+                    .iter()
+                    .position(|e| e == source)
+                    .ok_or_else(|| reject("source placement changed"))?;
+                if vd.revision != *expected_revision
+                    || from.revision != *source_revision
+                    || to.revision != *target_revision
+                    || !to.allocatable()
+                    || from.id == to.id
+                    || from.tier != to.tier
+                    || target.data != DataState::Valid
+                    || target.blk >= to.capacity_blks
+                    || to.allocated.contains(&target.blk)
+                    || !from.allocated.contains(&source.blk)
+                    || state
+                        .allocations
+                        .get(&(pool.clone(), source.disk.clone(), source.blk))
+                        != Some(volume)
+                    || bg.entries.iter().enumerate().any(|(i, e)| {
+                        i != slot
+                            && state
+                                .disks
+                                .get(&(pool.clone(), e.disk.clone()))
+                                .is_none_or(|d| d.node == to.node)
+                    })
+                {
+                    return Err(reject("invalid remap or stale placement revision"));
+                }
+                bg.entries[slot] = target.clone();
+                vd.revision += 1;
+                from.allocated.remove(&source.blk);
+                from.revision += 1;
+                to.allocated.insert(target.blk);
+                to.revision += 1;
+                state
+                    .allocations
+                    .remove(&(pool.clone(), source.disk.clone(), source.blk));
+                state.allocations.insert(
+                    (pool.clone(), target.disk.clone(), target.blk),
+                    volume.clone(),
+                );
+                state.disks.insert((pool.clone(), from.id.clone()), from);
+                state.disks.insert((pool.clone(), to.id.clone()), to);
+                state.volumes.insert(volume_key, vd);
+            }
             MetadataChange::CreateTier(tier) => {
                 let key = (pool.clone(), tier.id.clone());
                 if tier.pool != *pool
@@ -54,10 +263,9 @@ impl MetadataStore for MemoryMetadata {
                     .get(&key)
                     .ok_or_else(|| reject("unknown tier"))?;
                 if tier.revision != *expected_revision
-                    || state
-                        .disks
-                        .values()
-                        .any(|d| d.pool == *pool && d.tier == *id)
+                    || state.disks.values().any(|d| {
+                        d.pool == *pool && d.tier == *id && d.membership == DiskMembership::Member
+                    })
                 {
                     return Err(reject("tier is referenced or revision is stale"));
                 }
@@ -74,6 +282,7 @@ impl MetadataStore for MemoryMetadata {
                     .get(&key)
                     .ok_or_else(|| reject("unknown disk"))?;
                 if member.revision != *expected_revision
+                    || member.shrink.is_some()
                     || member.io != IoState::Down
                     || !member.allocated.is_empty()
                     || state.volumes.values().any(|v| {
@@ -137,7 +346,10 @@ impl MetadataStore for MemoryMetadata {
             }
             MetadataChange::AddDisk(disk) => {
                 if disk.pool != *pool
-                    || state.disks.keys().any(|(_, id)| *id == disk.id)
+                    || state
+                        .disks
+                        .values()
+                        .any(|d| d.id == disk.id && d.membership == DiskMembership::Member)
                     || state
                         .retired_disks
                         .contains(&(pool.clone(), disk.id.clone()))
@@ -157,8 +369,9 @@ impl MetadataStore for MemoryMetadata {
                     .disks
                     .get_mut(&(pool.clone(), disk.clone()))
                     .ok_or_else(|| reject("unknown disk"))?;
-                if disk.revision != *expected_revision {
-                    return Err(reject("stale disk revision"));
+                if disk.revision != *expected_revision || disk.membership == DiskMembership::Removed
+                {
+                    return Err(reject("stale or removed disk revision"));
                 }
                 disk.io = *io;
                 disk.revision += 1;

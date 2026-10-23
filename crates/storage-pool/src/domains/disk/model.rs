@@ -13,6 +13,11 @@ pub enum AllocationState {
     Inactive,
     Active,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskMembership {
+    Member,
+    Removed,
+}
 /// MemberDisk is the disk domain's aggregate, not a workflow status record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDisk {
@@ -26,14 +31,19 @@ pub struct MemberDisk {
     pub allocation: AllocationState,
     pub allocated: BTreeSet<u32>,
     pub revision: u64,
+    pub shrink: Option<crate::domains::balance::EvacuationId>,
+    pub membership: DiskMembership,
 }
 impl MemberDisk {
     pub fn allocatable(&self) -> bool {
-        self.io == IoState::Up && self.allocation == AllocationState::Active
+        self.membership == DiskMembership::Member
+            && self.shrink.is_none()
+            && self.io == IoState::Up
+            && self.allocation == AllocationState::Active
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiskSpec {
     pub id: DiskId,
     pub node: NodeId,
@@ -66,6 +76,8 @@ impl MemberDisk {
             allocation: AllocationState::Active,
             allocated: BTreeSet::new(),
             revision: 0,
+            shrink: None,
+            membership: DiskMembership::Member,
         })
     }
     pub(crate) fn require_identity(&self, spec: &DiskSpec) -> crate::domains::DomainResult<()> {

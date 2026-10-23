@@ -1,6 +1,6 @@
 use crate::domains::{
     PoolId,
-    disk::{Allocation, DiskId, DiskSpec, IoState, MemberDisk},
+    disk::{Allocation, AllocationState, DiskId, DiskMembership, DiskSpec, IoState, MemberDisk},
     vd::VolumeId,
 };
 use crate::{ports::*, support::reject};
@@ -11,7 +11,14 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use workflow_foundation::{Failure, Outcome};
 
+#[derive(Clone)]
 pub(crate) enum DiskCommand {
+    Refresh,
+    ShrinkIntent(DiskId, crate::domains::balance::EvacuationId),
+    DisableAllocation(DiskId, crate::domains::balance::EvacuationId),
+    ClearShrink(DiskId, crate::domains::balance::EvacuationId),
+    RequireEmpty(DiskId),
+    FinalizeShrink(DiskId, crate::domains::balance::EvacuationId),
     RequireTierEmpty(crate::TierId),
     RemoveEmpty(DiskId),
     Release {
@@ -36,7 +43,13 @@ pub(crate) enum DiskReply {
     Allocated(Allocation),
     Disks(Vec<MemberDisk>),
 }
+enum ShrinkMutation {
+    Intent,
+    Disable,
+    Clear,
+}
 pub(crate) struct DiskService {
+    authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
     owners: Mutex<BTreeMap<(DiskId, u32), VolumeId>>,
     released: Mutex<BTreeSet<(DiskId, u32, VolumeId)>>,
     retired: Mutex<BTreeSet<DiskId>>,
@@ -50,8 +63,10 @@ impl DiskService {
         pool: PoolId,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
+        authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
+            authoritative_reads,
             owners: Mutex::default(),
             released: Mutex::default(),
             retired: Mutex::default(),
@@ -69,6 +84,32 @@ impl DiskService {
             .cloned()
             .ok_or_else(|| reject("unknown member disk"))
     }
+    async fn latest(&self, id: &DiskId) -> Outcome<MemberDisk> {
+        if !self
+            .authoritative_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.get(id);
+        }
+        let snapshot = self.metadata.snapshot(&self.pool).await?;
+        let disk = snapshot
+            .disks
+            .iter()
+            .find(|d| &d.id == id)
+            .cloned()
+            .ok_or_else(|| reject("unknown member disk"))?;
+        self.disks.lock().unwrap().insert(id.clone(), disk.clone());
+        let mut owners = self.owners.lock().unwrap();
+        owners.retain(|(disk, _), _| disk != id);
+        owners.extend(
+            snapshot
+                .allocations
+                .into_iter()
+                .filter(|a| &a.disk == id)
+                .map(|a| ((a.disk, a.blk), a.volume)),
+        );
+        Ok(disk)
+    }
     pub async fn execute(
         &self,
         request: DiskCommand,
@@ -76,14 +117,172 @@ impl DiskService {
     ) -> Outcome<DiskReply> {
         // Only short in-memory access uses Mutex. No guard crosses an await;
         // object conflicts are resolved by the Pool TaskCenter before execution.
+        let shrink_mutation = match &request {
+            DiskCommand::ShrinkIntent(..) => Some(ShrinkMutation::Intent),
+            DiskCommand::DisableAllocation(..) => Some(ShrinkMutation::Disable),
+            DiskCommand::ClearShrink(..) => Some(ShrinkMutation::Clear),
+            _ => None,
+        };
         match request {
+            DiskCommand::Refresh => {
+                let snapshot = self.metadata.snapshot(&self.pool).await?;
+                if snapshot.disks.iter().any(|d| d.shrink.is_some()) {
+                    self.authoritative_reads
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if snapshot.disks.iter().any(|d| d.pool != self.pool) {
+                    return Err(reject("snapshot belongs to another pool"));
+                }
+                *self.retired.lock().unwrap() = snapshot
+                    .disks
+                    .iter()
+                    .filter(|d| d.membership == DiskMembership::Removed)
+                    .map(|d| d.id.clone())
+                    .collect();
+                *self.owners.lock().unwrap() = snapshot
+                    .allocations
+                    .into_iter()
+                    .map(|a| ((a.disk, a.blk), a.volume))
+                    .collect();
+                *self.disks.lock().unwrap() = snapshot
+                    .disks
+                    .iter()
+                    .cloned()
+                    .map(|d| (d.id.clone(), d))
+                    .collect();
+                Ok(DiskReply::Disks(snapshot.disks))
+            }
+            DiskCommand::ShrinkIntent(id, job)
+            | DiskCommand::DisableAllocation(id, job)
+            | DiskCommand::ClearShrink(id, job) => {
+                let mut disk = self.latest(&id).await?;
+                if disk.membership == DiskMembership::Removed {
+                    return Err(reject("disk is removed"));
+                }
+                let change = match shrink_mutation {
+                    Some(ShrinkMutation::Intent) => {
+                        if disk.shrink == Some(job) {
+                            return Ok(DiskReply::Disk(disk));
+                        }
+                        MetadataChange::ShrinkIntent {
+                            disk: id.clone(),
+                            expected_revision: disk.revision,
+                            job,
+                        }
+                    }
+                    Some(ShrinkMutation::Disable) => {
+                        if disk.shrink == Some(job) && disk.allocation == AllocationState::Inactive
+                        {
+                            return Ok(DiskReply::Disk(disk));
+                        }
+                        MetadataChange::DisableAllocation {
+                            disk: id.clone(),
+                            expected_revision: disk.revision,
+                            job,
+                        }
+                    }
+                    _ => MetadataChange::ClearShrink {
+                        disk: id.clone(),
+                        expected_revision: disk.revision,
+                        job,
+                    },
+                };
+                self.metadata.commit(&self.pool, change.clone()).await?;
+                self.authoritative_reads
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                match change {
+                    MetadataChange::ShrinkIntent { .. } => disk.shrink = Some(job),
+                    MetadataChange::DisableAllocation { .. } => {
+                        disk.allocation = AllocationState::Inactive
+                    }
+                    _ => {
+                        disk.shrink = None;
+                        disk.allocation = AllocationState::Inactive;
+                    }
+                }
+                disk.revision += 1;
+                self.disks.lock().unwrap().insert(id, disk.clone());
+                Ok(DiskReply::Disk(disk))
+            }
+            DiskCommand::RequireEmpty(id) => {
+                if !self.latest(&id).await?.allocated.is_empty() {
+                    return Err(reject("disk still has allocations"));
+                }
+                Ok(DiskReply::Checked)
+            }
+            DiskCommand::FinalizeShrink(id, job) => {
+                let mut disk = self.latest(&id).await?;
+                if disk.membership == DiskMembership::Removed && disk.shrink == Some(job) {
+                    return Ok(DiskReply::Disk(disk));
+                }
+                if disk.shrink != Some(job)
+                    || disk.allocation != AllocationState::Inactive
+                    || !disk.allocated.is_empty()
+                {
+                    return Err(reject("shrink intent or allocation verification failed"));
+                }
+                let snapshot = self.metadata.snapshot(&self.pool).await?;
+                if snapshot
+                    .volumes
+                    .iter()
+                    .flat_map(|v| &v.groups)
+                    .flat_map(|g| &g.entries)
+                    .any(|e| e.disk == id)
+                {
+                    return Err(reject("disk still has committed references"));
+                }
+                // One short, non-pausable finalization boundary: topo cannot reopen the
+                // disk between confirmed Down and Removed. Never drop an issued IO future.
+                self.data_plane
+                    .set_disk_io(&self.pool, &id, IoState::Down, cancel)
+                    .await?;
+                self.metadata
+                    .commit(
+                        &self.pool,
+                        MetadataChange::DiskIo {
+                            disk: id.clone(),
+                            expected_revision: disk.revision,
+                            io: IoState::Down,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        Failure::Uncertain(format!(
+                            "shrink IO down but metadata not confirmed: {e}"
+                        ))
+                    })?;
+                disk.io = IoState::Down;
+                disk.revision += 1;
+                self.disks.lock().unwrap().insert(id.clone(), disk.clone());
+                self.data_plane.close_disk(&self.pool, &id, cancel).await?;
+                self.metadata
+                    .commit(
+                        &self.pool,
+                        MetadataChange::MarkRemoved {
+                            disk: id.clone(),
+                            expected_revision: disk.revision,
+                            job,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        Failure::Uncertain(format!(
+                            "shrink disk closed but Removed not confirmed: {e}"
+                        ))
+                    })?;
+                disk.membership = DiskMembership::Removed;
+                disk.revision += 1;
+                self.disks.lock().unwrap().insert(id.clone(), disk.clone());
+                self.retired.lock().unwrap().insert(id);
+                Ok(DiskReply::Disk(disk))
+            }
             DiskCommand::RequireTierEmpty(tier) => {
                 if self
                     .disks
                     .lock()
                     .unwrap()
                     .values()
-                    .any(|disk| disk.tier == tier)
+                    .any(|disk| disk.tier == tier && disk.membership == DiskMembership::Member)
                 {
                     return Err(reject("tier still has member disks"));
                 }
@@ -98,10 +297,10 @@ impl DiskService {
                 if self.released.lock().unwrap().contains(&receipt) {
                     return Ok(DiskReply::Checked);
                 }
+                let mut disk = self.latest(&id).await?;
                 if self.owners.lock().unwrap().get(&(id.clone(), blk)) != Some(&volume) {
                     return Err(reject("allocation belongs to another volume"));
                 }
-                let mut disk = self.get(&id)?;
                 if !disk.allocated.contains(&blk) {
                     return Err(reject("allocation is missing"));
                 }
@@ -127,7 +326,10 @@ impl DiskService {
                 if self.retired.lock().unwrap().contains(&id) {
                     return Ok(DiskReply::Checked);
                 }
-                let disk = self.get(&id)?;
+                let disk = self.latest(&id).await?;
+                if disk.shrink.is_some() {
+                    return Err(reject("disk has a shrink intent; use shrink finalization"));
+                }
                 if !disk.allocated.is_empty() || disk.io != IoState::Down {
                     return Err(reject("disk must be down and have no allocations"));
                 }
@@ -148,7 +350,7 @@ impl DiskService {
                 self.retired.lock().unwrap().insert(id);
                 Ok(DiskReply::Checked)
             }
-            DiskCommand::Inspect(id) => Ok(DiskReply::Disk(self.get(&id)?)),
+            DiskCommand::Inspect(id) => Ok(DiskReply::Disk(self.latest(&id).await?)),
             DiskCommand::InspectMany(ids) => {
                 // Routing also includes reserved disks whose Add never committed.
                 let disks = self.disks.lock().unwrap();
@@ -166,7 +368,11 @@ impl DiskService {
                     if !unique.insert(id.clone()) {
                         return Err(reject("duplicate disk in IO batch"));
                     }
-                    disks.push(self.get(id)?);
+                    let disk = self.latest(id).await?;
+                    if disk.membership == DiskMembership::Removed {
+                        return Err(reject("IO batch contains a removed disk"));
+                    }
+                    disks.push(disk);
                 }
                 let results = self
                     .data_plane
@@ -245,12 +451,18 @@ impl DiskService {
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::Open(id) => {
-                let disk = self.get(&id)?;
+                let disk = self.latest(&id).await?;
+                if disk.membership == DiskMembership::Removed {
+                    return Err(reject("disk is removed"));
+                }
                 self.data_plane.open_disk(&self.pool, &id, cancel).await?;
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::SetIo(id, io) => {
-                let mut disk = self.get(&id)?;
+                let mut disk = self.latest(&id).await?;
+                if disk.membership == DiskMembership::Removed {
+                    return Err(reject("disk is removed"));
+                }
                 // Reassert the external effect even for repeated metadata state.
                 self.data_plane
                     .set_disk_io(&self.pool, &id, io, cancel)
@@ -281,7 +493,7 @@ impl DiskService {
                 )))
             }
             DiskCommand::Allocate(id, volume) => {
-                let mut disk = self.get(&id)?;
+                let mut disk = self.latest(&id).await?;
                 let blk = disk.next_free_block()?;
                 self.metadata
                     .commit(
@@ -316,7 +528,14 @@ impl DiskService {
     pub fn query(&self, id: Option<DiskId>) -> Outcome<Vec<MemberDisk>> {
         match id {
             Some(id) => Ok(vec![self.get(&id)?]),
-            None => Ok(self.disks.lock().unwrap().values().cloned().collect()),
+            None => Ok(self
+                .disks
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| d.membership == DiskMembership::Member)
+                .cloned()
+                .collect()),
         }
     }
 }

@@ -106,7 +106,7 @@ impl ServiceHandler for Probe {
         self.calls.lock().unwrap().push(ctx.id);
         let _ = self.entered.send(work.name);
         if matches!(work.behavior, Behavior::CancelThenSettle) {
-            ctx.cancellation().cancelled().await;
+            ctx.control().cancelled().await;
             let _ = self.entered.send("cancel-observed");
         }
         if let Some(gate) = work.gate {

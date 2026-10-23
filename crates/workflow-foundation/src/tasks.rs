@@ -1,6 +1,8 @@
 //! Bounded in-memory execution observation; never a business WAL.
+use crate::audit::AuditEmitter;
 use crate::*;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::watch;
 
@@ -10,6 +12,8 @@ pub enum ActivityState {
     /// Includes waiting for space in the service mailbox.
     Queued,
     Running,
+    Pausing,
+    Paused,
     Completed,
     Failed(Failure),
 }
@@ -42,6 +46,8 @@ pub(crate) struct ActivityObservation {
     history: watch::Sender<ActivityHistory>,
     id: ActivityId,
     finished: bool,
+    entry: Arc<Mutex<ActivitySnapshot>>,
+    audit: AuditEmitter,
 }
 impl ActivityObservation {
     pub fn new(
@@ -51,36 +57,52 @@ impl ActivityObservation {
         service: String,
         name: &'static str,
         resources: Vec<ResourceAccess>,
+        audit: AuditEmitter,
     ) -> Self {
+        let entry = ActivitySnapshot {
+            id,
+            service,
+            name,
+            resources,
+            state: ActivityState::WaitingResources,
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+        };
+        audit.emit(AuditEvent::Activity(entry.clone()));
         history.send_modify(|history| {
             history.total += 1;
             if history.entries.len() == limit {
                 history.entries.pop_front();
                 history.omitted += 1;
             }
-            history.entries.push_back(ActivitySnapshot {
-                id,
-                service,
-                name,
-                resources,
-                state: ActivityState::WaitingResources,
-                created_at: SystemTime::now(),
-                started_at: None,
-                finished_at: None,
-            });
+            history.entries.push_back(entry.clone());
         });
         Self {
             history,
             id,
             finished: false,
+            entry: Arc::new(Mutex::new(entry)),
+            audit,
+        }
+    }
+    pub(crate) fn reporter(&self) -> ActivityReporter {
+        ActivityReporter {
+            history: self.history.clone(),
+            id: self.id,
+            entry: self.entry.clone(),
+            audit: self.audit.clone(),
         }
     }
     fn update(&self, update: impl FnOnce(&mut ActivitySnapshot)) {
+        let mut entry = self.entry.lock().unwrap();
+        update(&mut entry);
         self.history.send_modify(|history| {
-            if let Some(entry) = history.entries.iter_mut().find(|entry| entry.id == self.id) {
-                update(entry);
+            if let Some(retained) = history.entries.iter_mut().find(|e| e.id == self.id) {
+                *retained = entry.clone();
             }
         });
+        self.audit.emit(AuditEvent::Activity(entry.clone()));
     }
     pub fn queued(&self) {
         self.update(|entry| entry.state = ActivityState::Queued);
@@ -122,11 +144,53 @@ impl Drop for ActivityObservation {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Shares the same entry mutex as settlement: a late pause acknowledgement can
+/// never publish Paused AFTER the service has published the final business result.
+pub(crate) struct ActivityReporter {
+    history: watch::Sender<ActivityHistory>,
+    id: ActivityId,
+    entry: Arc<Mutex<ActivitySnapshot>>,
+    audit: AuditEmitter,
+}
+impl ActivityReporter {
+    pub fn state(&self, state: ActivityState) {
+        let mut entry = self.entry.lock().unwrap();
+        if entry.finished_at.is_some() {
+            return;
+        }
+        entry.state = state;
+        self.history.send_modify(|history| {
+            if let Some(retained) = history.entries.iter_mut().find(|e| e.id == self.id) {
+                *retained = entry.clone();
+            }
+        });
+        self.audit.emit(AuditEvent::Activity(entry.clone()));
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskProgress {
     pub stage: Option<String>,
     pub completed: u64,
     pub total: Option<u64>,
+}
+pub(crate) fn report_progress(
+    sender: &watch::Sender<TaskProgress>,
+    audit: &AuditEmitter,
+    stage: String,
+    completed: u64,
+    total: Option<u64>,
+) {
+    if stage.trim().is_empty() || stage.len() > 256 || total.is_some_and(|t| completed > t) {
+        return;
+    }
+    let progress = TaskProgress {
+        stage: Some(stage),
+        completed,
+        total,
+    };
+    audit.emit(AuditEvent::Progress(progress.clone()));
+    sender.send_replace(progress);
 }
 #[derive(Debug, Clone)]
 pub struct TaskSnapshot {
@@ -138,6 +202,8 @@ pub struct TaskSnapshot {
     pub progress: TaskProgress,
     pub activities: ActivityHistory,
     pub pause_requested: bool,
+    pub user_pause_requested: bool,
+    pub system_pause_requested: bool,
     pub cancellation_requested: bool,
 }
 #[derive(Clone)]
@@ -156,6 +222,8 @@ impl TaskRecord {
             progress: self.control.progress(),
             activities: self.control.activities(),
             pause_requested: self.control.pause_requested(),
+            user_pause_requested: self.control.user_pause_requested(),
+            system_pause_requested: self.control.system_pause_requested(),
             cancellation_requested: self.control.cancellation_requested(),
         }
     }

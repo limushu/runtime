@@ -13,7 +13,7 @@
 | [conflicts.rs](src/task_center/conflicts.rs) | 单一业务冲突判断入口 |
 | [workflows](src/workflows/mod.rs) | 完整业务流程，读写步骤均经 Activity |
 | [disk/service.rs](src/domains/disk/service.rs) | 磁盘能力、状态与外部效果协调 |
-| [domains](src/domains/mod.rs) | 按 disk / node / tier / vd 聚合领域服务与托管适配 |
+| [domains](src/domains/mod.rs) | 按 disk / node / tier / vd / balance 聚合领域服务与托管适配 |
 | [ports.rs](src/ports.rs) | 元数据/数据面端口及失败契约 |
 | [disk/runtime.rs](src/domains/disk/runtime.rs) | 磁盘服务托管协议与调用适配 |
 
@@ -32,6 +32,8 @@ model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的
 - 离线：失效引用 → 关闭 IO 并提交 Down → 等待重建 → 移除成员。重建/成员移除仍为
   明确失败的占位能力，不假装业务完成。上线不恢复失效数据，也不释放空间。
 - 节点上下线组织批量磁盘步骤；节点交接需等待旧流程及批量动作真正停稳。
+- 缩容：持久意图 → 禁止分配 → 整盘排空 → 核验引用及分配 → Down/关闭/Removed。
+  同池 topo 等待排空实际暂停；全部结束后检查条件，再继续同一个 job。移除保留身份记录。
 - 已生效 IO 后元数据未确认是 Uncertain；不能凭旧视图继续修改。领域视图只表示最后确认状态。
 - 拓扑身份在当前模型中不可变。预读只用于稳定路由，影响执行决策的状态必须在 Workflow 内
   通过读 Activity 重新验证；外部观察可以 Query，不承诺跨领域一致快照。
@@ -60,7 +62,18 @@ Task 是完整 Workflow 执行，不是 Activity。重复业务目标在途时�
 conflicts 字段提供准入时的已有任务 ID、决定、原因；scheduling() 提供业务队列计数，
 execution() 提供 Runtime 执行计数。ID 只在当前 Pool 实例内唯一。
 普通历史按 Config::task_history 有界保留，Uncertain 保留；observer 不因历史淘汰失效。
-暂停只在当前进程安全边界生效，仍保留对象占用，不支持崩溃恢复。
+原有暂停在当前进程安全边界生效，并保留对象占用；纯内存模式不支持切换续办。
+
+可选注入 TaskStore 后，TaskCenter 保存独立的 KV 历史，并为显式声明的任务提供检查点续办。
+普通任务仍只查询历史；新配置的池需先 recover_tasks，再接收业务。
+数据库接口、PoolHandle 入口和缩容模拟示例见 [TaskCenter 持久化](../../docs/task-persistence.md)。
+
+正式缩容入口是 `pool.shrink_disk(id)`，实现见 [ShrinkDiskWorkflow](src/workflows/shrink_disk.rs)。
+创建池前用 `PoolManager::with_balancer` 注入已有均衡服务；未配置时明确拒绝。
+一次 Activity 提交整盘 job，转发实际进度并处理暂停/恢复；BG 规划、复制和 remap 由均衡模块负责。
+取消保留已迁移数据及 Inactive 意图，显式 `abort_shrink_disk` 确认 job 停稳后才清除意图。
+配置 TaskStore 后自动登记可续办 Task，新宿主先恢复元数据及实际拓扑，再恢复并继续原任务。
+完整阶段、端口契约与接管顺序见 [缩容工作流](../../docs/shrink-workflow.md)。
 
 规则扩展见 [TaskCenter 开发说明](../../docs/task-center.md)。本轮删除 with_policy/with_rules、
 PoolConflictPolicy、RulePolicy 和选择器引擎，不保留兼容的第二套协调路径。
@@ -74,7 +87,10 @@ PoolConflictPolicy、RulePolicy 和选择器引擎，不保留兼容的第二套
 cargo test --locked -p storage-pool
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
+cargo run --locked -p storage-pool --example shrink_disk
 cargo run --locked -p storage-pool --example shrink_commands
+cargo run --locked -p storage-pool --features kv-redb --example task_persistence -- /tmp/tasks.redb
 ```
 
-shrink_commands 是执行控制示例，不代表生产缩容已实现。DESIGN.md 仅保留阶段性历史。
+shrink_disk 调用正式缩容工作流，注入模拟数据面与均衡器，不执行物理复制。
+shrink_commands 是通用执行控制示例。DESIGN.md 仅保留阶段性历史。

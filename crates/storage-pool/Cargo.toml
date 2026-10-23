@@ -10,3 +10,14 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+redb = { workspace = true, optional = true }
+
+[features]
+default = []
+kv-redb = ["dep:redb"]
+
+[[example]]
+name = "task_persistence"
+required-features = ["kv-redb"]

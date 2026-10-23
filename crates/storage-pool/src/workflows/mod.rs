@@ -16,7 +16,11 @@ mod offline_disk;
 mod offline_node;
 mod online_disk;
 mod online_node;
+mod restore_metadata;
+mod shrink_disk;
 pub(crate) use manage_children::*;
+pub(crate) use shrink_disk::ShrinkRequest;
+pub use shrink_disk::{AbortShrinkDiskWorkflow, ShrinkDiskWorkflow};
 
 pub use create_volume::CreateVolumeWorkflow;
 pub use load_node::LoadNodeWorkflow;
@@ -28,6 +32,7 @@ pub use online_node::OnlineNodeWorkflow;
 
 #[derive(Clone)]
 pub(crate) struct Domains {
+    pub balance: ActivityClient<crate::domains::balance::BalanceCommand, (), (), ()>,
     pub tier: ActivityClient<TierCommand, TierReply, Option<TierId>, Vec<Tier>>,
     pub disk: ActivityClient<DiskCommand, DiskReply, Option<DiskId>, Vec<MemberDisk>>,
     pub node: ActivityClient<NodeCommand, PoolNode, Option<NodeId>, Vec<PoolNode>>,

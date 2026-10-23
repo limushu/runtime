@@ -1,4 +1,4 @@
-use crate::{model::Scope, workflow::ActivityGuard, *};
+use crate::{audit::AuditEmitter, model::Scope, workflow::ActivityGuard, *};
 use async_trait::async_trait;
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{panic::AssertUnwindSafe, sync::Arc};
@@ -29,11 +29,37 @@ pub trait ServiceHandler: Send + Sync + 'static {
 }
 pub struct ActivityContext {
     pub id: ActivityId,
-    pub(crate) cancel: CancellationToken,
+    pub(crate) control: ControlToken,
+    pub(crate) pause_hook: watch::Sender<Option<Arc<dyn ActivityPause>>>,
+    pub(crate) progress: watch::Sender<TaskProgress>,
+    pub(crate) audit: AuditEmitter,
 }
 impl ActivityContext {
-    pub fn cancellation(&self) -> &CancellationToken {
-        &self.cancel
+    /// Forward observed domain-job progress while the same Activity remains pending.
+    pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
+        crate::tasks::report_progress(&self.progress, &self.audit, stage.into(), completed, total);
+    }
+    /// Optional capability for THIS invocation. Without it, pauses wait for step completion.
+    /// Register once, before starting the external job. Hooks must tolerate completion
+    /// racing a pause/resume command. Cancellation is observed through control().
+    pub fn register_pause(&self, hook: Arc<dyn ActivityPause>) -> Outcome<()> {
+        if self.pause_hook.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(hook);
+                true
+            }
+        }) {
+            Ok(())
+        } else {
+            Err(Failure::Rejected(
+                "Activity pause hook already registered".into(),
+            ))
+        }
+    }
+    pub fn control(&self) -> &ControlToken {
+        &self.control
     }
 }
 /// Optional shorthand when the caller knows the concrete host type.
@@ -47,7 +73,7 @@ pub type ServiceClient<S> = ActivityClient<
 enum Message<R, P, Q, V> {
     Execute {
         request: R,
-        context: ActivityContext,
+        context: Box<ActivityContext>,
         guard: ActivityGuard,
         reply: oneshot::Sender<Outcome<P>>,
     },
@@ -114,7 +140,7 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
             .tx
             .send(Message::Execute {
                 request,
-                context,
+                context: Box::new(context),
                 guard,
                 reply,
             })
@@ -225,10 +251,11 @@ pub(crate) fn spawn<S: ServiceHandler>(
                     Some(Message::Execute { request, context, mut guard, reply }) => {
                         let service = service.clone(); let stop = stop_task.clone();
                         running.push(Box::pin(async move {
-                            let result = if context.cancel.is_cancelled() || stop.is_cancelled() { Err(Failure::Cancelled) } else {
+                            let _hook_lifetime = context.pause_hook.clone();
+                            let result = if context.control.is_cancelled() || stop.is_cancelled() { Err(Failure::Cancelled) } else {
                                 guard.started();
-                                let cancel = context.cancel.clone();
-                                let operation = AssertUnwindSafe(async move { service.execute(request, context).await }).catch_unwind();
+                                let cancel = context.control.cancellation().clone();
+                                let operation = AssertUnwindSafe(async move { service.execute(request, *context).await }).catch_unwind();
                                 tokio::pin!(operation);
                                 let result = tokio::select! {
                                     biased;

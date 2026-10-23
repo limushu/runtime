@@ -13,7 +13,7 @@ use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Read/control access only. Does not submit, schedule, spawn, or own execution.
@@ -49,6 +49,10 @@ impl ExecutionView {
     pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
         self.control(id)?.resume()
     }
+    pub fn recheck(&self, id: WorkflowId) -> Outcome<()> {
+        self.control(id)?.recheck();
+        Ok(())
+    }
     pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
         self.control(id)?.cancel();
         Ok(())
@@ -75,6 +79,7 @@ impl StartPermit {
 /// Passive execution engine. All workflow futures and resource events are driven by tick()
 /// in the OWNER'S event loop. No submission mailbox, policy callback or spawned workflow host.
 pub struct WorkflowDriver {
+    wake: Arc<Notify>,
     view: ExecutionView,
     state: watch::Sender<RuntimeSnapshot>,
     pool: String,
@@ -113,6 +118,7 @@ impl WorkflowDriver {
         };
         let (broker, events) = Broker::new();
         Ok(Self {
+            wake: Arc::new(Notify::new()),
             view,
             state,
             pool,
@@ -160,18 +166,26 @@ impl WorkflowDriver {
     }
     /// Unmanaged standalone use: the driver provides simple logical-object exclusion.
     pub fn submit<W: Workflow>(&mut self, workflow: W) -> Outcome<Run<W::Output>> {
-        self.enqueue(workflow, None)
+        self.enqueue(workflow, None, ExecutionOptions::default())
     }
     /// Managed use: the owner retains logical objects and uncertain-result fences.
     /// This is synchronous registration, not a request to another event loop.
     pub fn defer<W: Workflow>(&mut self, workflow: W) -> Outcome<(Run<W::Output>, StartPermit)> {
+        self.defer_with_options(workflow, ExecutionOptions::default())
+    }
+    pub fn defer_with_options<W: Workflow>(
+        &mut self,
+        workflow: W,
+        options: ExecutionOptions,
+    ) -> Outcome<(Run<W::Output>, StartPermit)> {
         let (tx, rx) = oneshot::channel();
-        Ok((self.enqueue(workflow, Some(rx))?, StartPermit(tx)))
+        Ok((self.enqueue(workflow, Some(rx), options)?, StartPermit(tx)))
     }
     fn enqueue<W: Workflow>(
         &mut self,
         workflow: W,
         start: Option<oneshot::Receiver<Outcome<()>>>,
+        options: ExecutionOptions,
     ) -> Outcome<Run<W::Output>> {
         if self.view.scope.is_closed() {
             return Err(Failure::Unavailable);
@@ -194,6 +208,8 @@ impl WorkflowDriver {
                 cancel: self.stop.child_token(),
                 config: self.config.clone(),
                 start,
+                options,
+                wake: self.wake.clone(),
             },
         );
         self.view
@@ -226,6 +242,7 @@ impl WorkflowDriver {
                 self.view.tasks.lock().unwrap().finish(id);
                 Some(id)
             }
+            _ = self.wake.notified() => None,
         };
         self.publish();
         completed
