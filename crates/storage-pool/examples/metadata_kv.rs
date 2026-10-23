@@ -1,13 +1,14 @@
 //! One application-owned database, two repositories: pool metadata and task history.
-//! Run twice with the same path to observe persisted Removed state and old tasks.
+//! TaskRun twice with the same path to observe persisted Removed state and old tasks.
 use std::{sync::Arc, time::Duration};
+use storage_pool::TaskRun;
 use storage_pool::{
     adapters::{SimulatedBalancer, SimulatedDataPlane},
     metadata::*,
     task_center::persistence::*,
     *,
 };
-async fn done<T>(mut run: Run<T>) -> Outcome<T> {
+async fn done<T>(mut run: TaskRun<T>) -> Outcome<T> {
     run.result().await
 }
 #[tokio::main(flavor = "current_thread")]

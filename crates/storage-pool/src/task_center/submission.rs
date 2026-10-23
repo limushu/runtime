@@ -5,15 +5,16 @@ pub(super) struct Accepted {
     pub control: RunControl,
     pub start: StartPermit,
     pub publish: Box<dyn FnOnce() + Send>,
-    pub task_id: Option<TaskId>,
 }
 type Accept = Box<dyn FnOnce(Outcome<&mut WorkflowDriver>) -> Option<Accepted> + Send>;
 pub(super) struct Submission {
+    pub task_id: TaskId,
+    pub name: String,
     pub operation: PoolOperation,
     pub accept: Accept,
     pub administrative: bool,
-    /// Transfer a restored logical claim to its reconstructed execution.
-    pub restored_task: Option<TaskId>,
+    /// Attach an execution to a logical task already registered in TaskCenter.
+    pub reconstructing: bool,
 }
 impl Submission {
     fn new<W: Workflow>(
@@ -21,16 +22,18 @@ impl Submission {
         operation: PoolOperation,
         administrative: bool,
         binding: Option<TaskBinding>,
-        reply: impl FnOnce(Outcome<Run<W::Output>>) + Send + 'static,
+        reply: impl FnOnce(Outcome<TaskRun<W::Output>>) + Send + 'static,
     ) -> Self {
-        let task_id = binding.as_ref().map(|b| b.id);
-        let restored_task = binding.as_ref().filter(|b| b.is_restored).map(|b| b.id);
+        let task_id = binding.as_ref().map(|b| b.id).unwrap_or_default();
+        let reconstructing = binding.as_ref().is_some_and(|b| b.is_restored);
         let paused = binding.as_ref().is_some_and(|b| b.initial_pause);
         let options = binding.as_ref().map(|b| b.options()).unwrap_or_default();
         Self {
+            task_id,
+            name: W::NAME.into(),
             operation,
             administrative,
-            restored_task,
+            reconstructing,
             accept: Box::new(move |driver| {
                 let result = driver
                     .and_then(|d| d.defer_with_options(workflow, options))
@@ -51,8 +54,7 @@ impl Submission {
                     Ok((run, start)) => Some(Accepted {
                         control: run.control.clone(),
                         start,
-                        task_id,
-                        publish: Box::new(move || reply(Ok(run))),
+                        publish: Box::new(move || reply(Ok(TaskRun::new(task_id, run)))),
                     }),
                 }
             }),
@@ -61,13 +63,13 @@ impl Submission {
 }
 impl TaskCenter {
     /// Extension point for application-owned workflows. Uses the same conflict/object rules.
-    pub async fn submit_task<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+    pub async fn submit_task<W: Workflow>(&self, workflow: W) -> Outcome<TaskRun<W::Output>> {
         self.submit_classified(workflow, OperationKind::UserTask(W::NAME.into()))
             .await
     }
     /// Shrink participates in pool-wide topology coordination and retains its single slot
     /// while paused or waiting on business conditions. A read-only guard is required.
-    pub async fn submit_shrink<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+    pub async fn submit_shrink<W: Workflow>(&self, workflow: W) -> Outcome<TaskRun<W::Output>> {
         if workflow.continuation_guard().is_none() {
             return Err(Failure::Rejected(
                 "shrink requires a continuation guard".into(),
@@ -76,15 +78,34 @@ impl TaskCenter {
         self.submit_classified(workflow, OperationKind::Shrink)
             .await
     }
-    pub async fn submit_topology<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+    pub async fn submit_topology<W: Workflow>(&self, workflow: W) -> Outcome<TaskRun<W::Output>> {
         self.submit_classified(workflow, OperationKind::Topology(W::NAME.into()))
+            .await
+    }
+    pub async fn submit_operation<W: Workflow>(
+        &self,
+        workflow: W,
+        operation: PoolOperation,
+    ) -> Outcome<TaskRun<W::Output>> {
+        if operation.objects != workflow.objects() {
+            return Err(Failure::Rejected(
+                "operation objects must match workflow objects".into(),
+            ));
+        }
+        if operation.kind == OperationKind::Shrink && workflow.continuation_guard().is_none() {
+            return Err(Failure::Rejected(
+                "shrink requires a continuation guard".into(),
+            ));
+        }
+        let binding = self.record_submission::<W>(&operation, None);
+        self.submit_prepared(workflow, operation, false, binding)
             .await
     }
     async fn submit_classified<W: Workflow>(
         &self,
         workflow: W,
         kind: OperationKind,
-    ) -> Outcome<Run<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         let operation = PoolOperation {
             kind,
             objects: workflow.objects(),
@@ -97,7 +118,7 @@ impl TaskCenter {
         &self,
         workflow: W,
         resume: ResumeSpec,
-    ) -> Outcome<PersistentRun<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         self.submit_resumable_class(workflow, resume, TaskClass::General)
             .await
     }
@@ -105,7 +126,7 @@ impl TaskCenter {
         &self,
         workflow: W,
         resume: ResumeSpec,
-    ) -> Outcome<PersistentRun<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         if workflow.continuation_guard().is_none() {
             return Err(Failure::Rejected(
                 "shrink requires a continuation guard".into(),
@@ -119,7 +140,7 @@ impl TaskCenter {
         workflow: W,
         resume: ResumeSpec,
         class: TaskClass,
-    ) -> Outcome<PersistentRun<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         if !self.accepts() {
             return Err(Failure::Unavailable);
         }
@@ -138,22 +159,25 @@ impl TaskCenter {
         }
         let binding = self
             .persistence()?
-            .resumable_binding(W::NAME.into(), operation.objects.clone(), resume, class)
+            .resumable_binding(
+                TaskId::new(),
+                W::NAME.into(),
+                operation.objects.clone(),
+                resume,
+                class,
+            )
             .await?;
-        let task_id = binding.id;
-        let run = self
-            .submit_prepared(workflow, operation, false, Some(binding))
-            .await?;
-        Ok(PersistentRun { task_id, run })
+        self.submit_prepared(workflow, operation, false, Some(binding))
+            .await
     }
 
-    pub(crate) async fn submit<W: PoolWorkflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+    pub(crate) async fn submit<W: PoolWorkflow>(&self, workflow: W) -> Outcome<TaskRun<W::Output>> {
         self.submit_with_access(workflow, false).await
     }
     pub(crate) async fn submit_admin<W: PoolWorkflow>(
         &self,
         workflow: W,
-    ) -> Outcome<Run<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         self.submit_with_access(workflow, true).await
     }
     fn record_submission<W: Workflow>(
@@ -163,6 +187,7 @@ impl TaskCenter {
     ) -> Option<TaskBinding> {
         self.persistence.as_ref().map(|p| {
             p.history_binding(
+                TaskId::new(),
                 W::NAME.into(),
                 operation.objects.clone(),
                 source,
@@ -174,7 +199,7 @@ impl TaskCenter {
         &self,
         workflow: W,
         administrative: bool,
-    ) -> Outcome<Run<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         let operation = workflow.operation();
         let binding = self.record_submission::<W>(&operation, None);
         self.submit_prepared(workflow, operation, administrative, binding)
@@ -186,7 +211,7 @@ impl TaskCenter {
         operation: PoolOperation,
         administrative: bool,
         binding: Option<TaskBinding>,
-    ) -> Outcome<Run<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         if self.stop.is_cancelled() {
             if let Some(b) = binding {
                 b.rejected(Failure::Unavailable);
@@ -216,7 +241,7 @@ impl TaskCenter {
         &self,
         workflow: W,
         source_event: Option<uuid::Uuid>,
-        callback: impl FnOnce(Outcome<Run<W::Output>>) + Send + 'static,
+        callback: impl FnOnce(Outcome<TaskRun<W::Output>>) + Send + 'static,
     ) -> Outcome<()> {
         if !self.accepts() {
             return Err(Failure::Unavailable);

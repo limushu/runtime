@@ -23,9 +23,9 @@ impl Workflow for Steps {
 }
 
 async fn observed(
-    observer: &mut TaskObserver,
-    predicate: impl Fn(&TaskSnapshot) -> bool,
-) -> TaskSnapshot {
+    observer: &mut ExecutionObserver,
+    predicate: impl Fn(&ExecutionSnapshot) -> bool,
+) -> ExecutionSnapshot {
     tokio::time::timeout(LIMIT, async {
         loop {
             let snapshot = observer.snapshot();
@@ -56,7 +56,7 @@ async fn live_and_historical_snapshots_retain_each_actual_step() {
     assert_eq!(next(&mut entered).await, "prepare");
     assert_eq!(next(&mut entered).await, "publish");
     let client = pool.client();
-    let snapshot = client.task(run.id()).unwrap();
+    let snapshot = client.execution(run.id()).unwrap();
     assert_eq!(snapshot.activities.total, 2);
     assert_eq!(snapshot.activities.omitted, 0);
     let first = &snapshot.activities.entries[0];
@@ -71,7 +71,7 @@ async fn live_and_historical_snapshots_retain_each_actual_step() {
     assert_eq!(second.id.sequence, 2);
     assert_eq!(second.state, ActivityState::Running);
     assert!(second.finished_at.is_none());
-    let mut observer = client.observe_task(run.id()).unwrap();
+    let mut observer = client.observe_execution(run.id()).unwrap();
     gate.add_permits(1);
     finish(&mut run).await.unwrap();
     let terminal = observed(&mut observer, |s| s.state == RunState::Completed).await;
@@ -81,7 +81,10 @@ async fn live_and_historical_snapshots_retain_each_actual_step() {
     let id = run.id();
     drop(run);
     pool.shutdown().await.unwrap();
-    assert_eq!(client.task(id).unwrap().activities, terminal.activities);
+    assert_eq!(
+        client.execution(id).unwrap().activities,
+        terminal.activities
+    );
 }
 
 #[tokio::test]
@@ -94,7 +97,7 @@ async fn observer_wakes_when_service_starts_without_workflow_state_change() {
     let mut run = driver
         .submit(Call::new(&service, Work::write("work", "r").gated(&gate)))
         .unwrap();
-    let mut observer = driver.view().observe_task(run.id()).unwrap();
+    let mut observer = driver.view().observe_execution(run.id()).unwrap();
     // tick has no completed workflow, but polls its future through dispatch.
     // A single-threaded test prevents the spawned service from running during this poll.
     for _ in 0..32 {
@@ -155,7 +158,7 @@ async fn resource_wait_cancellation_is_recorded_without_starting_the_activity() 
         .submit(Call::new(&service, Work::write("waiting", "r")))
         .await
         .unwrap();
-    let mut observer = pool.client().observe_task(waiting.id()).unwrap();
+    let mut observer = pool.client().observe_execution(waiting.id()).unwrap();
     let snapshot = observed(&mut observer, |s| s.state == RunState::WaitingResources).await;
     assert_eq!(
         snapshot.activities.entries[0].state,
@@ -163,7 +166,13 @@ async fn resource_wait_cancellation_is_recorded_without_starting_the_activity() 
     );
     waiting.control.cancel();
     assert_eq!(finish(&mut waiting).await, Err(Failure::Cancelled));
-    let record = pool.client().task(waiting.id()).unwrap().activities.entries[0].clone();
+    let record = pool
+        .client()
+        .execution(waiting.id())
+        .unwrap()
+        .activities
+        .entries[0]
+        .clone();
     assert_eq!(record.state, ActivityState::Failed(Failure::Cancelled));
     assert!(record.started_at.is_none());
     assert!(record.finished_at.is_some());
@@ -189,7 +198,7 @@ async fn cancellation_request_keeps_running_until_real_settlement() {
         if matches!(behavior, Behavior::CancelThenSettle) {
             assert_eq!(next(&mut entered).await, "cancel-observed");
         }
-        let snapshot = pool.client().task(run.id()).unwrap();
+        let snapshot = pool.client().execution(run.id()).unwrap();
         assert!(snapshot.cancellation_requested);
         assert_eq!(snapshot.activities.entries[0].state, ActivityState::Running);
         assert!(snapshot.activities.entries[0].finished_at.is_none());
@@ -203,7 +212,12 @@ async fn cancellation_request_keeps_running_until_real_settlement() {
             ActivityState::Failed(Failure::Cancelled)
         };
         assert_eq!(
-            pool.client().task(run.id()).unwrap().activities.entries[0].state,
+            pool.client()
+                .execution(run.id())
+                .unwrap()
+                .activities
+                .entries[0]
+                .state,
             expected
         );
         pool.shutdown().await.unwrap();
@@ -222,7 +236,7 @@ async fn failure_panic_and_unavailability_preserve_activity_outcomes() {
             .await
             .unwrap();
         let error = finish(&mut run).await.unwrap_err();
-        let snapshot = pool.client().task(run.id()).unwrap();
+        let snapshot = pool.client().execution(run.id()).unwrap();
         let activity = &snapshot.activities.entries[0];
         match (&error, &activity.state) {
             (Failure::Failed(_), ActivityState::Failed(Failure::Failed(_)))
@@ -240,7 +254,13 @@ async fn failure_panic_and_unavailability_preserve_activity_outcomes() {
         .await
         .unwrap();
     assert_eq!(finish(&mut run).await, Err(Failure::Unavailable));
-    let activity = pool.client().task(run.id()).unwrap().activities.entries[0].clone();
+    let activity = pool
+        .client()
+        .execution(run.id())
+        .unwrap()
+        .activities
+        .entries[0]
+        .clone();
     assert_eq!(activity.state, ActivityState::Failed(Failure::Unavailable));
     assert!(activity.started_at.is_none());
     assert!(activity.finished_at.is_some());
@@ -267,7 +287,7 @@ async fn bounded_history_reports_omissions_and_survives_task_eviction_via_observ
         })
         .await
         .unwrap();
-    let observer = pool.client().observe_task(first.id()).unwrap();
+    let observer = pool.client().observe_execution(first.id()).unwrap();
     finish(&mut first).await.unwrap();
     let history = observer.snapshot().activities;
     assert_eq!(history.total, 5);
@@ -286,7 +306,7 @@ async fn bounded_history_reports_omissions_and_survives_task_eviction_via_observ
         .unwrap();
     finish(&mut last).await.unwrap();
     tokio::time::timeout(LIMIT, async {
-        while pool.client().task(first.id()).is_ok() {
+        while pool.client().execution(first.id()).is_ok() {
             tokio::task::yield_now().await;
         }
     })
@@ -322,7 +342,7 @@ async fn forcefully_dropped_host_marks_started_activity_uncertain() {
         .await
         .unwrap();
     next(&mut entered).await;
-    let observer = pool.client().observe_task(run.id()).unwrap();
+    let observer = pool.client().observe_execution(run.id()).unwrap();
     drop(pool);
     assert!(matches!(finish(&mut run).await, Err(Failure::Uncertain(_))));
     // Forced service abort is asynchronous; the activity becomes terminal when its guard drops.
@@ -352,7 +372,7 @@ async fn queued_shutdown_records_cancellation_without_starting_work() {
     let mut run = driver
         .submit(Call::new(&service, Work::write("queued", "r")))
         .unwrap();
-    let observer = driver.view().observe_task(run.id()).unwrap();
+    let observer = driver.view().observe_execution(run.id()).unwrap();
     for _ in 0..32 {
         if observer
             .snapshot()

@@ -20,9 +20,10 @@ let report = pool.recovery_report().unwrap();
 
 启用存储后，新 TaskCenter 的普通准入保持关闭。`PoolManager::open` 创建本地宿主并调用
 `PoolHandle::takeover`：恢复元数据与成员目录，应用完整的当前拓扑并加载服务，然后自动重建可续办任务。
-任务恢复先安装所有未结束任务的对象占用，再按原请求顺序重建执行，最后开放普通准入。
+任务恢复先将所有未结束任务注册到统一 Task 目录（execution 为空），再按原请求顺序重建执行，最后开放普通准入。
+未知工厂等恢复失败也能通过 `task(id)` 查询；任务保留占用和错误，观察者会看到后续绑定的执行。
 新建空池也可走相同入口，系统调用时不需要提供任何 TaskId。
-未配置 TaskStore 时保持原有纯内存行为。数据库地址、连接池、表名和编码由适配器自行配置。
+未配置 TaskStore 时也提供 TaskId、实时任务查询和控制，仅历史归档及跨宿主续办不可用。数据库地址、连接池、表名和编码由适配器自行配置。
 
 TaskStore 协议只有三个存储操作：
 
@@ -57,15 +58,15 @@ TaskStore 只负责任务。Pool 的领域元数据通过 [可嵌入 KV 的仓�
 
 ```rust,ignore
 let mut run = pool.attach_node(node, sequence, connected).await?;
-let task_id = pool.persistent_task_id(run.id())?;
+let task_id = run.id();
 run.result().await?;
 pool.flush_task_history().await?;
 let detail = pool.task_detail(task_id).await?;
 let page = pool.task_history(TaskQuery::default()).await?;
 ```
 
-TaskId 是稳定 UUID；原 WorkflowId / TaskRef 属于某次运行实例，记录为 execution。
-旧 WorkflowId 到 TaskId 的内存映射遵循运行时历史淘汰，长期查询使用 TaskId 或分页查询。
+TaskId 是 TaskCenter 分配的稳定 UUID，纯内存任务也使用它。TaskRef 为 PoolUuid + TaskId。
+WorkflowId 只描述某个宿主中的执行；任务查询和控制统一使用 TaskId，长期历史使用 TaskId 或分页查询。
 每次执行的 Activity 序号独立，任务详情保留各次执行及其全部已录制步骤。
 KV 历史不受 Config::task_history / activity_history 的热缓存上限影响。
 拓扑通知创建的任务附带 source_event UUID；无关事件不生成 Task，本版本不单独归档全局事件。
@@ -121,7 +122,7 @@ save_checkpoint 等待耐久确认，失败停止后续依赖步骤并保留 Nee
 
 控制语义分开：
 
-- `suspend_task` / `resume_task`：只控制当前内存执行，resume 返回同一个 WorkflowId，不提交新 Workflow。
+- `suspend_task` / `resume_task`：只控制当前内存执行，返回 `()`，保留当前 execution，不提交新 Workflow。
 - 接管恢复：自动重建 Workflow，保留 TaskId，新增一次 execution；不恢复旧 Future 或调用栈。
 - 用户原本挂起：新宿主自动重建一个仍挂起的执行，用户明确 resume 后才继续，不会覆盖暂停意图。
 - 系统 topo 暂停：按新宿主当前阻塞重建，解除后自动检查条件并继续。

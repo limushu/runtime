@@ -3,6 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use storage_pool::TaskRun;
 use storage_pool::{adapters::SimulatedDataPlane, domains::vd::BgEntry, metadata::*, *};
 use tokio::sync::Barrier;
 
@@ -15,7 +16,7 @@ fn disk(id: &str) -> DiskId {
 fn tier(id: &str) -> TierId {
     TierId::new(id).unwrap()
 }
-async fn done<T>(mut run: Run<T>) -> Outcome<T> {
+async fn done<T>(mut run: TaskRun<T>) -> Outcome<T> {
     run.result().await
 }
 fn member(pool: PoolId) -> MemberDisk {

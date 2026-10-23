@@ -7,6 +7,7 @@ use std::{
     },
     time::Duration,
 };
+use storage_pool::TaskRun;
 use storage_pool::{adapters::*, ports::*, *};
 use tokio::{sync::Semaphore, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -35,7 +36,7 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
         .await
         .expect("operation timed out")
 }
-async fn done<T>(mut run: Run<T>) -> Outcome<T> {
+async fn done<T>(mut run: TaskRun<T>) -> Outcome<T> {
     bounded(run.result()).await
 }
 fn manager() -> PoolManager {
@@ -376,6 +377,9 @@ async fn children_delete_in_dependency_order_and_old_release_cannot_free_new_vol
     assert!(pool.tasks().iter().any(|task| {
         task.name == "storage.delete-volume"
             && task
+                .execution
+                .as_ref()
+                .unwrap()
                 .activities
                 .entries
                 .iter()
@@ -546,22 +550,26 @@ async fn dropping_delete_wait_does_not_abandon_pool_owned_finalizer() {
 }
 
 #[tokio::test]
-async fn task_references_are_scoped_by_uuid_and_instance() {
+async fn task_references_use_logical_identity_and_pool_uuid() {
     let manager = manager();
     let a = manager.create_pool(id("a")).unwrap();
     let b = manager.create_pool(id("b")).unwrap();
     let first = a.create_tier(tier()).await.unwrap();
     let second = b.create_tier(tier()).await.unwrap();
-    assert_eq!(first.id(), second.id());
+    assert_ne!(first.id(), second.id());
+    assert_eq!(first.execution_id(), second.execution_id());
     let task = a.task_ref(first.id());
     done(first).await.unwrap();
     done(second).await.unwrap();
-    assert_eq!(manager.task(task).unwrap().pool, "a");
+    assert_eq!(
+        manager.task(task).unwrap().execution.as_ref().unwrap().pool,
+        "a"
+    );
     assert!(b.task_by_ref(task).is_err());
     assert!(
         manager
             .task(TaskRef {
-                instance: PoolInstanceId::new(),
+                task: TaskId::new(),
                 ..task
             })
             .is_err()
@@ -703,6 +711,9 @@ async fn unload_keeps_handles_and_load_requires_complete_fresh_snapshot() {
     assert!(pool.tasks().iter().any(|task| {
         task.name == "storage.unload-pool"
             && task
+                .execution
+                .as_ref()
+                .unwrap()
                 .activities
                 .entries
                 .iter()
@@ -711,6 +722,9 @@ async fn unload_keeps_handles_and_load_requires_complete_fresh_snapshot() {
     assert!(pool.tasks().iter().any(|task| {
         task.name == "storage.load-pool"
             && task
+                .execution
+                .as_ref()
+                .unwrap()
                 .activities
                 .entries
                 .iter()
@@ -865,11 +879,10 @@ async fn known_and_ambiguous_volume_deletion_failures_do_not_free_allocations() 
                 .all(|d| d.allocated.len() == 1)
         );
         if matches!(failure, Failure::Uncertain(_)) {
-            assert!(
-                done(pool.create_volume(create_volume("later")).await.unwrap())
-                    .await
-                    .is_err()
-            );
+            assert!(matches!(
+                pool.create_volume(create_volume("later")).await,
+                Err(Failure::Rejected(_))
+            ));
             assert!(pool.delete(0).await.is_err());
         } else {
             done(pool.delete_volume(volume("v")).await.unwrap())
@@ -903,7 +916,7 @@ async fn deleted_pool_histories_are_bounded_but_existing_observers_survive() {
     b.delete(0).await.unwrap();
     assert!(manager.task(reference).is_err());
     assert_eq!(
-        observer.snapshot().state,
+        observer.snapshot().execution.as_ref().unwrap().state,
         workflow_foundation::RunState::Completed
     );
     assert!(manager.create_pool(id("a")).is_err());

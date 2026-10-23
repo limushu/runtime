@@ -166,6 +166,7 @@ impl TaskPersistence {
     }
     fn initial(
         &self,
+        id: TaskId,
         name: String,
         objects: Vec<ObjectKey>,
         resume: Option<ResumeSpec>,
@@ -173,7 +174,7 @@ impl TaskPersistence {
         let now = SystemTime::now();
         StoredTask {
             format_version: 1,
-            id: TaskId::new(),
+            id,
             pool: self.pool,
             name,
             class: TaskClass::General,
@@ -193,12 +194,13 @@ impl TaskPersistence {
     }
     pub fn history_binding(
         &self,
+        id: TaskId,
         name: String,
         objects: Vec<ObjectKey>,
         source_event: Option<uuid::Uuid>,
         class: TaskClass,
     ) -> TaskBinding {
-        let mut task = self.initial(name, objects, None);
+        let mut task = self.initial(id, name, objects, None);
         task.source_event = source_event;
         task.class = class;
         let id = task.id;
@@ -219,6 +221,7 @@ impl TaskPersistence {
     }
     pub async fn resumable_binding(
         &self,
+        id: TaskId,
         name: String,
         objects: Vec<ObjectKey>,
         resume: ResumeSpec,
@@ -234,7 +237,7 @@ impl TaskPersistence {
                 "invalid recovery kind/version or oversized resume data".into(),
             ));
         }
-        let mut task = self.initial(name, objects, Some(resume));
+        let mut task = self.initial(id, name, objects, Some(resume));
         task.class = class;
         let id = task.id;
         self.request(move |store| {
@@ -567,6 +570,7 @@ mod tests {
         .unwrap();
         let binding = old
             .resumable_binding(
+                TaskId::new(),
                 "test".into(),
                 vec![ObjectKey::new("disk", "d1")],
                 ResumeSpec {

@@ -67,7 +67,8 @@ pause/cancel 成功必须表示在途工作已稳定；resume 应核对当前拓
 
 ## topo、条件与取消
 
-同 Pool 只有一个前序缩容，暂停、等待条件期间仍保留名额。后续缩容排队。
+同 Pool 只允许一个未结束缩容，暂停、等待条件、恢复和 NeedsCheck 期间都保留名额；第二个缩容直接拒绝。
+`current_shrink()` 查询当前任务；`suspend_shrink/resume_shrink/cancel_shrink` 从 TaskCenter 定位它，无须调用方保存 ID。
 Node/Disk/Tier 变更及 Pool Load/Unload/Delete 均参与池级协调；其他 Pool 的无关变更不影响本池。
 
 ```text

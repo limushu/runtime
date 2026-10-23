@@ -20,7 +20,7 @@ impl Workflow for Waiting {
         Ok(())
     }
 }
-async fn terminal(observer: &mut TaskObserver) -> TaskSnapshot {
+async fn terminal(observer: &mut ExecutionObserver) -> ExecutionSnapshot {
     tokio::time::timeout(LIMIT, async {
         loop {
             let snapshot = observer.snapshot();
@@ -40,9 +40,9 @@ async fn id_based_controls_and_observation_survive_dropped_run_handle() {
     let run = pool.submit(Waiting).await.unwrap();
     let id = run.id();
     state(&run.control, RunState::WaitingSignal).await;
-    let mut observer = client.observe_task(id).unwrap();
+    let mut observer = client.observe_execution(id).unwrap();
     drop(run);
-    let snapshot = client.task(id).unwrap();
+    let snapshot = client.execution(id).unwrap();
     assert_eq!(snapshot.pool, "test-pool");
     assert_eq!(snapshot.name, "observable.wait");
     assert_eq!(snapshot.objects, vec![key("logical")]);
@@ -55,8 +55,8 @@ async fn id_based_controls_and_observation_survive_dropped_run_handle() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(client.task(id).unwrap().state, RunState::Paused);
-    assert!(client.task(id).unwrap().pause_requested);
+    assert_eq!(client.execution(id).unwrap().state, RunState::Paused);
+    assert!(client.execution(id).unwrap().pause_requested);
     client.resume(id).unwrap();
     client.cancel(id).unwrap();
     let snapshot = terminal(&mut observer).await;
@@ -66,7 +66,7 @@ async fn id_based_controls_and_observation_survive_dropped_run_handle() {
     assert!(client.cancel(WorkflowId(u64::MAX)).is_err());
     pool.shutdown().await.unwrap();
     assert_eq!(
-        client.task(id).unwrap().state,
+        client.execution(id).unwrap().state,
         RunState::Failed(Failure::Cancelled)
     );
 }
@@ -99,7 +99,7 @@ async fn observer_wakes_on_progress_even_without_run_state_transition() {
         })
         .await
         .unwrap();
-    let mut observer = pool.client().observe_task(run.id()).unwrap();
+    let mut observer = pool.client().observe_execution(run.id()).unwrap();
     tokio::time::timeout(LIMIT, async {
         while observer.snapshot().progress.stage.as_deref() != Some("before") {
             observer.changed().await.unwrap();
@@ -129,7 +129,7 @@ async fn waiting_task_is_observable_and_cancelable_by_id() {
     let mut first = client.submit(Waiting).await.unwrap();
     state(&first.control, RunState::WaitingSignal).await;
     let mut second = client.submit(Waiting).await.unwrap();
-    let snapshot = client.task(second.id()).unwrap();
+    let snapshot = client.execution(second.id()).unwrap();
     assert_eq!(snapshot.state, RunState::WaitingObjects);
     client.cancel(second.id()).unwrap();
     assert_eq!(finish(&mut second).await, Err(Failure::Cancelled));
@@ -165,21 +165,21 @@ async fn history_is_bounded_but_uncertain_tasks_and_existing_observers_are_retai
     let mut uncertain = pool.submit(Immediate(true)).await.unwrap();
     assert!(finish(&mut uncertain).await.is_err());
     let mut first = pool.submit(Immediate(false)).await.unwrap();
-    let observer = client.observe_task(first.id()).unwrap();
+    let observer = client.observe_execution(first.id()).unwrap();
     finish(&mut first).await.unwrap();
     let mut last = pool.submit(Immediate(false)).await.unwrap();
     finish(&mut last).await.unwrap();
     tokio::time::timeout(LIMIT, async {
-        while client.task(first.id()).is_ok() {
+        while client.execution(first.id()).is_ok() {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert!(client.task(uncertain.id()).is_ok());
-    assert!(client.task(last.id()).is_ok());
+    assert!(client.execution(uncertain.id()).is_ok());
+    assert!(client.execution(last.id()).is_ok());
     assert_eq!(observer.snapshot().state, RunState::Completed);
-    assert_eq!(client.tasks().len(), 2);
+    assert_eq!(client.executions().len(), 2);
     pool.shutdown().await.unwrap();
 }
 
@@ -196,7 +196,7 @@ async fn rejected_admission_is_not_registered_as_an_accepted_task() {
     let client = pool.client();
     let mut first = pool.submit(Waiting).await.unwrap();
     assert!(matches!(pool.submit(Waiting).await, Err(Failure::Busy)));
-    assert_eq!(client.tasks().len(), 1);
+    assert_eq!(client.executions().len(), 1);
     client.cancel(first.id()).unwrap();
     assert_eq!(finish(&mut first).await, Err(Failure::Cancelled));
     pool.shutdown().await.unwrap();
@@ -220,7 +220,7 @@ async fn invalid_observation_does_not_fail_business_or_replace_valid_progress() 
     let (mut pool, _, _) = setup();
     let mut run = pool.submit(InvalidProgress).await.unwrap();
     finish(&mut run).await.unwrap();
-    let snapshot = pool.client().task(run.id()).unwrap();
+    let snapshot = pool.client().execution(run.id()).unwrap();
     assert_eq!(snapshot.state, RunState::Completed);
     assert_eq!(snapshot.progress.stage.as_deref(), Some("valid"));
     pool.shutdown().await.unwrap();

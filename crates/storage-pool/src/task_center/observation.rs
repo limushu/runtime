@@ -1,64 +1,85 @@
-//! Read-only task and scheduling views.
+//! Logical task observation. Execution details are absent until recovery rebuilds it.
 use super::*;
-use std::ops::Deref;
-#[derive(Debug, Clone)]
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictMatch {
-    pub existing: WorkflowId,
+    pub existing: TaskId,
     pub conflict: Conflict,
 }
-/// Runtime observation, admission-time conflict explanations and live topology blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCondition {
+    /// The predecessor must finish with a known result.
+    Completion,
+    /// A running predecessor must acknowledge a safe pause.
+    SafePause,
+    /// This task stays suspended until the requesting task finishes.
+    Release,
+    /// A recovered or uncertain predecessor needs reconstruction/reconciliation.
+    Reconciliation,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskWait {
+    pub task: TaskId,
+    pub condition: WaitCondition,
+    pub reason: &'static str,
+}
 #[derive(Debug, Clone)]
 pub struct TaskSnapshot {
-    pub execution: workflow_foundation::TaskSnapshot,
+    pub id: TaskId,
+    pub name: String,
+    pub operation: PoolOperation,
+    pub status: TaskStatus,
+    pub last_error: Option<Failure>,
+    pub execution: Option<workflow_foundation::ExecutionSnapshot>,
     pub conflicts: Vec<ConflictMatch>,
-    /// Live, accepted topology tasks delaying this shrink (including queued topology).
-    pub topology_blockers: Vec<WorkflowId>,
-}
-impl Deref for TaskSnapshot {
-    type Target = workflow_foundation::TaskSnapshot;
-    fn deref(&self) -> &Self::Target {
-        &self.execution
-    }
+    /// Current unsatisfied conditions, including the causes of system suspension.
+    pub waits: Vec<TaskWait>,
 }
 pub struct TaskObserver {
-    pub(super) execution: workflow_foundation::TaskObserver,
-    pub(super) conflicts: Vec<ConflictMatch>,
-    pub(super) blockers: Blockers,
+    pub(super) record: Arc<registry::TaskRecord>,
+    pub(super) changes: watch::Receiver<u64>,
+    pub(super) execution: Option<workflow_foundation::ExecutionObserver>,
+    pub(super) execution_id: Option<WorkflowId>,
 }
 impl TaskObserver {
     pub fn snapshot(&self) -> TaskSnapshot {
-        let execution = self.execution.snapshot();
-        TaskSnapshot {
-            topology_blockers: self
-                .blockers
-                .lock()
-                .unwrap()
-                .get(&execution.id)
-                .cloned()
-                .unwrap_or_default(),
-            execution,
-            conflicts: self.conflicts.clone(),
-        }
+        self.record.snapshot()
     }
     pub async fn changed(&mut self) -> Outcome<TaskSnapshot> {
-        let execution = self.execution.changed().await?;
-        Ok(TaskSnapshot {
-            topology_blockers: self
-                .blockers
-                .lock()
-                .unwrap()
-                .get(&execution.id)
-                .cloned()
-                .unwrap_or_default(),
-            execution,
-            conflicts: self.conflicts.clone(),
-        })
+        loop {
+            tokio::select! {
+                result = self.changes.changed() => {
+                    result.map_err(|_| Failure::Unavailable)?;
+                    let next = self.record.execution_observer();
+                    let id = next.as_ref().map(|execution| execution.snapshot().id);
+                    if id != self.execution_id {
+                        self.execution_id = id;
+                        self.execution = next;
+                    }
+                }
+                result = async {
+                    match &mut self.execution {
+                        Some(execution) => execution.changed().await.map(|_| ()),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(error) = result {
+                        if self.snapshot().status.terminal() { return Err(error); }
+                        // An uncertain execution ended; the logical task is still alive.
+                        // Wait for reconciliation/reconstruction instead of polling it again.
+                        self.execution = None;
+                        continue;
+                    }
+                }
+            }
+            return Ok(self.snapshot());
+        }
     }
 }
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingSnapshot {
     pub queued: usize,
     pub running: usize,
-    /// Logical ownership fences; only reconciliation can release these (not implemented).
+    pub recovering: usize,
     pub fenced: usize,
 }

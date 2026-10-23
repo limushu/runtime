@@ -36,9 +36,9 @@ storage-pool/src/workflows/shrink_disk.rs  缩容流程及其恢复参数/检查
 
 ## 一个 Task，多次执行
 
-新增持久 TaskId，Task 的整个生命周期保持不变。
-现有 WorkflowId / TaskRef 继续标识某个实例内的执行，作为执行记录关联到 TaskId。
-切换后不复用旧 RunControl；同一 TaskId 下新增 execution_attempt 和新的 TaskRef。
+TaskId 由 TaskCenter 为所有任务分配，Task 的整个生命周期保持不变，不依赖持久化。
+WorkflowId 标识某个宿主内的执行；TaskRef 为 PoolUuid + TaskId，切换后保持稳定。
+切换后不复用旧执行控制句柄；同一 TaskId 下新增 execution_attempt。
 Activity 按 TaskId、执行代次、步骤序号归属，避免切换前后重复步骤号混淆。
 
 ```text
@@ -54,8 +54,8 @@ TaskRecord
     user_pause_requested
 
 Task #T1：缩容 disk-7
-  ├─ execution 1 → 旧 TaskRef → Activity…
-  └─ execution 2 → 新 TaskRef → Activity…
+  ├─ execution 1 → 旧宿主 / WorkflowId → Activity…
+  └─ execution 2 → 新宿主 / WorkflowId → Activity…
 ```
 
 业务类型决定 checkpoint 的内容，TaskCenter 只保存和调度恢复。

@@ -1,83 +1,133 @@
-# 如何阅读与扩展 TaskCenter
+# TaskCenter：任务、规则和执行
 
-## 先看三个入口
+**TaskCenter 是 Task 的管理主体，WorkflowDriver 是一次执行的推进器。**
+未配置数据库时也有 TaskId、任务查询、暂停、继续和取消。TaskStore 是历史与续办的可选适配器。
 
-1. [conflicts.rs](../crates/storage-pool/src/task_center/conflicts.rs)：业务冲突判断。
-2. [mod.rs](../crates/storage-pool/src/task_center/mod.rs)：队列、占用、停稳交接。
-3. [tests.rs](../crates/storage-pool/src/task_center/tests.rs)：不需要运行真实领域服务的协调测试。
+## 阅读顺序
 
-没有策略 trait、OperationSelector、RuleRelation 或规则优先级。规则在同一个具体
-TaskCenter 的 conflict 方法中，是普通 Rust 业务代码。
+1. [model.rs](../crates/storage-pool/src/task_center/model.rs)：TaskId、TaskStatus、TaskClass。
+2. [registry.rs](../crates/storage-pool/src/task_center/registry.rs)：逻辑任务目录，连接当前执行和观察者。
+3. [conflicts.rs](../crates/storage-pool/src/task_center/conflicts.rs)：TaskRules 协议及默认 PoolRules。
+4. [scheduler.rs](../crates/storage-pool/src/task_center/scheduler.rs)：规则结果的通用执行、等待关系和隔离。
+5. [mod.rs](../crates/storage-pool/src/task_center/mod.rs)：唯一主循环；接收提交、控制和 Driver 事件。
+6. [control.rs](../crates/storage-pool/src/task_center/control.rs)：按 TaskId 控制当前执行；暂停/继续不会重建。
+7. [recovery.rs](../crates/storage-pool/src/task_center/recovery.rs)：读取持久记录，注册原 Task，调用工厂重建执行。
 
-## 五个明确结果
-
-| 结果 | 意义 |
-| --- | --- |
-| Independent | 对象集合无交集，可并行；不再用 Queue 表示无冲突 |
-| Wait | 有冲突，按接受顺序等待；后来的重叠任务不能插队 |
-| CancelThenWait | 请求旧任务取消，但等其实际终态后才放行 |
-| SuspendThenWait | 请求缩容暂停，等实际暂停确认后放行 topo，保留原执行 |
-| Reject(reason) | 拒绝本次提交，不取消任何已有任务 |
-
-判断顺序是：池级缩容/topo 规则 → 对象关系 → 节点变更序号 → 重复请求 → 具名业务情况 → 默认等待。
-同一节点的新序号替换旧序号；旧序号/相同序号的在途节点变更拒绝。
-相同操作的重复任务拒绝，调用者应观察原 Run；本轮没有合并结果功能。
-
-业务关系来自 Workflow 声明的完整对象集合：节点与磁盘通过共同 node 键建立冲突，
-不是靠 namespace 字符串自动推断父子关系。新增操作必须声明其全部影响范围。
-
-## 新增一条规则
-
-假设新增一种流程，需要改变它与已有流程的交接方式：
-
-1. 在 OperationKind 增加业务操作，Workflow 的 operation() 返回该操作与 objects()。
-2. 明确所有受影响的 Disk/Node/Volume 对象。若涉及新增对象关系，先修正声明，不靠规则猜拓扑。
-3. 在 conflict() 的 match 增加带方向的业务分支，返回上述结果之一和可读 reason。
-4. 给正向、反向、不同对象、重复/陈旧请求补表格测试。
-5. 对 CancelThenWait 补实际交接测试：旧 Activity 未停稳时新流程绝不能产生副作用。
-   同时测试新任务被其他冲突拒绝、容量不足或对象被隔离时，不会误取消旧任务。
-
-例如当前已有分支（不是配置语言）：
-
-```rust,ignore
-(OfflineDisk(a), OnlineDisk(b)) if a == b => "disk-down-cancels-disk-up",
+```text
+Pool 请求 / topo 事件
+    ↓
+TaskCenter：TaskId → TaskRecord
+    ├─ PoolRules：判断两件业务之间的关系
+    ├─ scheduler：维护关系、发控制请求、判断条件、发 StartPermit
+    ├─ registry：统一查询与观察，包括尚未重建执行的任务
+    ├─ TaskStore（可选）：历史、恢复参数、检查点
+    └─ WorkflowDriver：推进当前执行，报告步骤状态和安全暂停确认
 ```
 
-该分支返回 CancelThenWait；反向 OnlineDisk/OfflineDisk 默认 Wait。
-修改冲突处理通常只改这一处和测试，不需要新增 trait、选择器或修改执行驱动。
+Driver 内部的 `ExecutionRegistry` 只按 WorkflowId 保存执行观察。
+它不决定哪个业务可以开始，也不分配逻辑 TaskId。
 
-## 安全交接
+## 身份与接口
 
-TaskCenter 先看完整冲突集合，再通过嵌入的执行驱动同步登记一个未启动的执行。登记失败不发取消；
-成功后才取消被替代者，并把新任务放入队列。开始许可由 TaskCenter 持有，调用者不能强行放行。
+`TaskRun::id()` 返回稳定的 TaskId；`execution_id()` 返回本次执行的 WorkflowId，仅供诊断。
+暂停/继续不改变这两个 ID；接管保留 TaskId，创建属于新宿主的执行。
+WorkflowId 是宿主内的序号，跨宿主可能重复，必须结合 PoolInstanceId 解释。
+跨池引用为 `TaskRef { pool: PoolUuid, task: TaskId }`。
 
-同一个循环轮询 Workflow Future，确认完成后才清理占用并推进队列。取消请求不等于完成。任何 Uncertain 会保留原对象隔离，
-相交等待者得到 Rejected，不扩大隔离到其额外对象。被隔离的新任务不会取消其他活动任务。
-正常排队任务可以按 ID 取消；互不相关的对象不受队头阻塞。
+```rust,ignore
+let mut run = pool.shrink_disk(disk).await?;
+let id = run.id();
+let task = pool.task(id)?;
+let mut observer = pool.observe_task(id)?;
+pool.suspend_task(id).await?;
+pool.wait_suspended(id).await?;
+pool.resume_task(id).await?;
+let result = run.result().await?;
+```
 
-## 可观察性
+`TaskSnapshot` 包含逻辑身份、业务分类、状态、错误、准入解释 `conflicts` 和当前等待 `waits`。
+`execution: Option<ExecutionSnapshot>` 提供执行状态、进度和 Activity 详情。
+恢复出的任务尚无 Future 时，execution 为空，但仍可查询、观察并保留占用。
+同一个观察者能看到该 Task 随后绑定的新执行。
 
-`pool.task(id)`：执行状态、进度、对象、逐 Activity 历史及 conflicts（已有任务 ID、决定、原因）。
-`pool.observe_task(id)`：状态/进度/Activity 更新订阅；不会保证保留每个中间事件。
-`pool.scheduling()`：TaskCenter 排队、运行、逻辑隔离计数。
-`pool.execution()`：Runtime 的底层资源/生命周期计数，不能代替业务队列计数。
+`suspend/resume/cancel` 是对当前执行的即时控制；异步 `suspend_task/resume_task/cancel_task`
+还会在配置了 TaskStore 时等待历史写入。取消尚未重建的任务也走 `cancel_task`，确认持久取消后释放占用。
+`resume_task` 只解除用户暂停，返回 `()`；重建需要自动接管或显式 `retry_task`。
+`TaskRun.control` 绑定原执行，不能替代切换后通过 TaskId 重新查询。
 
-conflicts 是准入时的解释，不是实时阻塞列表。普通执行历史有界，已有 observer 可在记录淘汰后
-继续观察；不确定记录与隔离保留，没有自动解除隔离。可配置的持久历史和显式可续办任务见 [持久化](task-persistence.md)。
+## 规则只描述关系
 
-`topology_blockers` 是缩容当前等待的已受理 topo WorkflowId，包含排队任务。
-单 Pool 的前序缩容在暂停/等待条件时仍保留名额；topo 即使来自其他磁盘，也先请求暂停再等待确认。
-全部 topo 结束后清除系统原因，再执行业务条件检查，不会清除用户暂停。
-接口、控制钩子与资源要求见 [Activity 控制](activity-control.md) 和 [缩容流程](shrink-workflow.md)。
+| 决定 | 调度器行为 |
+| --- | --- |
+| Independent | 不建立等待关系 |
+| Wait | 等已有任务以确定结果结束 |
+| CancelThenWait | 请求取消已有任务，并等它实际结束 |
+| SuspendThenWait | 请求已有任务安全暂停，确认后放行；请求者结束后撤销自己的暂停原因 |
+| Reject(reason) | 拒绝新任务，不改变任何已有任务 |
 
-`snapshot.activities.entries` 按调用序号列出每个步骤的名称、服务、资源、状态和时间戳。
-例如 OnlineDisk 执行期间可以看到 `node.inspect`、`disk.add` 已完成，`disk.open` 正在执行；
-执行完成后，同一 task ID 仍可查到这三步及后续 `disk.set-io` 的结果。
-Activity 记录由框架自动产生，TaskCenter 直接透传，不依赖业务 `report_progress()`。
-取消请求不等于 Activity 已结束；其终态由实际执行停稳后的结果决定。
+默认 PoolRules 包含池级缩容/topo 关系、节点版本、重复请求和对象重叠规则。
+规则先检查全部冲突，准入和容量检查通过后才执行取消或暂停。
+对象关系来自 Workflow 声明的完整对象集合，不能靠字符串猜测拓扑。
 
-`Config::activity_history` 限制每个 task 保留的步骤数（默认 1024），
-`activities.total` / `activities.omitted` 表示累计调用与已淘汰数量。
-这与 task 级历史上限独立；这里是进程内缓存，跨进程历史由配置的 TaskStore 保存。
-未走到的动态分支不会被列为“未完成步骤”。具体语义见
-[Workflow Foundation 逐 Activity 观测](../crates/workflow-foundation/README.md#逐-activity-观测)。
+新增业务通常只修改 PoolRules。独立嵌入者也可实现 `TaskRules`，通过
+`TaskCenter::with_rules` 和 `submit_operation` 接入自己的分类。
+`scheduler.rs` 不识别 Shrink、Topology、Node 或 Disk，只解释规则结果。
+通用机制测试见 `memory_tasks_and_custom_rules_share_identity_control_and_wait_observation`。
+
+## 有状态的等待与唤醒
+
+每次准入建立明确关系，关系保留到相应任务确定结束。`pump` 读取关系与执行事实，
+计算当前未满足条件，再同步更新控制和观察；不会重新写一套 topo 判断。
+
+```text
+缩容 S 正在迁移
+  → topo T1 受理：建立 T1 等 S.SafePause，S 等 T1.Release
+  → S 的 Activity 向均衡服务发 Pause，等待确认
+  → Driver 报告 S 安全暂停，pump 发出 T1 的 StartPermit
+  → T2 受理：再增加一个暂停原因
+  → T1 结束：只删除 T1 对应关系，S 仍等 T2
+  → T2 确定结束：撤销最后一个系统暂停原因，唤醒 S 的条件检查
+  → 条件满足且无用户暂停：继续原执行、原均衡 job
+```
+
+TaskCenter 主循环不能 await 暂停确认，否则 Driver 无法继续推进并产生确认。
+它只发请求、记录条件，随后继续轮询 `driver.tick()`。状态变化再进入 `reap → pump`。
+`reap` 收走已确定结束的执行并释放关系；Uncertain 转成隔离，继续保留关系。
+`pump` 根据现有状态放行可运行任务；通知只触发重检，不替代条件本身。
+
+`waits` 是实际执行使用的等待关系视图：
+
+- Completion：等另一个 Task 确定结束。
+- SafePause：等另一个执行确认安全暂停。
+- Release：当前暂停由哪个 Task 请求，需等它结束。
+- Reconciliation：前序任务尚未重建，或结果不确定。
+
+观察者既订阅执行变化，也订阅关系变化。因此多个 topo 只结束其中一个时，即使缩容仍是 Paused，
+界面也能收到等待原因变化。业务条件不满足的具体原因仍在 execution.state 的 WaitingConditions 中。
+
+## 单池缩容入口
+
+每池最多一个未结束缩容。排队、用户暂停、条件等待、待恢复和 NeedsCheck 都保留名额；
+第二个缩容直接拒绝。确定结束后可提交下一次。
+
+无需保存 ID 的后端接口可以直接调用：
+
+```rust,ignore
+let current = pool.current_shrink(); // Option<TaskSnapshot>
+pool.suspend_shrink().await?;
+pool.resume_shrink().await?;
+pool.cancel_shrink().await?;
+```
+
+这些方法从同一个 TaskCenter 目录定位任务，没有第二份缩容状态。
+没有正在进行的缩容时，查询返回 None，控制返回明确错误。
+
+## 历史与隔离
+
+普通终态记录按 `Config::task_history` 有界保留；已获取的 observer 不随目录淘汰失效。
+Activity 记录自动生成，`Config::activity_history` 限制热缓存，total/omitted 说明截断。
+watch 是合并的当前状态订阅；完整持久历史通过 TaskStore 查询，见 [持久化](task-persistence.md)。
+
+Uncertain 不释放对象和暂停原因。已有相交等待者得到 Rejected；新的相交请求在准入阶段拒绝，
+不会取消别的活动任务或扩大隔离范围。业务确认完成前不能用普通 cancel 清除隔离。
+恢复过程和 Activity 控制分别见 [恢复](task-recovery-design.md)、[控制](activity-control.md)。

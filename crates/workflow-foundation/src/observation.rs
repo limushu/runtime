@@ -193,7 +193,7 @@ pub(crate) fn report_progress(
     sender.send_replace(progress);
 }
 #[derive(Debug, Clone)]
-pub struct TaskSnapshot {
+pub struct ExecutionSnapshot {
     pub pool: String,
     pub id: WorkflowId,
     pub name: &'static str,
@@ -207,13 +207,13 @@ pub struct TaskSnapshot {
     pub cancellation_requested: bool,
 }
 #[derive(Clone)]
-pub(crate) struct TaskRecord {
+pub(crate) struct ExecutionRecord {
     pub control: RunControl,
     pub pool: String,
 }
-impl TaskRecord {
-    fn snapshot(&self) -> TaskSnapshot {
-        TaskSnapshot {
+impl ExecutionRecord {
+    fn snapshot(&self) -> ExecutionSnapshot {
+        ExecutionSnapshot {
             pool: self.pool.clone(),
             id: self.control.id,
             name: self.control.name,
@@ -230,17 +230,18 @@ impl TaskRecord {
 }
 /// Read-only subscription survives history eviction. watch coalesces updates;
 /// it is a current-state feed, not a guaranteed event journal.
-pub struct TaskObserver {
-    record: TaskRecord,
+#[derive(Clone)]
+pub struct ExecutionObserver {
+    record: ExecutionRecord,
     progress: tokio::sync::watch::Receiver<TaskProgress>,
     activities: watch::Receiver<ActivityHistory>,
     ended: bool,
 }
-impl TaskObserver {
-    pub fn snapshot(&self) -> TaskSnapshot {
+impl ExecutionObserver {
+    pub fn snapshot(&self) -> ExecutionSnapshot {
         self.record.snapshot()
     }
-    pub async fn changed(&mut self) -> Outcome<TaskSnapshot> {
+    pub async fn changed(&mut self) -> Outcome<ExecutionSnapshot> {
         if self.ended {
             return Err(Failure::Unavailable);
         }
@@ -259,12 +260,12 @@ impl TaskObserver {
         Ok(snapshot)
     }
 }
-pub(crate) struct TaskRegistry {
-    entries: BTreeMap<WorkflowId, TaskRecord>,
+pub(crate) struct ExecutionRegistry {
+    entries: BTreeMap<WorkflowId, ExecutionRecord>,
     completed: VecDeque<WorkflowId>,
     limit: usize,
 }
-impl TaskRegistry {
+impl ExecutionRegistry {
     pub fn new(limit: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -274,7 +275,7 @@ impl TaskRegistry {
     }
     pub fn insert(&mut self, pool: String, control: RunControl) {
         self.entries
-            .insert(control.id, TaskRecord { control, pool });
+            .insert(control.id, ExecutionRecord { control, pool });
     }
     pub fn finish(&mut self, id: WorkflowId) {
         if self.entries.get(&id).is_some_and(|record| {
@@ -292,21 +293,24 @@ impl TaskRegistry {
             }
         }
     }
-    pub fn observer(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+    pub fn observer(&self, id: WorkflowId) -> Outcome<ExecutionObserver> {
         let record = self
             .entries
             .get(&id)
             .cloned()
             .ok_or_else(|| Failure::Rejected("unknown or expired task id".into()))?;
-        Ok(TaskObserver {
+        Ok(ExecutionObserver {
             progress: record.control.progress.clone(),
             activities: record.control.activities.clone(),
             record,
             ended: false,
         })
     }
-    pub fn snapshots(&self) -> Vec<TaskSnapshot> {
-        self.entries.values().map(TaskRecord::snapshot).collect()
+    pub fn snapshots(&self) -> Vec<ExecutionSnapshot> {
+        self.entries
+            .values()
+            .map(ExecutionRecord::snapshot)
+            .collect()
     }
     pub fn ids(&self) -> Vec<WorkflowId> {
         self.entries.keys().copied().collect()

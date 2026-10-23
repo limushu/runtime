@@ -24,7 +24,7 @@ use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex, Weak},
 };
-use workflow_foundation::{RuntimeSnapshot, WorkflowDriver, WorkflowId};
+use workflow_foundation::{RuntimeSnapshot, WorkflowDriver};
 
 /// A composition/lifecycle boundary, not an aggregate containing all domain data.
 pub struct Pool {
@@ -48,26 +48,36 @@ impl PoolHandle {
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.task_center.tasks()
     }
-    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
+    pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
         self.task_center.task(id)
     }
-    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+    pub fn observe_task(&self, id: TaskId) -> Outcome<TaskObserver> {
         self.task_center.observe_task(id)
     }
-    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn suspend(&self, id: TaskId) -> Outcome<()> {
         self.task_center.suspend(id)
     }
-    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn resume(&self, id: TaskId) -> Outcome<()> {
         self.task_center.resume(id)
     }
-    pub fn recheck_task(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn recheck_task(&self, id: TaskId) -> Outcome<()> {
         self.task_center.recheck(id)
     }
-    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn cancel(&self, id: TaskId) -> Outcome<()> {
         self.task_center.cancel(id)
     }
-    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
+    pub async fn wait_suspended(&self, id: TaskId) -> Outcome<()> {
         self.task_center.wait_suspended(id).await
+    }
+    pub async fn suspend_task(&self, id: TaskId) -> Outcome<()> {
+        self.task_center.suspend_task(id).await
+    }
+    pub async fn resume_task(&self, id: TaskId) -> Outcome<()> {
+        self.descriptor().active()?;
+        self.task_center.resume_task(id).await
+    }
+    pub async fn cancel_task(&self, id: TaskId) -> Outcome<()> {
+        self.task_center.cancel_task(id).await
     }
     pub fn scheduling(&self) -> crate::task_center::SchedulingSnapshot {
         self.task_center.scheduling()
@@ -96,7 +106,7 @@ impl PoolHandle {
         id: NodeId,
         sequence: u64,
         connected: bool,
-    ) -> Outcome<Run<PoolNode>> {
+    ) -> Outcome<TaskRun<PoolNode>> {
         self.descriptor().active()?;
         if !self.shared.nodes.lock().unwrap().contains(&id) {
             return Err(reject("node is not attached to this pool"));
@@ -114,7 +124,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn load_node(&self, id: NodeId) -> Outcome<Run<PoolNode>> {
+    pub async fn load_node(&self, id: NodeId) -> Outcome<TaskRun<PoolNode>> {
         self.task_center
             .submit(LoadNodeWorkflow {
                 domains: self.domains.clone(),
@@ -122,7 +132,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn online_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
+    pub async fn online_disk(&self, id: DiskId) -> Outcome<TaskRun<MemberDisk>> {
         let disk = self.disk(id).await?;
         if disk.membership == DiskMembership::Removed {
             return Err(reject("disk is removed"));
@@ -140,7 +150,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn offline_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
+    pub async fn offline_disk(&self, id: DiskId) -> Outcome<TaskRun<MemberDisk>> {
         let disk = self.disk(id.clone()).await?;
         self.task_center
             .submit(OfflineDiskWorkflow {
@@ -150,7 +160,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn offline_node(&self, request: NodeTransitionRequest) -> Outcome<Run<PoolNode>> {
+    pub async fn offline_node(&self, request: NodeTransitionRequest) -> Outcome<TaskRun<PoolNode>> {
         self.task_center
             .submit(OfflineNodeWorkflow {
                 specs: self.shared.node_disks(&request.node),
@@ -159,7 +169,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn online_node(&self, request: NodeTransitionRequest) -> Outcome<Run<PoolNode>> {
+    pub async fn online_node(&self, request: NodeTransitionRequest) -> Outcome<TaskRun<PoolNode>> {
         let specs = self.shared.node_disks(&request.node);
         let reservations = specs
             .iter()
@@ -174,7 +184,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn create_volume(&self, request: CreateVolume) -> Outcome<Run<VirtualDisk>> {
+    pub async fn create_volume(&self, request: CreateVolume) -> Outcome<TaskRun<VirtualDisk>> {
         request.validate()?;
         // Placement identities are immutable in this slice. Future relocation
         // must add a versioned placement protocol, not trust this pre-read.

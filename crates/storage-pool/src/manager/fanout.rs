@@ -1,13 +1,12 @@
 use super::*;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::watch, time::Instant};
-use workflow_foundation::{RunControl, RunState};
+use workflow_foundation::RunState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskRef {
     pub pool: PoolUuid,
-    pub instance: PoolInstanceId,
-    pub workflow: WorkflowId,
+    pub task: TaskId,
 }
 #[derive(Debug, Clone)]
 pub struct PoolTaskSnapshot {
@@ -57,7 +56,7 @@ pub(crate) enum EventDecision {
     Pending,
     NotRelevant,
     Applied,
-    Accepted(RunControl),
+    Accepted(TaskControl),
     Rejected(Failure),
 }
 #[derive(Clone)]
@@ -137,8 +136,7 @@ impl PoolEventReceipt {
             EventDecision::Accepted(control) => {
                 let task = TaskRef {
                     pool: self.pool,
-                    instance: self.instance,
-                    workflow: control.id,
+                    task: control.id,
                 };
                 match control.state() {
                     RunState::Completed => TargetStatus::Completed(task),

@@ -63,7 +63,7 @@ impl Fixture {
             events,
         }
     }
-    async fn submit(&self, operation: PoolOperation, uncertain: bool) -> Outcome<Run<()>> {
+    async fn submit(&self, operation: PoolOperation, uncertain: bool) -> Outcome<TaskRun<()>> {
         tokio::time::timeout(
             LIMIT,
             self.center.submit(Work {
@@ -88,10 +88,10 @@ impl Fixture {
             .unwrap();
     }
 }
-async fn result(run: &mut Run<()>) -> Outcome<()> {
+async fn result(run: &mut TaskRun<()>) -> Outcome<()> {
     tokio::time::timeout(LIMIT, run.result()).await.unwrap()
 }
-async fn finish(run: &mut Run<()>) -> Outcome<()> {
+async fn finish(run: &mut TaskRun<()>) -> Outcome<()> {
     run.control.signal(Signal::new("finish", "")).await.unwrap();
     result(run).await
 }
@@ -150,17 +150,19 @@ fn business_conflicts_have_explicit_names_and_directions() {
     ];
     for (incoming, existing, decision, reason) in cases {
         assert_eq!(
-            TaskCenter::conflict(&operation(incoming, &["n"]), &operation(existing, &["n"])),
+            PoolRules.conflict(&operation(incoming, &["n"]), &operation(existing, &["n"])),
             Conflict { decision, reason }
         );
     }
     let same = operation(OperationKind::OnlineDisk(d.clone()), &["d"]);
     assert_eq!(
-        TaskCenter::conflict(&same, &operation(OperationKind::OfflineDisk(d), &["other"])).decision,
+        PoolRules
+            .conflict(&same, &operation(OperationKind::OfflineDisk(d), &["other"]))
+            .decision,
         Independent
     );
     assert!(matches!(
-        TaskCenter::conflict(&same, &same).decision,
+        PoolRules.conflict(&same, &same).decision,
         Reject(_)
     ));
     let newer = operation(
@@ -172,13 +174,10 @@ fn business_conflicts_have_explicit_names_and_directions() {
     );
     let stale = operation(OperationKind::OfflineNode { id: n, sequence: 9 }, &["n"]);
     assert_eq!(
-        TaskCenter::conflict(&stale, &newer).reason,
+        PoolRules.conflict(&stale, &newer).reason,
         "stale-node-guard"
     );
-    assert_eq!(
-        TaskCenter::conflict(&newer, &stale).decision,
-        CancelThenWait
-    );
+    assert_eq!(PoolRules.conflict(&newer, &stale).decision, CancelThenWait);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -190,7 +189,7 @@ async fn rejection_of_one_conflict_prevents_cancelling_another() {
         .submit(operation(OperationKind::OnlineDisk(d), &["n"]), false)
         .await
         .unwrap();
-    assert_eq!(f.next().await, online.id());
+    assert_eq!(f.next().await, online.execution_id());
     // A connected observation waits for disk online, without cancelling it.
     let mut newer = f
         .submit(
@@ -230,7 +229,7 @@ async fn capacity_rejection_never_cancels_existing_work() {
         )
         .await
         .unwrap();
-    assert_eq!(f.next().await, online.id());
+    assert_eq!(f.next().await, online.execution_id());
     assert!(matches!(
         f.submit(operation(OperationKind::OfflineDisk(d), &["d"]), false)
             .await,
@@ -248,7 +247,7 @@ async fn fifo_conflicts_do_not_block_disjoint_work_and_cancelled_waiter_is_remov
         .submit(operation(volume("a"), &["a"]), false)
         .await
         .unwrap();
-    assert_eq!(f.next().await, a.id());
+    assert_eq!(f.next().await, a.execution_id());
     let mut ab = f
         .submit(operation(volume("ab"), &["a", "b"]), false)
         .await
@@ -261,20 +260,32 @@ async fn fifo_conflicts_do_not_block_disjoint_work_and_cancelled_waiter_is_remov
         .submit(operation(volume("c"), &["c"]), false)
         .await
         .unwrap();
-    assert_eq!(f.next().await, c.id());
+    assert_eq!(f.next().await, c.execution_id());
     assert_eq!(
-        f.center.task(ab.id()).unwrap().state,
+        f.center
+            .task(ab.id())
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .state,
         RunState::WaitingObjects
     );
     assert_eq!(
-        f.center.task(b.id()).unwrap().state,
+        f.center
+            .task(b.id())
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .state,
         RunState::WaitingObjects
     );
     assert_eq!(f.center.scheduling().queued, 2);
     assert_eq!(f.center.scheduling().running, 2);
     ab.control.cancel();
     assert_eq!(result(&mut ab).await, Err(Failure::Cancelled));
-    assert_eq!(f.next().await, b.id());
+    assert_eq!(f.next().await, b.execution_id());
     finish(&mut b).await.unwrap();
     finish(&mut a).await.unwrap();
     finish(&mut c).await.unwrap();
@@ -288,7 +299,7 @@ async fn uncertain_workflow_without_activity_fences_only_its_objects() {
         .submit(operation(volume("a"), &["a"]), true)
         .await
         .unwrap();
-    assert_eq!(f.next().await, a.id());
+    assert_eq!(f.next().await, a.execution_id());
     let mut ab = f
         .submit(operation(volume("ab"), &["a", "b"]), false)
         .await
@@ -300,13 +311,9 @@ async fn uncertain_workflow_without_activity_fences_only_its_objects() {
         .submit(operation(volume("b"), &["b"]), false)
         .await
         .unwrap();
-    assert_eq!(f.next().await, b.id());
-    let mut retry = f
-        .submit(operation(volume("retry"), &["a"]), false)
-        .await
-        .unwrap();
+    assert_eq!(f.next().await, b.execution_id());
     assert!(matches!(
-        result(&mut retry).await,
+        f.submit(operation(volume("retry"), &["a"]), false).await,
         Err(Failure::Rejected(_))
     ));
     assert_eq!(f.center.scheduling().fenced, 1);
@@ -322,7 +329,7 @@ async fn dropped_handle_keeps_ownership_and_observer_keeps_conflict_explanation(
         .await
         .unwrap();
     let id = a.id();
-    assert_eq!(f.next().await, id);
+    assert_eq!(f.next().await, a.execution_id());
     drop(a);
     let mut b = f
         .submit(operation(volume("b"), &["a"]), false)
@@ -330,11 +337,17 @@ async fn dropped_handle_keeps_ownership_and_observer_keeps_conflict_explanation(
         .unwrap();
     let observer = f.center.observe_task(b.id()).unwrap();
     assert_eq!(observer.snapshot().conflicts[0].existing, id);
-    assert_eq!(observer.snapshot().state, RunState::WaitingObjects);
+    assert_eq!(
+        observer.snapshot().execution.as_ref().unwrap().state,
+        RunState::WaitingObjects
+    );
     f.center.cancel(id).unwrap();
-    assert_eq!(f.next().await, b.id());
+    assert_eq!(f.next().await, b.execution_id());
     finish(&mut b).await.unwrap();
-    assert_eq!(observer.snapshot().state, RunState::Completed);
+    assert_eq!(
+        observer.snapshot().execution.as_ref().unwrap().state,
+        RunState::Completed
+    );
     assert_eq!(
         observer.snapshot().conflicts[0].conflict.reason,
         "overlapping-objects"
@@ -349,7 +362,7 @@ async fn fenced_replacement_does_not_cancel_unrelated_live_work() {
         .submit(operation(volume("unknown"), &["a"]), true)
         .await
         .unwrap();
-    assert_eq!(f.next().await, uncertain.id());
+    assert_eq!(f.next().await, uncertain.execution_id());
     assert!(matches!(
         finish(&mut uncertain).await,
         Err(Failure::Uncertain(_))
@@ -361,8 +374,8 @@ async fn fenced_replacement_does_not_cancel_unrelated_live_work() {
         )
         .await
         .unwrap();
-    assert_eq!(f.next().await, live.id());
-    let mut replacement = f
+    assert_eq!(f.next().await, live.execution_id());
+    let replacement = f
         .submit(
             operation(
                 OperationKind::OfflineNode {
@@ -373,13 +386,108 @@ async fn fenced_replacement_does_not_cancel_unrelated_live_work() {
             ),
             false,
         )
-        .await
-        .unwrap();
-    assert!(matches!(
-        result(&mut replacement).await,
-        Err(Failure::Rejected(_))
-    ));
+        .await;
+    assert!(matches!(replacement, Err(Failure::Rejected(_))));
     assert!(!live.control.cancellation_requested());
     finish(&mut live).await.unwrap();
     f.close().await;
+}
+
+/// This policy contains no Shrink or Topology classifications. The same scheduler
+/// owns pause acknowledgement, multiple causes, release and observer wakeup.
+struct MaintenanceRules;
+impl TaskRules for MaintenanceRules {
+    fn conflict(&self, incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
+        if incoming.kind == OperationKind::UserTask("foreground".into())
+            && existing.kind == OperationKind::UserTask("maintenance".into())
+        {
+            Conflict::new(
+                ConflictDecision::SuspendThenWait,
+                "foreground-needs-maintenance-paused",
+            )
+        } else {
+            Conflict::new(ConflictDecision::Independent, "independent")
+        }
+    }
+}
+
+#[tokio::test]
+async fn memory_tasks_and_custom_rules_share_identity_control_and_wait_observation() {
+    let config = Config::default();
+    let driver = WorkflowDriver::new("rules", config.clone()).unwrap();
+    let center = TaskCenter::with_rules(driver, &config, Arc::new(MaintenanceRules)).unwrap();
+    let (started, mut events) = mpsc::unbounded_channel();
+    let work = |name: &str| Work {
+        operation: operation(OperationKind::UserTask(name.into()), &[name]),
+        started: started.clone(),
+        uncertain: false,
+    };
+    let maintenance = work("maintenance");
+    let mut background = center
+        .submit_operation(maintenance, work("maintenance").operation)
+        .await
+        .unwrap();
+    assert_eq!(events.recv().await.unwrap(), background.execution_id());
+    let id = background.id();
+    assert_eq!(center.task(id).unwrap().id, id);
+    assert!(center.task_detail(id).await.is_err()); // No TaskStore, but all live controls work.
+    center.suspend_task(id).await.unwrap();
+    tokio::time::timeout(LIMIT, center.wait_suspended(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut observer = center.observe_task(id).unwrap();
+    let mut first = center
+        .submit_operation(work("foreground"), work("foreground").operation)
+        .await
+        .unwrap();
+    let mut second = center
+        .submit_operation(work("foreground"), work("foreground").operation)
+        .await
+        .unwrap();
+    tokio::time::timeout(LIMIT, async {
+        events.recv().await.unwrap();
+        events.recv().await.unwrap();
+    })
+    .await
+    .unwrap();
+    let pending = observer.snapshot();
+    assert_eq!(pending.waits.len(), 2);
+    assert!(
+        pending
+            .waits
+            .iter()
+            .all(|wait| wait.condition == WaitCondition::Release)
+    );
+    assert!(pending.execution.unwrap().system_pause_requested);
+
+    finish(&mut first).await.unwrap();
+    tokio::time::timeout(LIMIT, async {
+        while observer
+            .snapshot()
+            .waits
+            .iter()
+            .any(|wait| wait.task == first.id())
+        {
+            observer.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.snapshot().waits[0].task, second.id());
+    assert!(background.control.system_pause_requested());
+    finish(&mut second).await.unwrap();
+    tokio::time::timeout(LIMIT, async {
+        while !observer.snapshot().waits.is_empty() {
+            observer.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!background.control.system_pause_requested());
+    assert!(background.control.user_pause_requested());
+    center.resume_task(id).await.unwrap();
+    finish(&mut background).await.unwrap();
+    assert_eq!(center.task(id).unwrap().status, TaskStatus::Completed);
+    center.shutdown().await.unwrap();
 }

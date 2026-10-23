@@ -14,5 +14,7 @@ pub use domains::{PoolId, TierId, disk::*, node::*, tier::Tier, vd::*};
 pub use manager::*;
 pub use pool::{Pool, PoolHandle};
 pub use requests::{CreateVolume, NodeTransitionRequest};
-pub use task_center::{TaskObserver, TaskSnapshot};
-pub use workflow_foundation::{Config, Failure, Outcome, Run, WorkflowId};
+pub use task_center::{
+    TaskClass, TaskControl, TaskId, TaskObserver, TaskRun, TaskSnapshot, TaskStatus,
+};
+pub use workflow_foundation::{Config, Failure, Outcome, WorkflowId};

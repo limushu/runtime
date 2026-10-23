@@ -250,14 +250,17 @@ async fn main() -> Outcome<()> {
     conditions.0.store(false, Ordering::SeqCst);
     topo.result().await?;
     let mut observer = center.observe_task(shrink.id())?;
-    while !matches!(observer.snapshot().state, RunState::WaitingConditions(_)) {
+    while !matches!(
+        observer.snapshot().execution.as_ref().unwrap().state,
+        RunState::WaitingConditions(_)
+    ) {
         observer.changed().await?;
     }
     println!(
         "SHRINK {:?}: {:?}; progress {:?}",
         shrink.id(),
-        observer.snapshot().state,
-        observer.snapshot().progress
+        observer.snapshot().execution.as_ref().unwrap().state,
+        observer.snapshot().execution.as_ref().unwrap().progress
     );
     conditions.0.store(true, Ordering::SeqCst);
     center.recheck(shrink.id())?;

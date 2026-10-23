@@ -3,8 +3,8 @@
 use crate::{
     locks::{Broker, Event, LockTable},
     model::Scope,
+    observation::ExecutionRegistry,
     service::{self, ServiceOwner},
-    tasks::TaskRegistry,
     workflow::{ExecutionEnv, execution},
     *,
 };
@@ -21,27 +21,27 @@ use tokio_util::sync::CancellationToken;
 pub struct ExecutionView {
     pub(crate) scope: Arc<Scope>,
     state: watch::Receiver<RuntimeSnapshot>,
-    tasks: Arc<Mutex<TaskRegistry>>,
+    executions: Arc<Mutex<ExecutionRegistry>>,
 }
 impl ExecutionView {
-    pub fn tasks(&self) -> Vec<TaskSnapshot> {
-        self.tasks.lock().unwrap().snapshots()
+    pub fn executions(&self) -> Vec<ExecutionSnapshot> {
+        self.executions.lock().unwrap().snapshots()
     }
-    /// List retained tasks without copying their Activity histories.
-    pub fn task_ids(&self) -> Vec<WorkflowId> {
-        self.tasks.lock().unwrap().ids()
+    /// List retained executions without copying their Activity histories.
+    pub fn execution_ids(&self) -> Vec<WorkflowId> {
+        self.executions.lock().unwrap().ids()
     }
-    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
-        Ok(self.observe_task(id)?.snapshot())
+    pub fn execution(&self, id: WorkflowId) -> Outcome<ExecutionSnapshot> {
+        Ok(self.observe_execution(id)?.snapshot())
     }
-    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
-        self.tasks.lock().unwrap().observer(id)
+    pub fn observe_execution(&self, id: WorkflowId) -> Outcome<ExecutionObserver> {
+        self.executions.lock().unwrap().observer(id)
     }
     fn control(&self, id: WorkflowId) -> Outcome<RunControl> {
         if self.scope.is_closed() {
             return Err(Failure::Unavailable);
         }
-        self.tasks.lock().unwrap().control(id)
+        self.executions.lock().unwrap().control(id)
     }
     pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
         self.control(id)?.pause()
@@ -114,7 +114,7 @@ impl WorkflowDriver {
         let view = ExecutionView {
             scope,
             state: receiver,
-            tasks: Arc::new(Mutex::new(TaskRegistry::new(config.task_history))),
+            executions: Arc::new(Mutex::new(ExecutionRegistry::new(config.task_history))),
         };
         let (broker, events) = Broker::new();
         Ok(Self {
@@ -213,7 +213,7 @@ impl WorkflowDriver {
             },
         );
         self.view
-            .tasks
+            .executions
             .lock()
             .unwrap()
             .insert(self.pool.clone(), run.control.clone());
@@ -239,7 +239,7 @@ impl WorkflowDriver {
             biased;
             Some(event) = self.events.recv() => { self.table.event(event, &self.broker); None }
             Some(id) = self.running.next(), if !self.running.is_empty() => {
-                self.view.tasks.lock().unwrap().finish(id);
+                self.view.executions.lock().unwrap().finish(id);
                 Some(id)
             }
             _ = self.wake.notified() => None,

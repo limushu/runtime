@@ -4,8 +4,8 @@ mod activity;
 use crate::{
     locks::{Broker, Kind, Permit},
     model::Scope,
+    observation::ActivityObservation,
     service::ActivityClient,
-    tasks::ActivityObservation,
     *,
 };
 use async_trait::async_trait;
@@ -322,7 +322,13 @@ impl WorkflowContext {
     }
     /// Observational only. Invalid/oversized reports are ignored, never failing business work.
     pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
-        crate::tasks::report_progress(&self.progress, &self.audit, stage.into(), completed, total);
+        crate::observation::report_progress(
+            &self.progress,
+            &self.audit,
+            stage.into(),
+            completed,
+            total,
+        );
     }
     /// Persist a BUSINESS checkpoint; this does not serialize or replay the async future.
     /// A pause is acknowledged at the next safe_point, AFTER the caller saves settled work.

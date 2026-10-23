@@ -30,7 +30,7 @@ pub enum OperationKind {
     UnloadPool,
     LoadPool,
     UserTask(String),
-    /// One admitted/running shrink per Pool; queued successors keep their order.
+    /// One unfinished shrink per Pool, including suspension and recovery.
     Shrink,
     /// Explicit application extension for topology workflows.
     Topology(String),

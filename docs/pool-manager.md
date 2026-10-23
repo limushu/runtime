@@ -50,7 +50,8 @@ Accepted 只表示任务已接受；完成、失败、队列满、不相关、�
 `load` 要求覆盖全部已加入节点的完整、有效版本事实，恢复节点加载与可用盘状态后再开放准入。
 `shutdown` 结束本地运行宿主，不能通过 load 重启，也不等同于外部卸载已经确认。
 
-跨池 TaskRef 包含稳定 PoolUuid、运行期 PoolInstanceId、WorkflowId；观测和控制均校验作用域。
+跨池 TaskRef 包含稳定 PoolUuid 和 TaskId；观测和控制按 Pool 解析当前任务。
+PoolInstanceId 仍标识本地执行宿主，并用于 fanout 回执校验；它不再进入逻辑任务引用。
 Manager 汇总本池 Task 快照，选中任务可以订阅 observer；历史与 Activity 均在内存中有界保留。
 删除池的运行历史另按 `Config::task_history` 限制保留的池数量；已有 observer 不受目录淘汰影响。
 可选注入 TaskStore 后，TaskCenter 另外提供 KV 历史查询与任务自动重建及显式检查点续办，不受热缓存淘汰影响，

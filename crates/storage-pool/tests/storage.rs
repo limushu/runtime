@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use storage_pool::TaskRun;
 use storage_pool::{adapters::*, ports::*, *};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -26,10 +27,10 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
         .await
         .expect("operation must make progress")
 }
-async fn result<T>(mut run: Run<T>) -> Outcome<T> {
+async fn result<T>(mut run: TaskRun<T>) -> Outcome<T> {
     bounded(run.result()).await
 }
-async fn rebuild_pending(run: Run<MemberDisk>) {
+async fn rebuild_pending(run: TaskRun<MemberDisk>) {
     assert!(matches!(
         result(run).await,
         Err(Failure::Failed(message)) if message.starts_with("waiting for rebuild is not implemented")
@@ -661,7 +662,7 @@ async fn ambiguous_commit_fences_followers_while_reads_show_authoritative_metada
             .any(|(_, c)| matches!(c, MetadataChange::CreateVolume(_)))
     );
     assert!(matches!(
-        result(pool.create_volume(request("v2")).await.unwrap()).await,
+        pool.create_volume(request("v2")).await,
         Err(Failure::Rejected(_))
     ));
     assert!(pool.execution().fenced > 0);
@@ -687,7 +688,7 @@ async fn io_success_then_metadata_failure_is_uncertain() {
         "only confirmed metadata is published"
     );
     assert!(matches!(
-        result(pool.online_disk(disk_id("d1")).await.unwrap()).await,
+        pool.online_disk(disk_id("d1")).await,
         Err(Failure::Rejected(_))
     ));
     manager.shutdown().await.unwrap();
@@ -875,7 +876,10 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     let id = run.id();
     let live = pool.task(id).unwrap();
     assert_eq!(
-        live.activities
+        live.execution
+            .as_ref()
+            .unwrap()
+            .activities
             .entries
             .iter()
             .map(|a| (a.name, a.state.clone()))
@@ -891,7 +895,7 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     assert_eq!(
         run.control.state(),
         RunState::Activity(workflow_foundation::ActivityId {
-            workflow: run.id(),
+            workflow: run.execution_id(),
             sequence: 4
         })
     );
@@ -905,10 +909,16 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     gate.open();
     assert_eq!(result(run).await.unwrap().io, IoState::Up);
     let history = pool.task(id).unwrap();
-    assert_eq!(history.activities.total, 5);
-    assert_eq!(history.activities.entries[4].name, "disk.set-io");
+    assert_eq!(history.execution.as_ref().unwrap().activities.total, 5);
+    assert_eq!(
+        history.execution.as_ref().unwrap().activities.entries[4].name,
+        "disk.set-io"
+    );
     assert!(
         history
+            .execution
+            .as_ref()
+            .unwrap()
             .activities
             .entries
             .iter()
@@ -1099,18 +1109,17 @@ fn conflict_policy_is_explicit_and_testable_without_running_services() {
         sequence: 4,
         connected: false,
     });
-    assert_eq!(TaskCenter::conflict(&new, &old).decision, CancelThenWait);
-    assert!(matches!(
-        TaskCenter::conflict(&old, &new).decision,
-        Reject(_)
-    ));
+    assert_eq!(PoolRules.conflict(&new, &old).decision, CancelThenWait);
+    assert!(matches!(PoolRules.conflict(&old, &new).decision, Reject(_)));
     assert_eq!(
-        TaskCenter::conflict(&new, &operation(OperationKind::LoadNode(node))).decision,
+        PoolRules
+            .conflict(&new, &operation(OperationKind::LoadNode(node)))
+            .decision,
         CancelThenWait
     );
     let create = operation(OperationKind::CreateVolume(volume_id("v")));
     let offline = operation(OperationKind::OfflineDisk(disk_id("d")));
-    assert_eq!(TaskCenter::conflict(&offline, &create).decision, Wait);
+    assert_eq!(PoolRules.conflict(&offline, &create).decision, Wait);
 }
 
 #[test]
@@ -1141,7 +1150,7 @@ async fn ambiguous_open_fences_replacement_without_publishing_up() {
     ));
     assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Down);
     assert!(matches!(
-        result(pool.offline_disk(spec.id).await.unwrap()).await,
+        pool.offline_disk(spec.id).await,
         Err(Failure::Rejected(_))
     ));
     assert_eq!(plane.disk_calls.lock().unwrap().as_slice(), ["open"]);
@@ -1256,7 +1265,14 @@ async fn coordinator_cancels_node_offline_and_waits_for_batch_rebuild_to_settle_
     let offline = pool.offline_node(transition(2)).await.unwrap();
     gate.wait().await;
     assert_eq!(
-        pool.task(offline.id()).unwrap().progress.stage.as_deref(),
+        pool.task(offline.id())
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .progress
+            .stage
+            .as_deref(),
         Some("wait-rebuild")
     );
     assert_eq!(
@@ -1416,7 +1432,7 @@ async fn malformed_batch_io_response_fences_node_and_does_not_publish_unconfirme
     ));
     assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Up);
     assert!(matches!(
-        result(pool.online_node(transition(3)).await.unwrap()).await,
+        pool.online_node(transition(3)).await,
         Err(Failure::Rejected(_))
     ));
     manager.shutdown().await.unwrap();
@@ -1506,7 +1522,10 @@ async fn task_center_explains_replacement_and_controls_waiting_task_by_id() {
         "disk-down-cancels-disk-up"
     );
     assert_eq!(snapshot.conflicts[0].existing, online.id());
-    assert_eq!(snapshot.state, RunState::WaitingObjects);
+    assert_eq!(
+        snapshot.execution.as_ref().unwrap().state,
+        RunState::WaitingObjects
+    );
     pool.cancel(offline.id()).unwrap();
     assert_eq!(result(offline).await, Err(Failure::Cancelled));
     gate.open();

@@ -1,13 +1,14 @@
 //! Runs the production Workflow/Pool facade with explicit metadata/data-plane/balancing
 //! simulators. No physical IO is performed. Replace the injected ports in production.
 use std::{sync::Arc, time::Duration};
+use storage_pool::TaskRun;
 use storage_pool::{
     adapters::{MemoryMetadata, SimulatedBalancer, SimulatedDataPlane},
     task_center::persistence::*,
     *,
 };
 
-async fn finish<T>(mut run: Run<T>) -> Outcome<T> {
+async fn finish<T>(mut run: TaskRun<T>) -> Outcome<T> {
     run.result().await
 }
 #[tokio::main(flavor = "current_thread")]
@@ -57,17 +58,24 @@ async fn main() -> Outcome<()> {
         .await?;
     }
     let mut shrink = pool.shrink_disk(DiskId::new("d1")?).await?;
-    let task_id = pool.persistent_task_id(shrink.id())?;
+    let task_id = shrink.id();
     let mut observer = pool.observe_task(shrink.id())?;
     loop {
         let task = observer.snapshot();
-        println!("Task {task_id}: {:?}, {:?}", task.state, task.progress);
+        println!(
+            "Task {task_id}: {:?}, {:?}",
+            task.execution.as_ref().unwrap().state,
+            task.execution.as_ref().unwrap().progress
+        );
         if task
+            .execution
+            .as_ref()
+            .unwrap()
             .progress
             .stage
             .as_ref()
             .is_some_and(|s| s.starts_with("evacuating "))
-            && task.progress.completed >= 1
+            && task.execution.as_ref().unwrap().progress.completed >= 1
         {
             break;
         }
@@ -83,7 +91,14 @@ async fn main() -> Outcome<()> {
         removed.io,
         removed.allocation
     );
-    for activity in &pool.task(shrink.id())?.activities.entries {
+    for activity in &pool
+        .task(shrink.id())?
+        .execution
+        .as_ref()
+        .unwrap()
+        .activities
+        .entries
+    {
         println!(
             "  {:2} {:38} {:?}",
             activity.id.sequence, activity.name, activity.state

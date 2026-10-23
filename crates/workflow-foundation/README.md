@@ -69,21 +69,21 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 - client 绑定 Runtime 实例，即使 Pool 名称相同也不能跨实例执行 Activity。
 - shutdown 拒绝新工作、请求取消、等待停稳、关闭服务；等待可取消后重试。
   强制 Drop 只保证本地任务回收，不能保证远端 IO 停止。
-- 任务索引按 ID 提供观察/控制。普通终态历史有界，Uncertain 保留；watch 可能合并事件。
+- ExecutionRegistry 按宿主内 WorkflowId 提供执行观察/控制；逻辑 Task 归应用 TaskCenter。普通终态历史有界，Uncertain 保留；watch 可能合并事件。
   业务冲突解释属于 TaskCenter，不再由 Runtime 记录或解释。
 
 ## 逐 Activity 观测
 
-每次通过 `WorkflowContext::activity()` 发起的步骤自动进入 `TaskSnapshot.activities`，
+每次通过 `WorkflowContext::activity()` 发起的步骤自动进入 `ExecutionSnapshot.activities`，
 不需要在 Workflow 中手工上报开始/结束。每条记录包含稳定的 `ActivityId`（Workflow ID + 调用序号）、
 注册服务名、步骤名、资源声明、当前状态和创建/实际开始/实际结束时间。
 
 ```rust,ignore
-let task = client.task(id)?; // 运行中或仍保留的历史 task
+let task = client.execution(id)?; // 运行中或仍保留的历史 task
 for activity in &task.activities.entries {
     println!("{} {:?}: {:?}", activity.name, activity.id, activity.state);
 }
-let mut observer = client.observe_task(id)?;
+let mut observer = client.observe_execution(id)?;
 let updated = observer.changed().await?; // Activity 更新也会唤醒，不依赖 Workflow 状态变化
 ```
 

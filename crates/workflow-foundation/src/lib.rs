@@ -4,9 +4,9 @@ mod control;
 mod driver;
 mod locks;
 mod model;
+mod observation;
 mod service;
 mod standalone;
-mod tasks;
 mod workflow;
 
 pub use audit::{AuditEvent, AuditRecord, AuditSink, CheckpointWriter, ExecutionOptions};
@@ -16,9 +16,10 @@ pub use control::{
 };
 pub use driver::{ExecutionView, StartPermit, WorkflowDriver};
 pub use model::*;
+pub use observation::{
+    ActivityHistory, ActivitySnapshot, ActivityState, ExecutionObserver, ExecutionSnapshot,
+    TaskProgress,
+};
 pub use service::{ActivityClient, ActivityContext, ServiceClient, ServiceHandler};
 pub use standalone::{RuntimeHandle, WorkflowRuntime};
-pub use tasks::{
-    ActivityHistory, ActivitySnapshot, ActivityState, TaskObserver, TaskProgress, TaskSnapshot,
-};
 pub use workflow::{Run, RunControl, Workflow, WorkflowContext};

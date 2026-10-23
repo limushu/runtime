@@ -87,14 +87,14 @@ Workflow 可通过 `continuation_guard()` 返回 `ContinuationGuard`。只读 `c
 
 ## 缩容与 topo
 
-TaskCenter 的 `submit_shrink` 要求提供继续条件；每 Pool 一个前序缩容，暂停/等待条件仍保留名额，后续缩容排队。
+TaskCenter 的 `submit_shrink` 要求提供继续条件；每 Pool 一个未结束缩容，暂停/等待条件/恢复仍保留名额，第二个缩容直接拒绝。
 显式 topo、内置 Node/Disk/Tier 成员变更和 Pool Load/Unload/Delete，即使对象不相交也会触发缩容暂停。
 topo 等真实暂停确认后执行。
 所有已受理 topo 结束后才清除系统暂停；Uncertain fence 不视为释放。恢复指令在途再来 topo 时，
 旧暂停确认已撤销，新 topo 必须等待新的暂停确认。
 
-TaskSnapshot 的 `topology_blockers` 是当前受理任务的 WorkflowId，不包含已经终态但尚未对账的 fence。
-此时仍可从系统暂停标记和 SchedulingSnapshot.fenced 看出存在未解阻塞。
+TaskSnapshot 的 `waits` 来自调度器的真实等待关系，按 TaskId 列出原因和条件，包含尚未对账的隔离任务。
+用户暂停和系统暂停标记位于 `execution` 中；恢复任务尚未绑定执行时该字段为空。
 
 运行 `cargo run --offline --locked -p storage-pool --example shrink_topology` 查看完整指令/应答示例。
 真实磁盘流程与接入边界见 [缩容流程](shrink-workflow.md)。

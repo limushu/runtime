@@ -17,28 +17,34 @@ use workflow_foundation::{
 };
 
 mod conflicts;
+mod control;
+mod model;
+mod registry;
+mod run;
+pub use model::{TaskClass, TaskId, TaskStatus};
+pub use run::{TaskControl, TaskRun};
 mod observation;
 mod operation;
 mod scheduler;
 mod submission;
-pub use observation::{ConflictMatch, SchedulingSnapshot, TaskObserver, TaskSnapshot};
+pub use observation::{
+    ConflictMatch, SchedulingSnapshot, TaskObserver, TaskSnapshot, TaskWait, WaitCondition,
+};
 pub(crate) use operation::PoolWorkflow;
 pub use operation::{OperationKind, PoolOperation};
 use scheduler::State;
 use submission::Submission;
 pub mod persistence;
 mod recovery;
-pub use conflicts::{Conflict, ConflictDecision};
-use persistence::{TaskId, TaskPersistence};
-pub use recovery::{PersistentRun, RecoveryFailure, RecoveryReport};
-type Explanations = Arc<Mutex<BTreeMap<WorkflowId, Vec<ConflictMatch>>>>;
-type Blockers = Arc<Mutex<BTreeMap<WorkflowId, Vec<WorkflowId>>>>;
+pub use conflicts::{Conflict, ConflictDecision, PoolRules, TaskRules};
+use persistence::TaskPersistence;
+pub use recovery::{RecoveryFailure, RecoveryReport};
 enum SchedulingCommand {
-    Restore {
-        claims: Vec<(TaskId, PoolOperation)>,
+    RegisterRecovered {
+        tasks: Vec<Arc<registry::TaskRecord>>,
         reply: oneshot::Sender<()>,
     },
-    Release {
+    CancelInactive {
         task: TaskId,
         reply: oneshot::Sender<()>,
     },
@@ -50,14 +56,14 @@ impl Drop for Host {
     }
 }
 
-/// Concrete Pool coordinator. There is deliberately no TaskCenter trait or policy injection.
+/// Owns logical tasks, admission, waiting relationships and recovery.
+/// WorkflowDriver is its passive execution engine; TaskStore is an optional journal.
 #[derive(Clone)]
 pub struct TaskCenter {
     execution: ExecutionView,
     failure: Arc<Mutex<Option<Failure>>>,
     tx: mpsc::Sender<Submission>,
-    explanations: Explanations,
-    blockers: Blockers,
+    registry: Arc<Mutex<registry::TaskRegistry>>,
     scheduling: Arc<Mutex<SchedulingSnapshot>>,
     stop: CancellationToken,
     lifecycle: watch::Receiver<Lifecycle>,
@@ -67,7 +73,6 @@ pub struct TaskCenter {
     scheduling_commands: mpsc::Sender<SchedulingCommand>,
     persistence_initialized: Arc<tokio::sync::Mutex<bool>>,
     persistence_ready: Arc<AtomicBool>,
-    task_ids: Arc<Mutex<BTreeMap<WorkflowId, TaskId>>>,
     recovery: Arc<Mutex<BTreeMap<(String, u32), recovery::RecoveryFn>>>,
 }
 impl TaskCenter {
@@ -81,10 +86,23 @@ impl TaskCenter {
                 "TaskCenter capacity must be positive".into(),
             ));
         }
-        Ok(Self::start_inner(driver, config, None))
+        Ok(Self::start_inner(driver, config, None, Arc::new(PoolRules)))
+    }
+    /// Substitute application rules; the wait/suspension lifecycle stays unchanged.
+    pub fn with_rules(
+        driver: WorkflowDriver,
+        config: &Config,
+        rules: Arc<dyn TaskRules>,
+    ) -> Outcome<Self> {
+        if config.capacity == 0 {
+            return Err(Failure::Rejected(
+                "TaskCenter capacity must be positive".into(),
+            ));
+        }
+        Ok(Self::start_inner(driver, config, None, rules))
     }
     pub(crate) fn start(driver: WorkflowDriver, config: &Config) -> Self {
-        Self::start_inner(driver, config, None)
+        Self::start_inner(driver, config, None, Arc::new(PoolRules))
     }
     /// Embed TaskCenter with application-registered services and a configurable storage adapter.
     pub fn with_task_store(
@@ -101,12 +119,18 @@ impl TaskCenter {
             ));
         }
         let persistence = TaskPersistence::new(pool, instance, store, persistence_config)?;
-        Ok(Self::start_inner(driver, config, Some(persistence)))
+        Ok(Self::start_inner(
+            driver,
+            config,
+            Some(persistence),
+            Arc::new(PoolRules),
+        ))
     }
     fn start_inner(
         mut driver: WorkflowDriver,
         config: &Config,
         persistence: Option<TaskPersistence>,
+        rules: Arc<dyn TaskRules>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Submission>(config.capacity);
         let (scheduling_commands, mut controls) =
@@ -115,10 +139,9 @@ impl TaskCenter {
         let stop = CancellationToken::new();
         let stopping = stop.clone();
         let (life, lifecycle) = watch::channel(Lifecycle::Running);
-        let explanations: Explanations = Arc::default();
-        let notes = explanations.clone();
-        let blockers: Blockers = Arc::default();
-        let live_blockers = blockers.clone();
+        let registry: Arc<Mutex<registry::TaskRegistry>> = Arc::default();
+        let catalog = registry.clone();
+        let history_limit = config.task_history;
         let scheduling = Arc::new(Mutex::new(SchedulingSnapshot::default()));
         let schedule = scheduling.clone();
         let execution = driver.view();
@@ -127,43 +150,13 @@ impl TaskCenter {
         let limit = config.max_workflows;
         let admission_closed = Arc::new(AtomicBool::new(needs_initialization));
         let closed = admission_closed.clone();
-        let task_ids = Arc::new(Mutex::new(BTreeMap::new()));
-        let task_id_index = task_ids.clone();
         let task = tokio::spawn(async move {
-            let mut state = State::default();
+            let mut state = State::new(rules, catalog, history_limit);
             let mut closing = false;
             loop {
                 state.reap();
                 state.pump();
-                let topology: Vec<_> = state
-                    .entries
-                    .iter()
-                    .filter(|(_, e)| e.operation.kind.is_topology())
-                    .map(|(id, _)| *id)
-                    .collect();
-                {
-                    let mut published = live_blockers.lock().unwrap();
-                    let next: BTreeMap<_, _> = state
-                        .entries
-                        .iter()
-                        .filter(|(_, e)| e.operation.kind == OperationKind::Shrink)
-                        .map(|(id, _)| (*id, topology.clone()))
-                        .collect();
-                    for (id, blockers) in &next {
-                        if published.get(id) != Some(blockers) {
-                            state.entries[id].control.recheck();
-                        }
-                    }
-                    *published = next;
-                }
                 *schedule.lock().unwrap() = state.snapshot();
-                // Keep only records still retained by runtime history.
-                let retained: BTreeSet<_> = driver.view().task_ids().into_iter().collect();
-                notes.lock().unwrap().retain(|id, _| retained.contains(id));
-                task_id_index
-                    .lock()
-                    .unwrap()
-                    .retain(|id, _| retained.contains(id));
                 if closing && driver.is_idle() {
                     break;
                 }
@@ -180,12 +173,12 @@ impl TaskCenter {
                     _ = driver.tick() => {}
                     command = controls.recv(), if !closing => {
                         match command {
-                            Some(SchedulingCommand::Restore { claims, reply }) => {
-                                state.restored_claims.extend(claims);
+                            Some(SchedulingCommand::RegisterRecovered { tasks, reply }) => {
+                                state.restore(tasks);
                                 let _ = reply.send(());
                             }
-                            Some(SchedulingCommand::Release { task, reply }) => {
-                                state.restored_claims.remove(&task);
+                            Some(SchedulingCommand::CancelInactive { task, reply }) => {
+                                state.cancel_inactive(task);
                                 let _ = reply.send(());
                             }
                             None => {}
@@ -196,16 +189,9 @@ impl TaskCenter {
                             stopping.cancel();
                             continue;
                         };
-                        if let Some(admitted) = state.admit(
-                            submission, &mut driver, closed.load(Ordering::SeqCst), limit,
-                        ) {
-                            if let Some(task) = admitted.task_id {
-                                task_id_index.lock().unwrap().insert(admitted.id, task);
-                            }
-                            notes.lock().unwrap().insert(admitted.id, admitted.conflicts);
-                            *schedule.lock().unwrap() = state.snapshot();
-                            (admitted.publish)();
-                        }
+                        let publish = state.admit(submission, &mut driver, closed.load(Ordering::SeqCst), limit);
+                        *schedule.lock().unwrap() = state.snapshot();
+                        if let Some(publish) = publish { publish(); }
                     }
                 }
             }
@@ -218,8 +204,7 @@ impl TaskCenter {
             execution,
             failure,
             tx,
-            explanations,
-            blockers,
+            registry,
             scheduling,
             stop,
             lifecycle,
@@ -229,7 +214,6 @@ impl TaskCenter {
             scheduling_commands,
             persistence_initialized: Arc::new(tokio::sync::Mutex::new(!needs_initialization)),
             persistence_ready: Arc::new(AtomicBool::new(!needs_initialization)),
-            task_ids,
             recovery: Arc::default(),
         }
     }
@@ -244,7 +228,7 @@ impl TaskCenter {
             self.admission_closed.store(false, Ordering::SeqCst);
             // Lifecycle state is finalized outside the task body. A guard may have
             // observed Loading/Deleting just before that task released its blocker.
-            for id in self.execution.task_ids() {
+            for id in self.execution.execution_ids() {
                 let _ = self.execution.recheck(id);
             }
         }
@@ -274,61 +258,24 @@ impl TaskCenter {
         result
     }
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
-        self.execution
-            .tasks()
-            .into_iter()
-            .map(|execution| {
-                let conflicts = self
-                    .explanations
-                    .lock()
-                    .unwrap()
-                    .get(&execution.id)
-                    .cloned()
-                    .unwrap_or_default();
-                TaskSnapshot {
-                    topology_blockers: self
-                        .blockers
-                        .lock()
-                        .unwrap()
-                        .get(&execution.id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    execution,
-                    conflicts,
-                }
-            })
+        self.registry
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .map(|record| record.snapshot())
             .collect()
     }
-    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
-        Ok(self.observe_task(id)?.snapshot())
+    pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
+        Ok(self.registry.lock().unwrap().get(id)?.snapshot())
     }
-    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
-        Ok(TaskObserver {
-            execution: self.execution.observe_task(id)?,
-            conflicts: self
-                .explanations
-                .lock()
-                .unwrap()
-                .get(&id)
-                .cloned()
-                .unwrap_or_default(),
-            blockers: self.blockers.clone(),
-        })
+    pub fn observe_task(&self, id: TaskId) -> Outcome<TaskObserver> {
+        Ok(self.registry.lock().unwrap().get(id)?.observe())
     }
-    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
-        self.execution.suspend(id)
-    }
-    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
-        self.execution.resume(id)
-    }
-    pub fn recheck(&self, id: WorkflowId) -> Outcome<()> {
-        self.execution.recheck(id)
-    }
-    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
-        self.execution.cancel(id)
-    }
-    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
-        self.execution.wait_suspended(id).await
+    pub fn current_shrink(&self) -> Option<TaskSnapshot> {
+        self.tasks()
+            .into_iter()
+            .find(|task| task.operation.kind == OperationKind::Shrink && !task.status.terminal())
     }
     pub fn scheduling(&self) -> SchedulingSnapshot {
         self.scheduling.lock().unwrap().clone()

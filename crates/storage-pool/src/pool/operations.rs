@@ -8,7 +8,7 @@ impl PoolHandle {
     pub async fn tiers(&self) -> Outcome<Vec<Tier>> {
         Ok(self.metadata.snapshot(&self.id).await?.tiers)
     }
-    pub async fn create_tier(&self, id: TierId) -> Outcome<Run<Tier>> {
+    pub async fn create_tier(&self, id: TierId) -> Outcome<TaskRun<Tier>> {
         self.task_center
             .submit(CreateTierWorkflow {
                 domains: self.domains.clone(),
@@ -16,7 +16,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn delete_tier(&self, id: TierId) -> Outcome<Run<()>> {
+    pub async fn delete_tier(&self, id: TierId) -> Outcome<TaskRun<()>> {
         {
             let registry = self.shared.registry.upgrade().ok_or(Failure::Unavailable)?;
             let _guard = registry.lock().unwrap();
@@ -54,7 +54,7 @@ impl PoolHandle {
         id: NodeId,
         sequence: u64,
         connected: bool,
-    ) -> Outcome<Run<PoolNode>> {
+    ) -> Outcome<TaskRun<PoolNode>> {
         let reservation = self.reserve_node(&id)?;
         self.shared
             .serial
@@ -69,7 +69,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn detach_node(&self, id: NodeId) -> Outcome<Run<()>> {
+    pub async fn detach_node(&self, id: NodeId) -> Outcome<TaskRun<()>> {
         {
             let registry = self.shared.registry.upgrade().ok_or(Failure::Unavailable)?;
             let _guard = registry.lock().unwrap();
@@ -89,7 +89,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn remove_disk(&self, id: DiskId) -> Outcome<Run<()>> {
+    pub async fn remove_disk(&self, id: DiskId) -> Outcome<TaskRun<()>> {
         let spec = {
             let registry = self.shared.registry.upgrade().ok_or(Failure::Unavailable)?;
             let _guard = registry.lock().unwrap();
@@ -117,7 +117,7 @@ impl PoolHandle {
             })
             .await
     }
-    pub async fn delete_volume(&self, id: VolumeId) -> Outcome<Run<()>> {
+    pub async fn delete_volume(&self, id: VolumeId) -> Outcome<TaskRun<()>> {
         let volume = self.metadata.snapshot(&self.id).await?.volume(&id)?;
         let nodes = volume
             .groups
@@ -212,23 +212,22 @@ impl PoolHandle {
     pub fn instance(&self) -> PoolInstanceId {
         self.shared.instance
     }
-    pub fn task_ref(&self, workflow: WorkflowId) -> TaskRef {
+    pub fn task_ref(&self, task: TaskId) -> TaskRef {
         TaskRef {
             pool: self.uuid(),
-            instance: self.instance(),
-            workflow,
+            task,
         }
     }
     pub fn task_by_ref(&self, task: TaskRef) -> Outcome<TaskSnapshot> {
         self.check_task_ref(task)?;
-        self.task(task.workflow)
+        self.task(task.task)
     }
     pub fn observe_task_by_ref(&self, task: TaskRef) -> Outcome<TaskObserver> {
         self.check_task_ref(task)?;
-        self.observe_task(task.workflow)
+        self.observe_task(task.task)
     }
     pub(crate) fn check_task_ref(&self, task: TaskRef) -> Outcome<()> {
-        if task.pool != self.uuid() || task.instance != self.instance() {
+        if task.pool != self.uuid() {
             Err(reject("stale or wrong pool task reference"))
         } else {
             Ok(())
@@ -238,7 +237,7 @@ impl PoolHandle {
         &self,
         name: PoolName,
         expected_revision: u64,
-    ) -> Outcome<Run<PoolDescriptor>> {
+    ) -> Outcome<TaskRun<PoolDescriptor>> {
         self.task_center
             .submit(RenamePoolWorkflow {
                 client: self.admin.clone(),
@@ -268,7 +267,7 @@ impl PoolHandle {
         };
         result
     }
-    pub async fn add_disk(&self, spec: DiskSpec) -> Outcome<Run<MemberDisk>> {
+    pub async fn add_disk(&self, spec: DiskSpec) -> Outcome<TaskRun<MemberDisk>> {
         let reservation = self.reserve_disk(&spec)?;
         self.task_center
             .submit(OnlineDiskWorkflow {
@@ -379,7 +378,7 @@ impl PoolHandle {
             .versions
             .insert(event.key(), (event.clone(), receipt.clone()));
         let reply = decision.clone();
-        let callback = move |result: Outcome<Run<PoolNode>>| {
+        let callback = move |result: Outcome<TaskRun<PoolNode>>| {
             reply.send_replace(match result {
                 Ok(run) => EventDecision::Accepted(run.control),
                 Err(error) => EventDecision::Rejected(error),
@@ -452,10 +451,7 @@ impl PoolHandle {
         receipt
     }
 }
-fn reply_disk(
-    sender: &watch::Sender<EventDecision>,
-    result: Outcome<workflow_foundation::RunControl>,
-) {
+fn reply_disk(sender: &watch::Sender<EventDecision>, result: Outcome<TaskControl>) {
     sender.send_replace(match result {
         Ok(control) => EventDecision::Accepted(control),
         Err(error) => EventDecision::Rejected(error),

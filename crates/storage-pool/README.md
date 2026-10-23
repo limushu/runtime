@@ -59,11 +59,11 @@ pool.resume(id)?;
 pool.cancel(id)?;
 ```
 
-Task 是完整 Workflow 执行，不是 Activity。重复业务目标在途时拒绝，不产生第二个 Run。
+Task 是逻辑任务，包含当前或多次 Workflow 执行；Activity 是执行中的步骤。重复业务目标在途时拒绝。
 取消是请求，最终状态要观察；不可中断提交成功可以胜过并发取消。
 
 conflicts 字段提供准入时的已有任务 ID、决定、原因；scheduling() 提供业务队列计数，
-execution() 提供 Runtime 执行计数。ID 只在当前 Pool 实例内唯一。
+execution() 提供 Runtime 执行计数。TaskRun.id() 返回稳定 TaskId，execution_id() 才是本地执行序号。纯内存任务同样可按 TaskId 查询和控制。
 普通历史按 Config::task_history 有界保留，Uncertain 保留；observer 不因历史淘汰失效。
 原有暂停在当前进程安全边界生效，并保留对象占用；纯内存模式不支持切换续办。
 

@@ -8,6 +8,7 @@ use std::{
     },
     time::Duration,
 };
+use storage_pool::TaskRun;
 use storage_pool::{
     task_center::{TaskCenter, persistence::*},
     *,
@@ -267,7 +268,7 @@ impl Fixture {
             conditions,
         }
     }
-    async fn topology(&self, key: &str, uncertain: bool) -> Run<()> {
+    async fn topology(&self, key: &str, uncertain: bool) -> TaskRun<()> {
         bounded(self.center.submit_topology(Topo {
             key: key.into(),
             started: self.started.clone(),
@@ -284,11 +285,11 @@ impl Fixture {
     async fn entered(&mut self, id: WorkflowId) {
         assert_eq!(bounded(self.topo.recv()).await, Some(id));
     }
-    async fn finish_topo(&mut self, run: &mut Run<()>) -> Outcome<()> {
+    async fn finish_topo(&mut self, run: &mut TaskRun<()>) -> Outcome<()> {
         run.control.signal(Signal::new("finish", "")).await.unwrap();
         bounded(run.result()).await
     }
-    async fn finish_shrink(&mut self, run: &mut Run<()>, start: Call) {
+    async fn finish_shrink(&mut self, run: &mut TaskRun<()>, start: Call) {
         start.reply.send(Ok(())).unwrap();
         self.call(Command::Finalize)
             .await
@@ -297,7 +298,7 @@ impl Fixture {
             .unwrap();
         bounded(run.result()).await.unwrap();
     }
-    async fn cancel_shrink(&mut self, run: &mut Run<()>, start: Call) {
+    async fn cancel_shrink(&mut self, run: &mut TaskRun<()>, start: Call) {
         run.control.cancel();
         self.call(Command::Cancel).await.reply.send(Ok(())).unwrap();
         start.reply.send(Err(Failure::Cancelled)).unwrap();
@@ -307,7 +308,7 @@ impl Fixture {
         bounded(self.center.shutdown()).await.unwrap();
     }
 }
-async fn state(run: &Run<()>, expected: impl Fn(&RunState) -> bool) {
+async fn state(run: &TaskRun<()>, expected: impl Fn(&RunState) -> bool) {
     let mut control = run.control.clone();
     bounded(async {
         while !expected(&control.state()) {
@@ -341,9 +342,15 @@ async fn topology_waits_for_real_pause_then_all_blockers_and_conditions_before_s
         bounded(f.topo.recv()).await.unwrap(),
     ];
     entered.sort();
-    assert_eq!(entered, vec![t1.id(), t2.id()]);
+    assert_eq!(entered, vec![t1.execution_id(), t2.execution_id()]);
     assert_eq!(
-        f.center.task(shrink.id()).unwrap().topology_blockers,
+        f.center
+            .task(shrink.id())
+            .unwrap()
+            .waits
+            .iter()
+            .map(|w| w.task)
+            .collect::<Vec<_>>(),
         vec![t1.id(), t2.id()]
     );
     assert_eq!(
@@ -351,7 +358,7 @@ async fn topology_waits_for_real_pause_then_all_blockers_and_conditions_before_s
         ActivityState::Paused
     );
     f.center.flush_history().await.unwrap();
-    let persistent_id = f.center.persistent_task_id(shrink.id()).unwrap();
+    let persistent_id = shrink.id();
     let paused = f.center.task_detail(persistent_id).await.unwrap();
     assert!(paused.system_pause_requested);
     assert!(!paused.pause_requested);
@@ -367,7 +374,7 @@ async fn topology_waits_for_real_pause_then_all_blockers_and_conditions_before_s
     state(&shrink, |s| matches!(s, RunState::WaitingConditions(_))).await;
     assert!(f.calls.try_recv().is_err());
     f.center.flush_history().await.unwrap();
-    let id = f.center.persistent_task_id(shrink.id()).unwrap();
+    let id = shrink.id();
     assert_eq!(
         f.center.task_detail(id).await.unwrap().status,
         TaskStatus::WaitingConditions
@@ -407,7 +414,7 @@ async fn no_hook_waits_for_completion_and_does_not_dispatch_the_next_step() {
     assert!(f.calls.try_recv().is_err());
     assert!(f.topo.try_recv().is_err());
     start.reply.send(Ok(())).unwrap();
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     assert_eq!(shrink.control.state(), RunState::Paused);
     assert!(f.calls.try_recv().is_err());
     f.finish_topo(&mut topo).await.unwrap();
@@ -429,7 +436,7 @@ async fn topology_release_never_clears_a_user_pause() {
     f.call(Command::Pause).await.reply.send(Ok(())).unwrap();
     bounded(shrink.control.wait_paused()).await.unwrap();
     let mut topo = f.topology("other", false).await;
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     f.finish_topo(&mut topo).await.unwrap();
     // Wait for the actor to consume terminal topo and publish a new scheduling snapshot.
     bounded(async {
@@ -458,7 +465,7 @@ async fn new_topology_during_resume_waits_for_a_new_pause_ack() {
     let start = f.call(Command::Start).await;
     let mut t1 = f.topology("other", false).await;
     f.call(Command::Pause).await.reply.send(Ok(())).unwrap();
-    f.entered(t1.id()).await;
+    f.entered(t1.execution_id()).await;
     f.finish_topo(&mut t1).await.unwrap();
     let resume = f.call(Command::Resume).await;
     let mut t2 = f.topology("another", false).await;
@@ -467,7 +474,7 @@ async fn new_topology_during_resume_waits_for_a_new_pause_ack() {
     let pause = f.call(Command::Pause).await;
     assert!(f.topo.try_recv().is_err());
     pause.reply.send(Ok(())).unwrap();
-    f.entered(t2.id()).await;
+    f.entered(t2.execution_id()).await;
     f.finish_topo(&mut t2).await.unwrap();
     f.call(Command::Resume).await.reply.send(Ok(())).unwrap();
     f.finish_shrink(&mut shrink, start).await;
@@ -475,36 +482,41 @@ async fn new_topology_during_resume_waits_for_a_new_pause_ack() {
 }
 
 #[tokio::test]
-async fn first_start_waits_for_topology_and_conditions_and_second_shrink_keeps_its_order() {
+async fn first_start_waits_for_topology_and_conditions_and_rejects_second_shrink() {
     let mut f = Fixture::new().await;
     let mut topo = f.topology("other", false).await;
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     let conditions = Conditions::new(false);
     let mut s1 = f
         .center
         .submit_shrink(f.work("j1", true, conditions.clone()))
         .await
         .unwrap();
-    let mut s2 = f
-        .center
-        .submit_shrink(f.work("j2", true, Conditions::new(true)))
-        .await
-        .unwrap();
+    assert!(matches!(
+        f.center
+            .submit_shrink(f.work("j2", true, Conditions::new(true)))
+            .await,
+        Err(Failure::Rejected(_))
+    ));
+    assert_eq!(f.center.current_shrink().unwrap().id, s1.id());
     assert!(f.calls.try_recv().is_err());
     f.finish_topo(&mut topo).await.unwrap();
     state(&s1, |s| matches!(s, RunState::WaitingConditions(_))).await;
-    assert_eq!(s2.control.state(), RunState::WaitingObjects);
     conditions.set(true);
     f.center.recheck(s1.id()).unwrap();
     let first = f.call(Command::Start).await;
     assert_eq!(first.job, "j1");
     let mut t2 = f.topology("third", false).await;
     f.call(Command::Pause).await.reply.send(Ok(())).unwrap();
-    f.entered(t2.id()).await;
-    assert_eq!(s2.control.state(), RunState::WaitingObjects);
+    f.entered(t2.execution_id()).await;
     f.finish_topo(&mut t2).await.unwrap();
     f.call(Command::Resume).await.reply.send(Ok(())).unwrap();
     f.finish_shrink(&mut s1, first).await;
+    let mut s2 = f
+        .center
+        .submit_shrink(f.work("j2", true, Conditions::new(true)))
+        .await
+        .unwrap();
     let second = f.call(Command::Start).await;
     assert_eq!(second.job, "j2");
     f.finish_shrink(&mut s2, second).await;
@@ -522,7 +534,7 @@ async fn uncertain_topology_keeps_shrink_suspended_but_cancel_still_works() {
     let start = f.call(Command::Start).await;
     let mut topo = f.topology("other", true).await;
     f.call(Command::Pause).await.reply.send(Ok(())).unwrap();
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     assert!(matches!(
         f.finish_topo(&mut topo).await,
         Err(Failure::Uncertain(_))
@@ -577,7 +589,7 @@ async fn completion_racing_pause_does_not_advance_past_the_gate() {
     start.reply.send(Ok(())).unwrap();
     assert!(f.topo.try_recv().is_err());
     pause.reply.send(Ok(())).unwrap();
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     assert!(f.calls.try_recv().is_err());
     f.finish_topo(&mut topo).await.unwrap();
     f.call(Command::Finalize).await.reply.send(Ok(())).unwrap();
@@ -602,8 +614,8 @@ async fn recoverable_shrink_restores_pool_wide_slot_and_rechecks_before_starting
         )
         .await
         .unwrap();
-    let id = run.task_id;
-    state(&run.run, |s| matches!(s, RunState::WaitingConditions(_))).await;
+    let id = run.id();
+    state(&run, |s| matches!(s, RunState::WaitingConditions(_))).await;
     bounded(f.center.shutdown()).await.unwrap();
     let pool = f.pool;
     let store = f.store.clone();
@@ -634,7 +646,7 @@ async fn recoverable_shrink_restores_pool_wide_slot_and_rechecks_before_starting
             }
         })
         .unwrap();
-    let workflow = next.center.retry_task(id).await.unwrap();
+    next.center.retry_task(id).await.unwrap();
     let start = next.call(Command::Start).await;
     start.reply.send(Ok(())).unwrap();
     next.call(Command::Finalize)
@@ -642,9 +654,9 @@ async fn recoverable_shrink_restores_pool_wide_slot_and_rechecks_before_starting
         .reply
         .send(Ok(()))
         .unwrap();
-    let mut observer = next.center.observe_task(workflow).unwrap();
+    let mut observer = next.center.observe_task(id).unwrap();
     bounded(async {
-        while observer.snapshot().state != RunState::Completed {
+        while observer.snapshot().execution.as_ref().unwrap().state != RunState::Completed {
             observer.changed().await.unwrap();
         }
     })
@@ -673,7 +685,7 @@ async fn coalesced_resume_and_pause_reacknowledges_the_still_paused_job() {
     shrink.control.resume().unwrap();
     shrink.control.pause().unwrap();
     let mut topo = f.topology("other", false).await;
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     assert!(f.calls.try_recv().is_err());
     f.finish_topo(&mut topo).await.unwrap();
     shrink.control.resume().unwrap();
@@ -702,7 +714,7 @@ async fn cancelling_a_paused_job_revokes_ack_until_cancel_and_work_have_settled(
     assert!(f.topo.try_recv().is_err());
     start.reply.send(Err(Failure::Cancelled)).unwrap();
     assert_eq!(bounded(shrink.result()).await, Err(Failure::Cancelled));
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     f.finish_topo(&mut topo).await.unwrap();
     f.close().await;
 }
@@ -740,12 +752,12 @@ async fn new_topology_invalidates_a_continuation_check_in_flight() {
     let start = f.call(Command::Start).await;
     let mut t1 = f.topology("other", false).await;
     f.call(Command::Pause).await.reply.send(Ok(())).unwrap();
-    f.entered(t1.id()).await;
+    f.entered(t1.execution_id()).await;
     guard.gated.store(true, Ordering::SeqCst);
     f.finish_topo(&mut t1).await.unwrap();
     let old_check = bounded(rx.recv()).await.unwrap();
     let mut t2 = f.topology("another", false).await;
-    f.entered(t2.id()).await;
+    f.entered(t2.execution_id()).await;
     assert!(old_check.send(Ok(ContinueDecision::Ready)).is_err());
     assert!(f.calls.try_recv().is_err());
     f.finish_topo(&mut t2).await.unwrap();
@@ -774,15 +786,13 @@ async fn uncertain_cancel_does_not_release_the_shrink_slot_as_a_known_cancellati
         bounded(shrink.result()).await,
         Err(Failure::Uncertain(_))
     ));
-    let mut next = f
-        .center
-        .submit_shrink(f.work("j2", true, Conditions::new(true)))
-        .await
-        .unwrap();
     assert!(matches!(
-        bounded(next.result()).await,
+        f.center
+            .submit_shrink(f.work("j2", true, Conditions::new(true)))
+            .await,
         Err(Failure::Rejected(_))
     ));
+    assert_eq!(f.center.current_shrink().unwrap().id, shrink.id());
     assert!(f.calls.try_recv().is_err());
     f.close().await;
 }
@@ -897,7 +907,7 @@ async fn service_shutdown_invalidates_its_activity_pause_ack_before_topology_can
     assert!(f.topo.try_recv().is_err());
     start.reply.send(Err(Failure::Cancelled)).unwrap();
     assert_eq!(bounded(shrink.result()).await, Err(Failure::Cancelled));
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     f.finish_topo(&mut topo).await.unwrap();
     bounded(shutdown).await.unwrap().unwrap();
     f.close().await;
@@ -925,7 +935,7 @@ async fn known_pause_rejection_waits_for_cleanup_then_releases_without_an_uncert
     assert!(f.topo.try_recv().is_err());
     start.reply.send(Err(Failure::Cancelled)).unwrap();
     assert_eq!(bounded(shrink.result()).await, Err(error));
-    f.entered(topo.id()).await;
+    f.entered(topo.execution_id()).await;
     assert_eq!(f.center.scheduling().fenced, 0);
     f.finish_topo(&mut topo).await.unwrap();
     f.close().await;

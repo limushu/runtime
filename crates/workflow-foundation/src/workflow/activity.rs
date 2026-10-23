@@ -1,7 +1,7 @@
 //! In-flight control state machine. The service owns cancellation and real settlement;
 //! this executor owns pause acknowledgements and the next-step gate.
 use super::*;
-use crate::{control::pause_result, tasks::ActivityReporter};
+use crate::{control::pause_result, observation::ActivityReporter};
 use std::future::Future;
 
 enum Phase {

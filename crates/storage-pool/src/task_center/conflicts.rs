@@ -1,5 +1,4 @@
-//! The single business-conflict entry point. No selectors, priorities or plugin policies.
-//! Add a concrete match arm here and a scenario test alongside it.
+//! Pool business rules. The scheduler only interprets the returned decisions.
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,7 +6,7 @@ pub enum ConflictDecision {
     Independent,
     Wait,
     CancelThenWait,
-    /// Admit only after the existing shrink has actually acknowledged suspension.
+    /// Wait for safe suspension, retaining that suspension until the requester finishes.
     SuspendThenWait,
     Reject(&'static str),
 }
@@ -17,7 +16,7 @@ pub struct Conflict {
     pub reason: &'static str,
 }
 impl Conflict {
-    fn new(decision: ConflictDecision, reason: &'static str) -> Self {
+    pub fn new(decision: ConflictDecision, reason: &'static str) -> Self {
         Self { decision, reason }
     }
 }
@@ -67,15 +66,22 @@ impl OperationKind {
         }
     }
 }
-impl TaskCenter {
-    /// Read top to bottom: object relation, freshness, duplicates, named business cases.
-    /// Pure inspection; the actor applies decisions only after ALL conflicts are checked.
-    pub fn conflict(incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
+pub trait TaskRules: Send + Sync {
+    fn conflict(&self, incoming: &PoolOperation, existing: &PoolOperation) -> Conflict;
+}
+#[derive(Default)]
+pub struct PoolRules;
+impl TaskRules for PoolRules {
+    /// Inspect every rule before the scheduler changes any existing task.
+    fn conflict(&self, incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
         use ConflictDecision::*;
         use OperationKind::*;
         // Pool-wide rules precede disjoint-object and duplicate detection.
         if incoming.kind == Shrink && existing.kind == Shrink {
-            return Conflict::new(Wait, "one-shrink-per-pool");
+            return Conflict::new(
+                Reject("one unfinished shrink per pool"),
+                "one-shrink-per-pool",
+            );
         }
         if incoming.kind == Shrink && existing.kind.is_topology() {
             return Conflict::new(Wait, "shrink-waits-topology");
@@ -100,7 +106,7 @@ impl TaskCenter {
         }
         if incoming.kind == existing.kind {
             return Conflict::new(
-                Reject("equivalent operation already in flight; observe its original Run"),
+                Reject("equivalent operation already in flight; observe its original TaskRun"),
                 "duplicate",
             );
         }

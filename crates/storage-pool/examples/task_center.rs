@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let online = operation(OperationKind::OnlineDisk(disk.clone()));
     let offline = operation(OperationKind::OfflineDisk(disk.clone()));
-    let decision = TaskCenter::conflict(&offline, &online);
+    let decision = PoolRules.conflict(&offline, &online);
     assert_eq!(decision.decision, ConflictDecision::CancelThenWait);
     println!("disk offline versus online: {decision:?}");
     // Extend business rules in task_center/conflicts.rs, not by implementing a policy.

@@ -42,9 +42,10 @@ Workflow：按顺序调用 Activity
 4. `domains/balance/runtime.rs`：领域 job 的进度、Pause/Resume/Cancel 适配。
 5. `metadata/kv.rs`：接入自己的 KV；`repository.rs` 和 `state.rs`：编码与统一业务约束。
 
-TaskCenter 的其他文件分别是 `operation.rs`（分类与对象声明）、`observation.rs`（只读视图）、
-`submission.rs`（提交与可选审计绑定）、`recovery.rs`（自动重建及稳定 TaskId 控制）、
-`persistence/`（存储与审计）。`mod.rs` 保留唯一事件循环；它调用同步的 `State::admit`，
+TaskCenter 的 `model.rs` 定义不依赖数据库的 TaskId，`registry.rs` 管理全部逻辑任务，
+`run.rs` 提供 TaskRun/TaskControl。Driver 内部只持有 ExecutionRegistry。其他文件分别是 `operation.rs`（分类与对象声明）、`observation.rs`（只读视图）、
+`submission.rs`（提交与可选审计绑定）、`control.rs`（稳定 TaskId 控制）、`recovery.rs`（自动重建）、
+`persistence/`（存储与审计）。`mod.rs` 保留唯一事件循环；它调用同步的 `State::admit`；规则在 PoolRules，等待及唤醒在通用 scheduler，
 事件循环不执行数据库 IO，也不包含泛型工作流及持久化绑定的构造细节。
 
 Pool 的 `membership.rs` 封装领域变化后的目录更新；`operations.rs`、`lifecycle.rs`、`shrink_disk.rs`

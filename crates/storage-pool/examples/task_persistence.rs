@@ -129,7 +129,7 @@ async fn main() -> Outcome<()> {
             },
         )
         .await?;
-    let id = task.task_id;
+    let id = task.id();
     started.acquire().await.map_err(codec)?.forget();
     old.suspend_task(id).await?;
     release.add_permits(1);
@@ -180,13 +180,14 @@ async fn main() -> Outcome<()> {
         }
     })?;
     let report = new.recover_tasks().await?;
-    new.wait_suspended(report.executions[&id]).await?;
+    println!("recovery: {report:?}");
+    new.wait_suspended(id).await?;
     new.flush_history().await?;
     assert_eq!(new.task_detail(id).await?.status, TaskStatus::Paused);
-    let execution = new.resume_task(id).await?;
-    let mut observer = new.observe_task(execution)?;
+    new.resume_task(id).await?;
+    let mut observer = new.observe_task(id)?;
     while !matches!(
-        observer.snapshot().state,
+        observer.snapshot().execution.as_ref().unwrap().state,
         RunState::Completed | RunState::Failed(_)
     ) {
         observer.changed().await?;

@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use storage_pool::TaskRun;
 use storage_pool::{adapters::*, domains::balance::*, ports::*, task_center::persistence::*, *};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -13,7 +14,7 @@ const LIMIT: Duration = Duration::from_secs(5);
 async fn bounded<T>(f: impl Future<Output = T>) -> T {
     tokio::time::timeout(LIMIT, f).await.expect("timed out")
 }
-async fn done<T>(mut run: Run<T>) -> Outcome<T> {
+async fn done<T>(mut run: TaskRun<T>) -> Outcome<T> {
     bounded(run.result()).await
 }
 fn disk(s: &str) -> DiskId {
@@ -116,34 +117,40 @@ async fn add(pool: &PoolHandle, index: usize) {
     .await
     .unwrap();
 }
-async fn migrating(pool: &PoolHandle, id: WorkflowId, minimum: u64) {
+async fn migrating(pool: &PoolHandle, id: TaskId, minimum: u64) {
     let mut observer = pool.observe_task(id).unwrap();
     bounded(async {
         loop {
             let task = observer.snapshot();
             if task
+                .execution
+                .as_ref()
+                .unwrap()
                 .progress
                 .stage
                 .as_ref()
                 .is_some_and(|s| s.starts_with("evacuating "))
-                && task.progress.completed >= minimum
+                && task.execution.as_ref().unwrap().progress.completed >= minimum
             {
                 break;
             }
             assert!(
-                !matches!(task.state, RunState::Completed | RunState::Failed(_)),
+                !matches!(
+                    task.execution.as_ref().unwrap().state,
+                    RunState::Completed | RunState::Failed(_)
+                ),
                 "ended before migration: {:?}",
-                task.state
+                task.execution.as_ref().unwrap().state
             );
             observer.changed().await.unwrap();
         }
     })
     .await;
 }
-async fn wait_state(pool: &PoolHandle, id: WorkflowId, predicate: impl Fn(&RunState) -> bool) {
+async fn wait_state(pool: &PoolHandle, id: TaskId, predicate: impl Fn(&RunState) -> bool) {
     let mut observer = pool.observe_task(id).unwrap();
     bounded(async {
-        while !predicate(&observer.snapshot().state) {
+        while !predicate(&observer.snapshot().execution.as_ref().unwrap().state) {
             observer.changed().await.unwrap();
         }
     })
@@ -182,7 +189,15 @@ async fn complete_workflow_commits_real_remaps_verifies_projections_and_retains_
     }
     assert_eq!(f.balancer.jobs_started(), 1);
     let task = f.pool.task(id).unwrap();
-    let names: Vec<_> = task.activities.entries.iter().map(|a| a.name).collect();
+    let names: Vec<_> = task
+        .execution
+        .as_ref()
+        .unwrap()
+        .activities
+        .entries
+        .iter()
+        .map(|a| a.name)
+        .collect();
     assert_eq!(
         names,
         [
@@ -196,7 +211,10 @@ async fn complete_workflow_commits_real_remaps_verifies_projections_and_retains_
         ]
     );
     assert!(
-        task.activities
+        task.execution
+            .as_ref()
+            .unwrap()
+            .activities
             .entries
             .iter()
             .all(|a| a.state == ActivityState::Completed)
@@ -258,7 +276,8 @@ async fn cancellation_stops_the_job_preserves_remaps_and_requires_explicit_inten
     let f = Fixture::new(4, true, None).await;
     let mut run = f.pool.shrink_disk(disk("d1")).await.unwrap();
     migrating(&f.pool, run.id(), 1).await;
-    f.pool.suspend(run.id()).unwrap();
+    assert_eq!(f.pool.current_shrink().unwrap().id, run.id());
+    f.pool.suspend_shrink().await.unwrap();
     bounded(f.pool.wait_suspended(run.id())).await.unwrap();
     let job = f.pool.disk(disk("d1")).await.unwrap().shrink.unwrap();
     let before = f
@@ -273,8 +292,9 @@ async fn cancellation_stops_the_job_preserves_remaps_and_requires_explicit_inten
         .allocated
         .len();
     assert!(before > 0 && before < 4);
-    f.pool.cancel(run.id()).unwrap();
+    f.pool.cancel_shrink().await.unwrap();
     assert_eq!(bounded(run.result()).await, Err(Failure::Cancelled));
+    assert!(f.pool.current_shrink().is_none());
     let cancelled = f.balancer.find(f.pool.id(), job).await.unwrap().unwrap();
     assert_eq!(
         cancelled.progress().borrow().state,
@@ -326,7 +346,7 @@ async fn handoff(user_paused: bool, source_connected: bool) {
     let f = Fixture::new(4, true, Some(tasks.clone())).await;
     let mut run = f.pool.shrink_disk(disk("d1")).await.unwrap();
     migrating(&f.pool, run.id(), 1).await;
-    let task_id = f.pool.persistent_task_id(run.id()).unwrap();
+    let task_id = run.id();
     if user_paused {
         f.pool.suspend_task(task_id).await.unwrap();
         bounded(f.pool.wait_suspended(run.id())).await.unwrap();
@@ -336,6 +356,7 @@ async fn handoff(user_paused: bool, source_connected: bool) {
     let job = f.pool.disk(disk("d1")).await.unwrap().shrink.unwrap();
     bounded(f.manager.shutdown()).await.unwrap();
     assert_eq!(bounded(run.result()).await, Err(Failure::Cancelled));
+    assert!(f.pool.current_shrink().is_none());
     let job_handle = f.balancer.find(&pool_id, job).await.unwrap().unwrap();
     assert_eq!(
         job_handle.progress().borrow().state,
@@ -370,8 +391,13 @@ async fn handoff(user_paused: bool, source_connected: bool) {
     let report = pool.recovery_report().unwrap();
     assert!(report.blocked.is_empty());
     let execution = report.executions[&task_id];
+    // Logical references survive host replacement; local execution handles do not.
+    assert_eq!(
+        pool.task_by_ref(f.pool.task_ref(task_id)).unwrap().id,
+        task_id
+    );
     if user_paused {
-        bounded(pool.wait_suspended(execution)).await.unwrap();
+        bounded(pool.wait_suspended(task_id)).await.unwrap();
         pool.flush_task_history().await.unwrap();
         assert_eq!(
             pool.task_detail(task_id).await.unwrap().status,
@@ -381,10 +407,11 @@ async fn handoff(user_paused: bool, source_connected: bool) {
             job_handle.progress().borrow().state,
             EvacuationState::Paused
         );
-        assert_eq!(pool.resume_task(task_id).await.unwrap(), execution);
+        pool.resume_task(task_id).await.unwrap();
+        assert_eq!(pool.task(task_id).unwrap().execution.unwrap().id, execution);
     }
     if !source_connected {
-        wait_state(&pool, execution, |s| {
+        wait_state(&pool, task_id, |s| {
             matches!(s, RunState::WaitingConditions(_))
         })
         .await;
@@ -405,11 +432,19 @@ async fn handoff(user_paused: bool, source_connected: bool) {
         .unwrap();
     }
     assert!(pool.takeover(vec![]).await.is_err());
-    wait_state(&pool, execution, |s| {
+    wait_state(&pool, task_id, |s| {
         matches!(s, RunState::Completed | RunState::Failed(_))
     })
     .await;
-    assert_eq!(pool.task(execution).unwrap().state, RunState::Completed);
+    assert_eq!(
+        pool.task(task_id)
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .state,
+        RunState::Completed
+    );
     pool.flush_task_history().await.unwrap();
     let record = pool.task_detail(task_id).await.unwrap();
     assert_eq!(record.status, TaskStatus::Completed);
@@ -432,7 +467,7 @@ async fn takeover_requires_complete_topology_and_continues_after_the_waiter_is_d
         matches!(s, RunState::WaitingConditions(_))
     })
     .await;
-    let id = f.pool.persistent_task_id(shrink.id()).unwrap();
+    let id = shrink.id();
     let descriptor = f.pool.descriptor();
     f.manager.shutdown().await.unwrap();
     assert_eq!(bounded(shrink.result()).await, Err(Failure::Cancelled));
@@ -471,10 +506,7 @@ async fn takeover_requires_complete_topology_and_continues_after_the_waiter_is_d
     .await;
     let report = pool.recovery_report().unwrap();
     assert!(report.blocked.is_empty());
-    wait_state(&pool, report.executions[&id], |s| {
-        matches!(s, RunState::WaitingConditions(_))
-    })
-    .await;
+    wait_state(&pool, id, |s| matches!(s, RunState::WaitingConditions(_))).await;
     pool.flush_task_history().await.unwrap();
     assert_eq!(pool.task_detail(id).await.unwrap().executions.len(), 2);
     assert_eq!(f.balancer.jobs_started(), 0);
@@ -482,7 +514,7 @@ async fn takeover_requires_complete_topology_and_continues_after_the_waiter_is_d
 }
 
 #[tokio::test]
-async fn takeover_reconstructs_queued_shrinks_before_releasing_their_restored_claims() {
+async fn takeover_retains_the_single_shrink_slot_and_rechecks_conditions() {
     let tasks = Arc::new(MemoryTaskStore::default());
     let f = Fixture::new(1, false, Some(tasks.clone())).await;
     let first = f.pool.shrink_disk(disk("d1")).await.unwrap();
@@ -490,9 +522,8 @@ async fn takeover_reconstructs_queued_shrinks_before_releasing_their_restored_cl
         matches!(s, RunState::WaitingConditions(_))
     })
     .await;
-    let second = f.pool.shrink_disk(disk("d2")).await.unwrap();
-    let first_id = f.pool.persistent_task_id(first.id()).unwrap();
-    let second_id = f.pool.persistent_task_id(second.id()).unwrap();
+    assert!(f.pool.shrink_disk(disk("d2")).await.is_err());
+    let first_id = first.id();
     let descriptor = f.pool.descriptor();
     f.manager.shutdown().await.unwrap();
     let manager = PoolManager::new(
@@ -517,20 +548,13 @@ async fn takeover_reconstructs_queued_shrinks_before_releasing_their_restored_cl
         .unwrap();
     let report = pool.recovery_report().unwrap();
     assert!(report.blocked.is_empty());
-    assert_eq!(report.executions.len(), 2);
-    // Both were waiting for a third disk. It is attached only after recovery;
-    // topology must still bypass/suspend the restored shrink queue safely.
+    assert_eq!(report.executions.len(), 1);
+    assert_eq!(pool.current_shrink().unwrap().id, first_id);
+    assert!(pool.shrink_disk(disk("d2")).await.is_err());
+    // A newly attached disk wakes the recovered shrink after topology settles.
     add(&pool, 3).await;
-    wait_state(&pool, report.executions[&first_id], |s| {
-        matches!(s, RunState::Completed)
-    })
-    .await;
-    wait_state(&pool, report.executions[&second_id], |s| {
-        matches!(s, RunState::WaitingConditions(_))
-    })
-    .await;
+    wait_state(&pool, first_id, |s| matches!(s, RunState::Completed)).await;
     assert_eq!(f.balancer.jobs_started(), 1);
-    pool.cancel_task(second_id).await.unwrap();
     manager.shutdown().await.unwrap();
 }
 
@@ -705,9 +729,20 @@ async fn real_topology_work_pauses_the_same_evacuation_activity_and_job_until_co
     *plane.load.lock().unwrap() = Some(gate.clone());
     let mut topo = pool.load_node(node("n2")).await.unwrap();
     gate.wait().await;
-    assert_eq!(pool.task(shrink.id()).unwrap().state, RunState::Paused);
+    assert_eq!(
+        pool.task(shrink.id())
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .state,
+        RunState::Paused
+    );
     let activity = pool
         .task(shrink.id())
+        .unwrap()
+        .execution
+        .as_ref()
         .unwrap()
         .activities
         .entries
@@ -727,6 +762,9 @@ async fn real_topology_work_pauses_the_same_evacuation_activity_and_job_until_co
     assert_eq!(f.balancer.jobs_started(), 1);
     assert_eq!(
         pool.task(shrink.id())
+            .unwrap()
+            .execution
+            .as_ref()
             .unwrap()
             .activities
             .entries
@@ -832,7 +870,7 @@ async fn unconfirmed_removed_commit_retains_the_member_and_fences_conflicting_to
     assert_eq!(source.membership, DiskMembership::Member);
     assert_eq!(source.io, IoState::Down);
     assert!(matches!(
-        done(pool.load_node(node("n2")).await.unwrap()).await,
+        pool.load_node(node("n2")).await,
         Err(Failure::Rejected(_))
     ));
     manager.shutdown().await.unwrap();

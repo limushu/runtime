@@ -1,11 +1,13 @@
-use crate::task_center::PersistentRun;
 use crate::task_center::persistence::*;
-use crate::{Outcome, PoolHandle, Run, WorkflowId};
+use crate::{Outcome, PoolHandle, TaskRun, WorkflowId};
 use std::future::Future;
 use workflow_foundation::Workflow;
 
 impl PoolHandle {
-    pub async fn submit_shrink_task<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+    pub async fn submit_shrink_task<W: Workflow>(
+        &self,
+        workflow: W,
+    ) -> Outcome<TaskRun<W::Output>> {
         self.descriptor().active()?;
         self.task_center.submit_shrink(workflow).await
     }
@@ -13,7 +15,7 @@ impl PoolHandle {
         &self,
         workflow: W,
         resume: ResumeSpec,
-    ) -> Outcome<PersistentRun<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         self.descriptor().active()?;
         self.task_center
             .submit_resumable_shrink(workflow, resume)
@@ -24,7 +26,7 @@ impl PoolHandle {
         &self,
         workflow: W,
         resume: ResumeSpec,
-    ) -> Outcome<PersistentRun<W::Output>> {
+    ) -> Outcome<TaskRun<W::Output>> {
         self.descriptor().active()?;
         self.task_center.submit_resumable(workflow, resume).await
     }
@@ -44,9 +46,6 @@ impl PoolHandle {
     pub async fn close_task_store(&self) -> Outcome<()> {
         self.task_center.close_task_store().await
     }
-    pub fn persistent_task_id(&self, workflow: WorkflowId) -> Outcome<TaskId> {
-        self.task_center.persistent_task_id(workflow)
-    }
     pub async fn task_history(&self, query: TaskQuery) -> Outcome<TaskPage> {
         self.task_center.task_history(query).await
     }
@@ -63,16 +62,6 @@ impl PoolHandle {
     pub async fn retry_task(&self, id: TaskId) -> Outcome<WorkflowId> {
         self.descriptor().active()?;
         self.task_center.retry_task(id).await
-    }
-    pub async fn suspend_task(&self, id: TaskId) -> Outcome<()> {
-        self.task_center.suspend_task(id).await
-    }
-    pub async fn resume_task(&self, id: TaskId) -> Outcome<WorkflowId> {
-        self.descriptor().active()?;
-        self.task_center.resume_task(id).await
-    }
-    pub async fn cancel_task(&self, id: TaskId) -> Outcome<()> {
-        self.task_center.cancel_task(id).await
     }
 }
 

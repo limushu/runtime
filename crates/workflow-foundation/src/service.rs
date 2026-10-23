@@ -37,7 +37,13 @@ pub struct ActivityContext {
 impl ActivityContext {
     /// Forward observed domain-job progress while the same Activity remains pending.
     pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
-        crate::tasks::report_progress(&self.progress, &self.audit, stage.into(), completed, total);
+        crate::observation::report_progress(
+            &self.progress,
+            &self.audit,
+            stage.into(),
+            completed,
+            total,
+        );
     }
     /// Optional capability for THIS invocation. Without it, pauses wait for step completion.
     /// Register once, before starting the external job. Hooks must tolerate completion

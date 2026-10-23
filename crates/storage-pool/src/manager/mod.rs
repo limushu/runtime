@@ -212,20 +212,20 @@ impl PoolManager {
     pub fn cancel(&self, task: TaskRef) -> Outcome<()> {
         let pool = self.get(task.pool)?;
         pool.check_task_ref(task)?;
-        pool.cancel(task.workflow)
+        pool.cancel(task.task)
     }
     pub fn suspend(&self, task: TaskRef) -> Outcome<()> {
         let pool = self.get(task.pool)?;
         pool.check_task_ref(task)?;
-        pool.suspend(task.workflow)
+        pool.suspend(task.task)
     }
     pub fn resume(&self, task: TaskRef) -> Outcome<()> {
         let pool = self.get(task.pool)?;
         pool.check_task_ref(task)?;
-        pool.resume(task.workflow)
+        pool.resume(task.task)
     }
     /// Compatibility facade. Membership validation and reservation live in Pool.
-    pub async fn online_disk(&self, pool: &PoolId, spec: DiskSpec) -> Outcome<Run<MemberDisk>> {
+    pub async fn online_disk(&self, pool: &PoolId, spec: DiskSpec) -> Outcome<TaskRun<MemberDisk>> {
         self.get(pool)?.add_disk(spec).await
     }
     pub async fn shutdown_pool(&self, id: &PoolId) -> Outcome<()> {

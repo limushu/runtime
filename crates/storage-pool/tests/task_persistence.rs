@@ -206,11 +206,11 @@ fn resume(spec: &Spec) -> ResumeSpec {
         checkpoint: b"0".to_vec(),
     }
 }
-async fn wait_state(center: &TaskCenter, id: WorkflowId, predicate: impl Fn(&RunState) -> bool) {
+async fn wait_state(center: &TaskCenter, id: TaskId, predicate: impl Fn(&RunState) -> bool) {
     let mut observer = center.observe_task(id).unwrap();
     bounded(async {
         loop {
-            if predicate(&observer.snapshot().state) {
+            if predicate(&observer.snapshot().execution.as_ref().unwrap().state) {
                 break;
             }
             observer.changed().await.unwrap();
@@ -218,7 +218,7 @@ async fn wait_state(center: &TaskCenter, id: WorkflowId, predicate: impl Fn(&Run
     })
     .await;
 }
-async fn finished(center: &TaskCenter, id: WorkflowId) {
+async fn finished(center: &TaskCenter, id: TaskId) {
     wait_state(center, id, |s| {
         matches!(s, RunState::Completed | RunState::Failed(_))
     })
@@ -231,7 +231,7 @@ async fn pending(pool: PoolUuid, store: Arc<dyn TaskStore>, domain: Arc<Domain>)
     work.wait_at = Some(1);
     let spec = resume(&work.spec);
     let run = f.center.submit_resumable(work, spec).await.unwrap();
-    let id = run.task_id;
+    let id = run.id();
     wait_state(&f.center, run.id(), |s| *s == RunState::WaitingSignal).await;
     f.center.shutdown().await.unwrap();
     assert_eq!(
@@ -246,10 +246,21 @@ async fn history_keeps_all_activities_after_memory_eviction_without_observers() 
     let store = Arc::new(MemoryTaskStore::default());
     let f = Fixture::new(PoolUuid::new(), store.clone(), Domain::new(false)).await;
     let mut run = f.center.submit_task(f.work("a", 3, false)).await.unwrap();
-    let id = f.center.persistent_task_id(run.id()).unwrap();
+    let id = run.id();
     assert_eq!(bounded(run.result()).await, Ok(3));
     f.center.flush_history().await.unwrap();
-    assert_eq!(f.center.task(run.id()).unwrap().activities.entries.len(), 1);
+    assert_eq!(
+        f.center
+            .task(run.id())
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .activities
+            .entries
+            .len(),
+        1
+    );
     let mut other = f.center.submit_task(f.work("b", 1, false)).await.unwrap();
     bounded(other.result()).await.unwrap();
     f.center.flush_history().await.unwrap();
@@ -285,7 +296,7 @@ async fn history_only_uncertain_task_remains_visible_but_is_not_resumable() {
     let pool = PoolUuid::new();
     let f = Fixture::new(pool, store.clone(), Domain::new(false)).await;
     let mut run = f.center.submit_task(UnknownTask).await.unwrap();
-    let id = f.center.persistent_task_id(run.id()).unwrap();
+    let id = run.id();
     assert!(matches!(
         bounded(run.result()).await,
         Err(Failure::Uncertain(_))
@@ -320,7 +331,7 @@ async fn paused_shrink_keeps_task_id_and_links_two_executions_across_takeover() 
     let work = old.work("a", 3, true);
     let spec = resume(&work.spec);
     let run = old.center.submit_resumable(work, spec).await.unwrap();
-    let id = run.task_id;
+    let id = run.id();
     bounded(domain.started.acquire()).await.unwrap().forget();
     old.center.suspend_task(id).await.unwrap();
     domain.release.add_permits(1);
@@ -333,15 +344,16 @@ async fn paused_shrink_keeps_task_id_and_links_two_executions_across_takeover() 
     let report = new.center.recover_tasks().await.unwrap();
     assert!(report.blocked.is_empty());
     let next = report.executions[&id];
-    bounded(new.center.wait_suspended(next)).await.unwrap();
+    bounded(new.center.wait_suspended(id)).await.unwrap();
     new.center.flush_history().await.unwrap();
     assert_eq!(
         new.center.task_detail(id).await.unwrap().status,
         TaskStatus::Paused
     );
     assert!(new.center.retry_task(id).await.is_err());
-    assert_eq!(new.center.resume_task(id).await.unwrap(), next);
-    finished(&new.center, next).await;
+    new.center.resume_task(id).await.unwrap();
+    assert_eq!(new.center.task(id).unwrap().execution.unwrap().id, next);
+    finished(&new.center, id).await;
     let task = new.center.task_detail(id).await.unwrap();
     assert_eq!(task.id, id);
     assert_eq!(task.status, TaskStatus::Completed);
@@ -367,8 +379,8 @@ async fn startup_automatically_reconstructs_ready_work_without_a_task_id_from_th
     new.register();
     let report = new.center.recover_tasks().await.unwrap();
     assert!(report.blocked.is_empty());
-    let next = report.executions[&id];
-    finished(&new.center, next).await;
+    assert!(report.executions.contains_key(&id));
+    finished(&new.center, id).await;
     assert_eq!(
         new.center.task_detail(id).await.unwrap().status,
         TaskStatus::Completed
@@ -451,7 +463,7 @@ async fn rejected_new_request_is_history_only_and_is_never_resurrected_by_takeov
     let report = new.center.recover_tasks().await.unwrap();
     assert!(report.blocked.is_empty());
     assert_eq!(report.executions.len(), 1);
-    finished(&new.center, report.executions[&original.task_id]).await;
+    finished(&new.center, original.id()).await;
     assert_eq!(domain.calls.lock().unwrap().len(), 3);
     new.center.shutdown().await.unwrap();
 }
@@ -463,6 +475,11 @@ async fn recovered_claim_blocks_new_conflicting_work_until_original_task_continu
     let domain = Domain::new(false);
     let id = pending(pool, store.clone(), domain.clone()).await;
     let new = Fixture::new(pool, store, domain).await;
+    let mut observer = new.center.observe_task(id).unwrap();
+    let restored = observer.snapshot();
+    assert_eq!(restored.id, id);
+    assert!(restored.execution.is_none());
+    assert!(matches!(restored.last_error, Some(Failure::Rejected(_))));
     assert!(matches!(
         new.center.submit_task(new.work("a", 3, false)).await,
         Err(Failure::Rejected(_))
@@ -479,8 +496,15 @@ async fn recovered_claim_blocks_new_conflicting_work_until_original_task_continu
         .unwrap();
     bounded(independent.result()).await.unwrap();
     new.register();
-    let next = new.center.retry_task(id).await.unwrap();
-    finished(&new.center, next).await;
+    new.center.retry_task(id).await.unwrap();
+    bounded(async {
+        while observer.snapshot().execution.is_none() {
+            observer.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert_eq!(observer.snapshot().id, id);
+    finished(&new.center, id).await;
     assert_eq!(
         new.center.task_detail(id).await.unwrap().status,
         TaskStatus::Completed
@@ -520,8 +544,8 @@ async fn concurrent_continuations_claim_exactly_one_new_execution() {
     new.register();
     let (a, b) = tokio::join!(new.center.retry_task(id), new.center.retry_task(id));
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
-    let next = a.or(b).unwrap();
-    finished(&new.center, next).await;
+    a.or(b).unwrap();
+    finished(&new.center, id).await;
     assert_eq!(
         new.center.task_detail(id).await.unwrap().executions.len(),
         2
@@ -562,16 +586,16 @@ async fn failed_checkpoint_stops_next_effect_and_requires_business_verification(
         Err(Failure::Uncertain(_))
     ));
     f.center.flush_history().await.unwrap();
-    let task = f.center.task_detail(run.task_id).await.unwrap();
+    let task = f.center.task_detail(run.id()).await.unwrap();
     assert_eq!(task.status, TaskStatus::NeedsCheck);
     assert_eq!(task.resume.unwrap().checkpoint, b"0");
     assert_eq!(domain.calls.lock().unwrap().len(), 1);
-    assert!(f.center.cancel_task(run.task_id).await.is_err());
+    assert!(f.center.cancel_task(run.id()).await.is_err());
     f.register(); // queries actual progress, then safely continues at chunk 2
-    let next = f.center.retry_task(run.task_id).await.unwrap();
-    finished(&f.center, next).await;
+    f.center.retry_task(run.id()).await.unwrap();
+    finished(&f.center, run.id()).await;
     assert_eq!(
-        f.center.task_detail(run.task_id).await.unwrap().status,
+        f.center.task_detail(run.id()).await.unwrap().status,
         TaskStatus::Completed
     );
     assert_eq!(domain.calls.lock().unwrap().len(), 2);
@@ -711,7 +735,7 @@ async fn configured_store_records_builtin_pool_tasks_and_survives_manager_recrea
         .attach_node(NodeId::new("node-1").unwrap(), 1, true)
         .await
         .unwrap();
-    let id = pool.persistent_task_id(run.id()).unwrap();
+    let id = run.id();
     bounded(run.result()).await.unwrap();
     let event = TopologyEvent::new(
         1,

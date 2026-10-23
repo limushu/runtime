@@ -7,7 +7,7 @@ use std::sync::Arc;
 use workflow_foundation::{ContinuationGuard, ContinueDecision};
 
 impl PoolHandle {
-    pub async fn shrink_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
+    pub async fn shrink_disk(&self, id: DiskId) -> Outcome<TaskRun<MemberDisk>> {
         self.descriptor().active()?;
         let snapshot = self.metadata.snapshot(&self.id).await?;
         let disk = snapshot
@@ -38,8 +38,7 @@ impl PoolHandle {
             Ok(self
                 .task_center
                 .submit_resumable_shrink(workflow, resume)
-                .await?
-                .run)
+                .await?)
         } else {
             self.task_center.submit_shrink(workflow).await
         }
@@ -54,7 +53,7 @@ impl PoolHandle {
         )
     }
 
-    pub async fn abort_shrink_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
+    pub async fn abort_shrink_disk(&self, id: DiskId) -> Outcome<TaskRun<MemberDisk>> {
         self.descriptor().active()?;
         let disk = self
             .metadata
@@ -159,4 +158,25 @@ pub(super) fn build_shrink(
         shared,
     });
     ShrinkDiskWorkflow::new(domains, request, guard)
+}
+
+impl PoolHandle {
+    /// Lookup for REST-style /pools/{pool}/shrink endpoints; no saved TaskId required.
+    pub fn current_shrink(&self) -> Option<crate::TaskSnapshot> {
+        self.task_center.current_shrink()
+    }
+    fn shrink_task_id(&self) -> Outcome<crate::TaskId> {
+        self.current_shrink()
+            .map(|task| task.id)
+            .ok_or_else(|| crate::support::reject("pool has no unfinished shrink"))
+    }
+    pub async fn suspend_shrink(&self) -> Outcome<()> {
+        self.suspend_task(self.shrink_task_id()?).await
+    }
+    pub async fn resume_shrink(&self) -> Outcome<()> {
+        self.resume_task(self.shrink_task_id()?).await
+    }
+    pub async fn cancel_shrink(&self) -> Outcome<()> {
+        self.cancel_task(self.shrink_task_id()?).await
+    }
 }
