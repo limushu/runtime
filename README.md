@@ -5,25 +5,22 @@
 
 ```text
 crates/
-├─ workflow-foundation/       # 可嵌入的执行驱动、能力通道、执行控制
+├─ workflow-foundation/       # 执行驱动、Activity、执行控制与资源保护
 └─ storage-pool/src/
-   ├─ pool.rs                # PoolManager / Pool / 对外业务入口
-   ├─ task_center/           # 协调、排队、占用、Workflow 推进
-   ├─ workflows/             # 完整业务流程
-   ├─ domains/
-   │  ├─ disk/               # model.rs / service.rs / runtime.rs
-   │  ├─ node/               # model.rs / service.rs / runtime.rs
-   │  ├─ vd/                 # model.rs / service.rs / runtime.rs
-   │  └─ balance/            # 整盘排空端口、进度与暂停/恢复适配
-   ├─ ports.rs               # 元数据与数据面接口
-   └─ adapters.rs            # 内存/模拟实现
-docs/                        # 架构、开发说明、验证与历史归档
-scripts/verify.ps1           # workspace 验证入口
+   ├─ manager/               # Pool 句柄索引、公平事件分发与汇聚
+   ├─ pool/                  # 所有业务入口、成员目录、生命周期与组装
+   ├─ task_center/           # 准入、冲突、排队、观察、历史与续办
+   ├─ workflows/             # 完整业务步骤
+   ├─ domains/               # disk / node / tier / vd / balance
+   ├─ metadata/              # 统一元数据仓储 + 可替换的事务 KV
+   ├─ ports.rs               # 数据面与均衡服务契约
+   └─ adapters/              # 模拟实现与测试适配
 ```
 
 ## 从哪里开始
 
-- [架构与依赖边界](docs/architecture.md)
+- [架构、职责和阅读顺序](docs/architecture.md)
+- [元数据模块：嵌入自己的 KV 数据库](docs/metadata.md)
 - [如何新增业务冲突规则](docs/task-center.md)
 - [Activity 暂停钩子与继续条件](docs/activity-control.md)
 - [完整缩容工作流与均衡模块接入](docs/shrink-workflow.md)
@@ -38,9 +35,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
 cargo run --locked -p storage-pool --example shrink_disk
-cargo run --locked -p storage-pool --example shrink_topology
+cargo run --locked -p storage-pool --features kv-redb --example metadata_kv -- /tmp/runtime-demo.redb
 ```
 
-本轮移除策略注入/规则引擎和旧分层目录，不保留第二套业务协调实现。旧代码可从 Git 历史恢复。
-当前仍使用内存领域模型与模拟数据面，不是生产存储系统，没有真实磁盘 IO 或通用崩溃恢复。
-TaskCenter 可注入自有数据库保存任务历史，指定任务可按业务检查点续办，见 [接入说明](docs/task-persistence.md)。
+默认使用内存适配器；元数据可注入自己的 KV，或启用 `kv-redb` 持久化。
+任务历史与指定任务续办由可注入的 TaskStore 提供。元数据和任务历史可以共用物理数据库。
+数据面与均衡示例仍是模拟，不执行真实磁盘 IO，也不提供跨主租约或任意 Future 的崩溃恢复。

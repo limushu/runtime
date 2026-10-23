@@ -4,16 +4,12 @@ use crate::domains::{
     vd::VolumeId,
 };
 use crate::{ports::*, support::reject};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use workflow_foundation::{Failure, Outcome};
 
 #[derive(Clone)]
 pub(crate) enum DiskCommand {
-    Refresh,
     ShrinkIntent(DiskId, crate::domains::balance::EvacuationId),
     DisableAllocation(DiskId, crate::domains::balance::EvacuationId),
     ClearShrink(DiskId, crate::domains::balance::EvacuationId),
@@ -49,12 +45,7 @@ enum ShrinkMutation {
     Clear,
 }
 pub(crate) struct DiskService {
-    authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
-    owners: Mutex<BTreeMap<(DiskId, u32), VolumeId>>,
-    released: Mutex<BTreeSet<(DiskId, u32, VolumeId)>>,
-    retired: Mutex<BTreeSet<DiskId>>,
     pool: PoolId,
-    disks: Mutex<BTreeMap<DiskId, MemberDisk>>,
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
 }
@@ -63,60 +54,19 @@ impl DiskService {
         pool: PoolId,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
-        authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            authoritative_reads,
-            owners: Mutex::default(),
-            released: Mutex::default(),
-            retired: Mutex::default(),
             pool,
-            disks: Mutex::new(BTreeMap::new()),
             metadata,
             data_plane,
         }
-    }
-    fn get(&self, id: &DiskId) -> Outcome<MemberDisk> {
-        self.disks
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| reject("unknown member disk"))
-    }
-    async fn latest(&self, id: &DiskId) -> Outcome<MemberDisk> {
-        if !self
-            .authoritative_reads
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return self.get(id);
-        }
-        let snapshot = self.metadata.snapshot(&self.pool).await?;
-        let disk = snapshot
-            .disks
-            .iter()
-            .find(|d| &d.id == id)
-            .cloned()
-            .ok_or_else(|| reject("unknown member disk"))?;
-        self.disks.lock().unwrap().insert(id.clone(), disk.clone());
-        let mut owners = self.owners.lock().unwrap();
-        owners.retain(|(disk, _), _| disk != id);
-        owners.extend(
-            snapshot
-                .allocations
-                .into_iter()
-                .filter(|a| &a.disk == id)
-                .map(|a| ((a.disk, a.blk), a.volume)),
-        );
-        Ok(disk)
     }
     pub async fn execute(
         &self,
         request: DiskCommand,
         cancel: &CancellationToken,
     ) -> Outcome<DiskReply> {
-        // Only short in-memory access uses Mutex. No guard crosses an await;
-        // object conflicts are resolved by the Pool TaskCenter before execution.
+        let snapshot = self.metadata.snapshot(&self.pool).await?;
         let shrink_mutation = match &request {
             DiskCommand::ShrinkIntent(..) => Some(ShrinkMutation::Intent),
             DiskCommand::DisableAllocation(..) => Some(ShrinkMutation::Disable),
@@ -124,38 +74,10 @@ impl DiskService {
             _ => None,
         };
         match request {
-            DiskCommand::Refresh => {
-                let snapshot = self.metadata.snapshot(&self.pool).await?;
-                if snapshot.disks.iter().any(|d| d.shrink.is_some()) {
-                    self.authoritative_reads
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                if snapshot.disks.iter().any(|d| d.pool != self.pool) {
-                    return Err(reject("snapshot belongs to another pool"));
-                }
-                *self.retired.lock().unwrap() = snapshot
-                    .disks
-                    .iter()
-                    .filter(|d| d.membership == DiskMembership::Removed)
-                    .map(|d| d.id.clone())
-                    .collect();
-                *self.owners.lock().unwrap() = snapshot
-                    .allocations
-                    .into_iter()
-                    .map(|a| ((a.disk, a.blk), a.volume))
-                    .collect();
-                *self.disks.lock().unwrap() = snapshot
-                    .disks
-                    .iter()
-                    .cloned()
-                    .map(|d| (d.id.clone(), d))
-                    .collect();
-                Ok(DiskReply::Disks(snapshot.disks))
-            }
             DiskCommand::ShrinkIntent(id, job)
             | DiskCommand::DisableAllocation(id, job)
             | DiskCommand::ClearShrink(id, job) => {
-                let mut disk = self.latest(&id).await?;
+                let mut disk = snapshot.disk(&id)?;
                 if disk.membership == DiskMembership::Removed {
                     return Err(reject("disk is removed"));
                 }
@@ -188,8 +110,6 @@ impl DiskService {
                     },
                 };
                 self.metadata.commit(&self.pool, change.clone()).await?;
-                self.authoritative_reads
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 match change {
                     MetadataChange::ShrinkIntent { .. } => disk.shrink = Some(job),
                     MetadataChange::DisableAllocation { .. } => {
@@ -201,17 +121,16 @@ impl DiskService {
                     }
                 }
                 disk.revision += 1;
-                self.disks.lock().unwrap().insert(id, disk.clone());
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::RequireEmpty(id) => {
-                if !self.latest(&id).await?.allocated.is_empty() {
+                if !snapshot.disk(&id)?.allocated.is_empty() {
                     return Err(reject("disk still has allocations"));
                 }
                 Ok(DiskReply::Checked)
             }
             DiskCommand::FinalizeShrink(id, job) => {
-                let mut disk = self.latest(&id).await?;
+                let mut disk = snapshot.disk(&id)?;
                 if disk.membership == DiskMembership::Removed && disk.shrink == Some(job) {
                     return Ok(DiskReply::Disk(disk));
                 }
@@ -253,7 +172,6 @@ impl DiskService {
                     })?;
                 disk.io = IoState::Down;
                 disk.revision += 1;
-                self.disks.lock().unwrap().insert(id.clone(), disk.clone());
                 self.data_plane.close_disk(&self.pool, &id, cancel).await?;
                 self.metadata
                     .commit(
@@ -272,16 +190,12 @@ impl DiskService {
                     })?;
                 disk.membership = DiskMembership::Removed;
                 disk.revision += 1;
-                self.disks.lock().unwrap().insert(id.clone(), disk.clone());
-                self.retired.lock().unwrap().insert(id);
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::RequireTierEmpty(tier) => {
-                if self
+                if snapshot
                     .disks
-                    .lock()
-                    .unwrap()
-                    .values()
+                    .iter()
                     .any(|disk| disk.tier == tier && disk.membership == DiskMembership::Member)
                 {
                     return Err(reject("tier still has member disks"));
@@ -293,12 +207,19 @@ impl DiskService {
                 volume,
                 blk,
             } => {
-                let receipt = (id.clone(), blk, volume.clone());
-                if self.released.lock().unwrap().contains(&receipt) {
+                if snapshot
+                    .released
+                    .iter()
+                    .any(|a| a.disk == id && a.blk == blk && a.volume == volume)
+                {
                     return Ok(DiskReply::Checked);
                 }
-                let mut disk = self.latest(&id).await?;
-                if self.owners.lock().unwrap().get(&(id.clone(), blk)) != Some(&volume) {
+                let mut disk = snapshot.disk(&id)?;
+                if !snapshot
+                    .allocations
+                    .iter()
+                    .any(|a| a.disk == id && a.blk == blk && a.volume == volume)
+                {
                     return Err(reject("allocation belongs to another volume"));
                 }
                 if !disk.allocated.contains(&blk) {
@@ -317,16 +238,13 @@ impl DiskService {
                     .await?;
                 disk.allocated.remove(&blk);
                 disk.revision += 1;
-                self.disks.lock().unwrap().insert(id.clone(), disk);
-                self.owners.lock().unwrap().remove(&(id, blk));
-                self.released.lock().unwrap().insert(receipt);
                 Ok(DiskReply::Checked)
             }
             DiskCommand::RemoveEmpty(id) => {
-                if self.retired.lock().unwrap().contains(&id) {
+                if snapshot.retired_disks.contains(&id) {
                     return Ok(DiskReply::Checked);
                 }
-                let disk = self.latest(&id).await?;
+                let disk = snapshot.disk(&id)?;
                 if disk.shrink.is_some() {
                     return Err(reject("disk has a shrink intent; use shrink finalization"));
                 }
@@ -346,16 +264,15 @@ impl DiskService {
                     .map_err(|e| {
                         Failure::Uncertain(format!("disk closed but removal not confirmed: {e}"))
                     })?;
-                self.disks.lock().unwrap().remove(&id);
-                self.retired.lock().unwrap().insert(id);
                 Ok(DiskReply::Checked)
             }
-            DiskCommand::Inspect(id) => Ok(DiskReply::Disk(self.latest(&id).await?)),
+            DiskCommand::Inspect(id) => Ok(DiskReply::Disk(snapshot.disk(&id)?)),
             DiskCommand::InspectMany(ids) => {
                 // Routing also includes reserved disks whose Add never committed.
-                let disks = self.disks.lock().unwrap();
                 Ok(DiskReply::Disks(
-                    ids.iter().filter_map(|id| disks.get(id).cloned()).collect(),
+                    ids.iter()
+                        .filter_map(|id| snapshot.disks.iter().find(|d| &d.id == id).cloned())
+                        .collect(),
                 ))
             }
             DiskCommand::RemoveMany(_) => Err(Failure::Failed(
@@ -368,7 +285,7 @@ impl DiskService {
                     if !unique.insert(id.clone()) {
                         return Err(reject("duplicate disk in IO batch"));
                     }
-                    let disk = self.latest(id).await?;
+                    let disk = snapshot.disk(id)?;
                     if disk.membership == DiskMembership::Removed {
                         return Err(reject("IO batch contains a removed disk"));
                     }
@@ -411,10 +328,6 @@ impl DiskService {
                             } else {
                                 disk.io = io;
                                 disk.revision += 1;
-                                self.disks
-                                    .lock()
-                                    .unwrap()
-                                    .insert(disk.id.clone(), disk.clone());
                             }
                         }
                         Err(error) => {
@@ -433,10 +346,10 @@ impl DiskService {
                 }
             }
             DiskCommand::Add(spec) => {
-                if self.retired.lock().unwrap().contains(&spec.id) {
+                if snapshot.retired_disks.contains(&spec.id) {
                     return Err(reject("disk membership identity is retired"));
                 }
-                if let Some(existing) = self.disks.lock().unwrap().get(&spec.id).cloned() {
+                if let Some(existing) = snapshot.disks.iter().find(|d| d.id == spec.id).cloned() {
                     existing.require_identity(&spec)?;
                     return Ok(DiskReply::Disk(existing));
                 }
@@ -444,14 +357,10 @@ impl DiskService {
                 self.metadata
                     .commit(&self.pool, MetadataChange::AddDisk(disk.clone()))
                     .await?;
-                self.disks
-                    .lock()
-                    .unwrap()
-                    .insert(disk.id.clone(), disk.clone());
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::Open(id) => {
-                let disk = self.latest(&id).await?;
+                let disk = snapshot.disk(&id)?;
                 if disk.membership == DiskMembership::Removed {
                     return Err(reject("disk is removed"));
                 }
@@ -459,7 +368,7 @@ impl DiskService {
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::SetIo(id, io) => {
-                let mut disk = self.latest(&id).await?;
+                let mut disk = snapshot.disk(&id)?;
                 if disk.membership == DiskMembership::Removed {
                     return Err(reject("disk is removed"));
                 }
@@ -482,7 +391,6 @@ impl DiskService {
                     })?;
                 disk.io = io;
                 disk.revision += 1;
-                self.disks.lock().unwrap().insert(id, disk.clone());
                 Ok(DiskReply::Disk(disk))
             }
             DiskCommand::Remove(id) => {
@@ -493,7 +401,7 @@ impl DiskService {
                 )))
             }
             DiskCommand::Allocate(id, volume) => {
-                let mut disk = self.latest(&id).await?;
+                let mut disk = snapshot.disk(&id)?;
                 let blk = disk.next_free_block()?;
                 self.metadata
                     .commit(
@@ -507,10 +415,6 @@ impl DiskService {
                     )
                     .await?;
                 disk.allocated.insert(blk);
-                self.owners
-                    .lock()
-                    .unwrap()
-                    .insert((id.clone(), blk), volume.clone());
                 disk.revision += 1;
                 let receipt = Allocation {
                     pool: self.pool.clone(),
@@ -520,22 +424,8 @@ impl DiskService {
                     tier: disk.tier.clone(),
                     blk,
                 };
-                self.disks.lock().unwrap().insert(id, disk);
                 Ok(DiskReply::Allocated(receipt))
             }
-        }
-    }
-    pub fn query(&self, id: Option<DiskId>) -> Outcome<Vec<MemberDisk>> {
-        match id {
-            Some(id) => Ok(vec![self.get(&id)?]),
-            None => Ok(self
-                .disks
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|d| d.membership == DiskMembership::Member)
-                .cloned()
-                .collect()),
         }
     }
 }

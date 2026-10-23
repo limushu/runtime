@@ -11,7 +11,7 @@ use workflow_foundation::{ObjectKey, Workflow, WorkflowContext};
 pub struct OnlineDiskWorkflow {
     pub(crate) domains: Domains,
     pub(crate) spec: DiskSpec,
-    pub(crate) reservation: Option<crate::manager::DiskReservation>,
+    pub(crate) reservation: Option<crate::pool::DiskReservation>,
 }
 
 impl PoolWorkflow for OnlineDiskWorkflow {

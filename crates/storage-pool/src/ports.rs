@@ -2,28 +2,14 @@
 use crate::domains::balance::*;
 use crate::domains::{
     PoolId,
-    disk::{DiskId, IoState, MemberDisk},
+    disk::{DiskId, IoState},
     node::NodeId,
-    vd::{BgEntry, VirtualDisk, VolumeId},
+    vd::{BgEntry, VolumeId},
 };
-use crate::{Tier, TierId};
+pub use crate::metadata::{AllocationOwner, MetadataChange, MetadataSnapshot, MetadataStore};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use workflow_foundation::{Failure, Outcome};
-
-#[derive(Debug, Clone)]
-pub struct AllocationOwner {
-    pub disk: DiskId,
-    pub blk: u32,
-    pub volume: VolumeId,
-}
-#[derive(Debug, Clone, Default)]
-pub struct MetadataSnapshot {
-    pub tiers: Vec<Tier>,
-    pub disks: Vec<MemberDisk>,
-    pub volumes: Vec<VirtualDisk>,
-    pub allocations: Vec<AllocationOwner>,
-}
 
 /// Existing balancing domain service: one idempotent whole-disk job, not WF batches.
 #[async_trait]
@@ -42,90 +28,6 @@ pub trait EvacuationJob: Send + Sync + 'static {
     async fn pause(&self) -> Outcome<()>;
     async fn resume(&self) -> Outcome<()>;
     async fn cancel(&self) -> Outcome<()>;
-}
-
-/// Field-level mutations, not overwrites of stale MemberDisk snapshots.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MetadataChange {
-    ShrinkIntent {
-        disk: DiskId,
-        expected_revision: u64,
-        job: EvacuationId,
-    },
-    DisableAllocation {
-        disk: DiskId,
-        expected_revision: u64,
-        job: EvacuationId,
-    },
-    ClearShrink {
-        disk: DiskId,
-        expected_revision: u64,
-        job: EvacuationId,
-    },
-    MarkRemoved {
-        disk: DiskId,
-        expected_revision: u64,
-        job: EvacuationId,
-    },
-    /// Atomic placement/allocation update after the balancing module confirms data copy.
-    Remap {
-        volume: VolumeId,
-        expected_revision: u64,
-        group: u32,
-        source: BgEntry,
-        target: BgEntry,
-        source_revision: u64,
-        target_revision: u64,
-    },
-    CreateTier(Tier),
-    DeleteTier {
-        id: TierId,
-        expected_revision: u64,
-    },
-    RemoveDisk {
-        disk: DiskId,
-        expected_revision: u64,
-    },
-    DeleteVolume {
-        volume: VolumeId,
-        expected_revision: u64,
-    },
-    ReleaseAllocation {
-        disk: DiskId,
-        expected_revision: u64,
-        volume: VolumeId,
-        blk: u32,
-    },
-    AddDisk(MemberDisk),
-    DiskIo {
-        disk: DiskId,
-        expected_revision: u64,
-        io: IoState,
-    },
-    Allocate {
-        disk: DiskId,
-        expected_revision: u64,
-        volume: VolumeId,
-        blk: u32,
-    },
-    CreateVolume(VirtualDisk),
-    InvalidateDisk {
-        disk: DiskId,
-    },
-}
-
-/// Ok means acknowledged commit. Known failure MUST mean not committed;
-/// ambiguous transport/commit outcomes MUST be Uncertain. No automatic retries.
-/// Production adapters must enforce revisions and fencing; memory is only a simulator.
-#[async_trait]
-pub trait MetadataStore: Send + Sync + 'static {
-    async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()>;
-    /// Authoritative, internally consistent projection; required for shrink and takeover.
-    async fn snapshot(&self, _pool: &PoolId) -> Outcome<MetadataSnapshot> {
-        Err(Failure::Rejected(
-            "metadata snapshot is not configured".into(),
-        ))
-    }
 }
 
 /// An operation must return only after it is stable. Cancelled means stopped with

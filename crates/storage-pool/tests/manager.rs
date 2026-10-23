@@ -575,6 +575,10 @@ struct ReleaseFailure {
 }
 #[async_trait]
 impl MetadataStore for ReleaseFailure {
+    async fn snapshot(&self, pool: &PoolId) -> Outcome<storage_pool::metadata::MetadataSnapshot> {
+        self.inner.snapshot(pool).await
+    }
+
     async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()> {
         if matches!(change, MetadataChange::ReleaseAllocation { .. })
             && self.fail.fetch_add(1, Ordering::SeqCst) == 1

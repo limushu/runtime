@@ -2,6 +2,7 @@
 pub mod adapters;
 pub mod domains;
 pub mod manager;
+pub mod metadata;
 mod pool;
 pub mod ports;
 mod requests;

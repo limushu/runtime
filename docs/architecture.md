@@ -1,72 +1,84 @@
-# 当前架构与依赖边界
+# 当前架构与职责
 
-## 组合结构
+业务入口统一在 Pool，跨池目录在 PoolManager，调度在 TaskCenter。
+执行框架和数据库分别提供基础能力，不参与判断存储业务冲突。
 
 ```text
-PoolManager
-└─ Pool（组合根 pool.rs）
-   ├─ TaskCenter（一个事件循环）
-   │  ├─ 冲突判断、队列、逻辑对象占用与隔离
-   │  └─ 直接推进 Workflow Future（嵌入通用执行驱动，无独立 task）
-   ├─ DiskService + DiskHost（独立服务宿主）
-   ├─ NodeService + NodeHost（独立服务宿主）
-   ├─ VdService + VdHost（独立服务宿主）
-   ├─ TierService + TierHost（独立服务宿主）
-   └─ BalanceService + BalanceHost（外部均衡 job 的能力与控制适配）
+外部事件 / 管理请求
+       ↓
+PoolManager：按 ID / UUID / Name 找 Pool；公平扇出并汇聚
+       ↓
+Pool：校验入口、准备对象集合、构造 Workflow
+       ↓ 提交
+TaskCenter：准入、冲突、队列、暂停协调、历史与续办
+       ↓ 推进 Workflow Future
+Workflow：按顺序调用 Activity
+       ↓
+领域服务 / Pool 成员能力：验证、执行、确认结果
+       ├── 元数据仓储 → 可替换 KV
+       ├── 数据面端口
+       └── 均衡服务端口
 ```
 
-Task 是一次完整 Workflow 执行，Activity 是其步骤。硬盘上线是一个流程，Add/Open/Enable
-是内部步骤。业务请求只经 PoolHandle/PoolManager，不能向 Pool 注入任意 Workflow 或策略。
-Pool 没有单独的 runtime 字段，也不使用 RuntimeHandle 向另一条协调队列提交。
+## 代码归属
 
-## 按业务组织，而不是把同一领域拆散
+| 模块 | 职责 | 不应持有或执行 |
+| --- | --- | --- |
+| `manager/` | 句柄索引、公平事件扇出、跨池物理盘预约索引 | Pool 内部生命周期、Workflow 推进 |
+| `pool/` | 所有 PoolHandle 入口、成员目录、生命周期、组装及恢复注册 | 第二套调度器或工作流引擎 |
+| `task_center/` | 任务准入与占用、拓扑协调、观察、历史和续办 | 磁盘目录、成员实体或迁移算法 |
+| `workflows/` | 一件业务的完整步骤、声明涉及的对象 | Manager Registry、Mutex、领域缓存刷新 |
+| `domains/` | 业务模型、领域能力、Activity 托管适配 | Task 队列、PoolManager 内部状态 |
+| `metadata/` | 一致读取、版本校验、原子业务变更、可替换 KV | 数据面 IO 或任务调度 |
+| `adapters/` | 模拟数据面、模拟均衡器及测试提交日志 | 第二套元数据业务规则 |
 
-domains 表示“业务领域分组”，不是声称其中所有文件都是 DDD 纯领域层。
+`ports.rs` 定义外部数据面和均衡契约。元数据类型定义在 `metadata/`，ports 保留重导出以支持既有接入。
 
-- `domains/{disk,node,vd,balance}/model.rs`：对象、不变量、状态规则，身份序列化不引入执行框架。
-- `domains/{disk,node,vd,balance}/service.rs`：能力与已确认状态；组织领域校验、数据面操作、元数据提交。
-  不实现 ServiceHandler、不使用 ActivityContext、不认识托管自己的 runtime、不维护对象冲突队列。
-- `domains/{disk,node,vd,balance}/runtime.rs`：服务托管适配，声明步骤资源并转发能力调用；runtime 依赖 service，
-  service 依赖 model，不能反向依赖。
-- `domains/mod.rs`：公共身份和 DomainError；错误转换放在最外层 support.rs。
-- `ports.rs` / `adapters.rs`：外部接口与模拟实现。取消/IO 是应用能力边界，不进入领域模型。
-- `workflows/`：通过 ActivityClient 的类型化能力通道调用步骤，不知道具体服务宿主类型。
-- `task_center/`：同一具体组件的协调状态与普通业务判断；conflicts.rs 不是插件策略系统。
-- `pool.rs`：组合根，装配 TaskCenter 和领域服务。不把组合逻辑放入模型。
+## 阅读顺序
 
-自动测试检查 model 不引用 Tokio/执行框架，service 不依赖 runtime，Workflow 不引用服务宿主。
-当前 service/ports 使用执行层 Outcome 和取消令牌，model 返回独立 DomainError。
+1. `pool/mod.rs`：Pool 与 PoolHandle、查询及业务入口；`bootstrap.rs` 只负责组装。
+2. `workflows/shrink_disk.rs`：读取缩容、禁止分配、整盘排空、校验和终结的完整链路。
+3. `task_center/conflicts.rs`：何种业务互斥；`scheduler.rs`：何时请求暂停及放行任务。
+4. `domains/balance/runtime.rs`：领域 job 的进度、Pause/Resume/Cancel 适配。
+5. `metadata/kv.rs`：接入自己的 KV；`repository.rs` 和 `state.rs`：编码与统一业务约束。
 
-## 一个循环协调并执行
+TaskCenter 的其他文件分别是 `operation.rs`（分类与对象声明）、`observation.rs`（只读视图）、
+`recovery.rs`（任务续办）、`persistence/`（存储与审计）。`mod.rs` 保留唯一事件循环和提交接口。
 
-TaskCenter 的 select 同时处理新请求、停止请求和 driver.tick()。
-WorkflowDriver 是一组可轮询的执行状态/Future，本身没有提交队列，也不会 spawn 执行宿主。
-defer() 是同步登记，不是发消息给另一个 Runtime。TaskCenter 持有启动许可，冲突消除后放行；
-在同一个循环内轮询多个 Workflow，因此不需要 await 整个流程才接收下一条请求。
+Pool 的 `membership.rs` 封装领域变化后的目录更新；`operations.rs`、`lifecycle.rs`、`shrink_disk.rs`
+组织对应业务入口。所有业务 Workflow 均位于 `workflows/`，Pool 模块不再混入流程体。
 
-WorkflowRuntime/RuntimeHandle 仅是基础库给无自有事件循环的示例使用的可选独立封装，
-代码位于 standalone.rs，存储 Pool 不构造它。ExecutionView 只共享观察/控制状态，
-不调度、不提交、不启动 task。
+## 状态由谁负责
 
-TaskCenter 检查全部在途冲突及容量。只有成功登记才实施取消；旧流程和 Activity 实际终态前
-不释放逻辑对象。排队任务计入容量、可取消；丢弃调用者/Run 不丢失已接受执行。
-不确定结果保留逻辑对象隔离；被隔离的新任务不会取消其他活动任务，被拒绝的后继不扩散隔离。
+- **任务协调状态**属于 TaskCenter：排队、对象占用、topo 阻塞、逻辑隔离。
+- **执行状态**属于 workflow-foundation：当前 Activity、安全暂停确认、已派发操作结算。
+- **磁盘、Tier、VD 及分配事实**属于元数据仓储。领域服务每次从仓储读取，不维护另一份可写缓存。
+- **连接和已加载事实**由 NodeService 接受真实拓扑观测；元数据恢复不会捏造这些事实。
+- **复制与迁移进度**属于均衡模块，Activity 转发其真实进度。
+- **Pool 成员路由与预约**属于 Pool；Manager 只维护需要跨 Pool 排他的物理盘归属索引。
 
-受控执行不再重复取得 Workflow 对象锁。驱动保留 Activity 资源读写保护、停稳跟踪与资源隔离，
-尤其保护 VD 反向引用索引等共享结构。服务内部没有业务对象排队器。
-通用独立 submit 仍提供简单对象互斥供示例/测试使用，不能绕过 Pool 正式入口混用。
+已确认元数据不等于外部 IO 的完整事实。Uncertain 任务继续隔离，成功读回某条记录不会自动解除隔离。
 
-完整缩容由 ShrinkDiskWorkflow 推进。一次排空 Activity 等待独立均衡 job，并转发实际进度；
-暂停钩子在适配层发送控制指令并确认停稳。均衡完成后的引用与分配读取权威元数据，
-防止领域缓存覆盖已提交的 remap。TaskCenter 协调 topo，均衡器不反向触发缩容状态切换。
+## 执行与控制
 
-暂停仍保留逻辑对象；排队任务只记录暂停请求，获准到达安全边界才确认 Paused。
-pool.scheduling() 表示业务排队/运行/逻辑隔离；pool.execution() 表示底层执行与资源计数。
-pool.task(id).conflicts 是准入时解释，不是实时等待图。
+TaskCenter 在一个循环内同时接收请求并轮询 `driver.tick()`，不等待一条 Workflow 完成才处理下一条。
+WorkflowDriver 推进 Futures，不再做一次业务排队；Activity 资源锁保护实际步骤，保持到停稳。
+领域 `runtime.rs` 只是 Activity 的托管适配，不是额外工作流引擎。
 
-## 限制
+缩容只提交一个整盘均衡 job。topo 到来后，TaskCenter 关闭继续门禁，等待 Activity 委托均衡服务确认暂停；
+所有 topo 完成后，先重新检查条件，再恢复同一个 job。没有暂停钩子的步骤正常完成后才确认暂停。
+用户取消和宿主中断的原因不同，但都需要适配器主动感知 token，不能直接丢弃在途 IO。
 
-任务历史可通过注入 TaskStore 持久化，指定用户 Task 可按业务检查点续办，见 [接入说明](task-persistence.md)。
-没有确定性重放、跨主所有权接管协议、自动重试、动态扩展对象集合或真实重建；空闲无引用成员盘可以显式移除。
-拓扑身份不可变；节点关联盘集合包含已预约但未提交的盘。资源声明仍较保守，同节点的部分
-磁盘流程会串行，本轮不改变原有冲突范围。强制 Drop 不能证明远端 IO 已停止。
+最终关闭磁盘、提交 Removed、更新 Pool 目录在一个不可中途暂停的完成步骤内执行。
+这样并发取消或 topo 不会落在提交成功和清理目录之间。细节见 [缩容工作流](shrink-workflow.md)。
+
+## 数据库接入与边界
+
+`MetadataStore` 是领域仓储接口；`KvMetadata` 是共用实现，`KvStore` 是底层数据库适配契约。
+它要求一致性快照和带条件的原子批量写入。内存和 redb 复用同一套业务规则，见 [元数据接入](metadata.md)。
+
+TaskStore 独立保存历史和可续办 Task，可与元数据共用物理数据库，但不与整个 Workflow 组成长事务。
+同一 Task 可以关联多次执行，缩容根据持久意图、真实 placement 和外部 job 核验后继续。
+
+当前没有跨主租约、确定性 Future 重放或真实磁盘复制。离线重建等待仍是明确失败的占位能力。
+本地强制 Drop 不能证明远端工作已经停止；接管必须沿用系统的所有权交接机制。

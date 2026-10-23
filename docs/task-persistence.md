@@ -44,7 +44,8 @@ before 是服务返回的游标，不能跨 Pool 使用；页大小 1..200。
 
 RedbTaskStore::open 是阻塞方法，在运行时外或 spawn_blocking 中调用。
 TaskStore 可以由多个池共享，任务读写按 Pool UUID 隔离；切换前后必须使用同一份数据与相同 Pool UUID。
-Pool 的领域元数据加载和主备所有权仍沿用系统原有机制，这里不持久恢复 PoolCatalog 或真实磁盘状态。
+TaskStore 只负责任务。Pool 的领域元数据通过 [可嵌入 KV 的仓储](metadata.md) 单独持久化，
+可与任务共用物理数据库；主备所有权仍沿用系统原有机制，不持久恢复真实连接和加载事实。
 
 ## 普通历史
 

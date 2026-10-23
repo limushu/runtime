@@ -3,6 +3,7 @@
 当前代码只有两个 workspace 成员，入口以本页和根 README 为准。
 
 - [当前架构与目录边界](architecture.md)
+- [可嵌入不同 KV 的元数据模块](metadata.md)（统一仓储、事务契约与 redb 示例）
 - [PoolManager 当前实现与限制](pool-manager.md)
 - [PoolManager 接口、多索引与创建/删除设计](pool-manager-design.md)（含后续持久化目标）
 - [TaskCenter TUI：任务列表、Activity 时间线与历史](task-center-tui.md)（界面建议）

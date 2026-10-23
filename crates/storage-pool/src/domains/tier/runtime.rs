@@ -8,22 +8,17 @@ pub(crate) struct TierHost(pub TierService);
 impl ServiceHandler for TierHost {
     type Request = TierCommand;
     type Reply = TierReply;
-    type Query = Option<TierId>;
-    type View = Vec<Tier>;
+    type Query = ();
+    type View = ();
     fn activity_name(request: &TierCommand) -> &'static str {
         match request {
-            TierCommand::Refresh => "tier.restore-metadata",
             TierCommand::Create(_) => "tier.create",
             TierCommand::Inspect(_) => "tier.inspect",
             TierCommand::Delete(_) => "tier.delete",
         }
     }
     fn resources(request: &TierCommand) -> Vec<ResourceAccess> {
-        if matches!(request, TierCommand::Refresh) {
-            return vec![ResourceAccess::write(object("tier", "catalog"))];
-        }
         let id = match request {
-            TierCommand::Refresh => unreachable!(),
             TierCommand::Create(id) | TierCommand::Inspect(id) | TierCommand::Delete(id) => id,
         };
         let key = object("tier", id.as_str());
@@ -36,7 +31,7 @@ impl ServiceHandler for TierHost {
     async fn execute(&self, request: TierCommand, _: ActivityContext) -> Outcome<TierReply> {
         self.0.execute(request).await
     }
-    fn query(&self, query: Option<TierId>) -> Outcome<Vec<Tier>> {
-        self.0.query(query)
+    fn query(&self, _: ()) -> Outcome<()> {
+        Ok(())
     }
 }

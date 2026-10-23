@@ -22,13 +22,16 @@ cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 cargo run --locked -p storage-pool --features kv-redb --example task_persistence -- /tmp/tasks.redb
 ```
 
-默认构建不启用 redb，可注入自己的 TaskStore。持久化示例执行模拟迁移并写入指定的本地 KV 文件。
+默认构建不启用 redb，可注入自己的 TaskStore 和 KvStore。持久化示例使用本地 KV 文件。
+运行 `cargo run --locked -p storage-pool --features kv-redb --example metadata_kv -- /tmp/runtime-demo.redb`，
+再以同一路径运行一次，可验证元数据和任务历史共用数据库以及重开读取。
 
 Activity 控制与缩容/topo 协调可单独验证：
 
 ```sh
 cargo test --offline --locked -p storage-pool --all-features --test topology_shrink
 cargo test --offline --locked -p storage-pool --all-features --test shrink_disk
+cargo test --offline --locked -p storage-pool --all-features --test metadata
 cargo run --offline --locked -p storage-pool --example shrink_topology
 ```
 

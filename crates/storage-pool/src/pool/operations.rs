@@ -1,61 +1,12 @@
-use super::{fanout::EventDecision, *};
+use super::*;
+use crate::manager::EventDecision;
 use crate::{support::reject, workflows::*, *};
-use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::{
-        Weak,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 
-pub(crate) struct PoolShared {
-    pub descriptor: Mutex<PoolDescriptor>,
-    pub registry: Weak<Mutex<Registry>>,
-    pub instance: PoolUuid,
-    pub nodes: Mutex<BTreeSet<NodeId>>,
-    pub node_claims: Mutex<BTreeMap<NodeId, super::ownership::NodeClaim>>,
-    pub detaching: Mutex<BTreeSet<NodeId>>,
-    pub retiring_tiers: Mutex<BTreeSet<TierId>>,
-    pub retiring_disks: Mutex<BTreeSet<DiskId>>,
-    pub(super) events: Mutex<EventCache>,
-    pub(crate) serial: AtomicU64,
-    event_limit: usize,
-}
-#[derive(Default)]
-pub(super) struct EventCache {
-    pub records: BTreeMap<uuid::Uuid, (Arc<TopologyEvent>, PoolEventReceipt)>,
-    pub order: VecDeque<uuid::Uuid>,
-    pub versions: BTreeMap<workflow_foundation::ObjectKey, (Arc<TopologyEvent>, PoolEventReceipt)>,
-}
-impl PoolShared {
-    pub fn new(
-        descriptor: PoolDescriptor,
-        registry: Weak<Mutex<Registry>>,
-        config: &Config,
-    ) -> Self {
-        Self {
-            descriptor: Mutex::new(descriptor),
-            registry,
-            instance: PoolUuid::new(),
-            nodes: Mutex::default(),
-            node_claims: Mutex::default(),
-            detaching: Mutex::default(),
-            retiring_tiers: Mutex::default(),
-            retiring_disks: Mutex::default(),
-            events: Mutex::default(),
-            serial: AtomicU64::new(1),
-            event_limit: config
-                .max_workflows
-                .saturating_add(config.capacity)
-                .saturating_add(config.task_history)
-                .max(1),
-        }
-    }
-}
 impl PoolHandle {
     pub async fn tiers(&self) -> Outcome<Vec<Tier>> {
-        self.domains.tier.query(None).await
+        Ok(self.metadata.snapshot(&self.id).await?.tiers)
     }
     pub async fn create_tier(&self, id: TierId) -> Outcome<Run<Tier>> {
         self.task_center
@@ -71,7 +22,7 @@ impl PoolHandle {
             let _guard = registry.lock().unwrap();
             self.descriptor().active()?;
             if self
-                .task_center
+                .shared
                 .disk_directory()
                 .lock()
                 .unwrap()
@@ -94,7 +45,7 @@ impl PoolHandle {
             .submit(DeleteTierWorkflow {
                 domains: self.domains.clone(),
                 id: id.clone(),
-                removal: super::RemovalGuard::tier(self.shared.clone(), id.clone()),
+                removal: RemovalGuard::tier(self.shared.clone(), id.clone()),
             })
             .await
     }
@@ -123,7 +74,7 @@ impl PoolHandle {
             let registry = self.shared.registry.upgrade().ok_or(Failure::Unavailable)?;
             let _guard = registry.lock().unwrap();
             self.descriptor().active()?;
-            if !self.task_center.node_disks(&id).is_empty() {
+            if !self.shared.node_disks(&id).is_empty() {
                 return Err(reject("node still has disks or reservations"));
             }
             if !self.shared.detaching.lock().unwrap().insert(id.clone()) {
@@ -134,8 +85,7 @@ impl PoolHandle {
             .submit(DetachNodeWorkflow {
                 domains: self.domains.clone(),
                 id: id.clone(),
-                shared: self.shared.clone(),
-                removal: super::RemovalGuard::node(self.shared.clone(), id.clone()),
+                removal: RemovalGuard::node(self.shared.clone(), id.clone()),
             })
             .await
     }
@@ -145,7 +95,7 @@ impl PoolHandle {
             let _guard = registry.lock().unwrap();
             self.descriptor().active()?;
             let spec = self
-                .task_center
+                .shared
                 .disk_spec(&id)
                 .ok_or_else(|| reject("unknown disk membership"))?;
             if !self
@@ -163,30 +113,17 @@ impl PoolHandle {
             .submit(RemoveDiskWorkflow {
                 domains: self.domains.clone(),
                 spec,
-                registry: self.shared.registry.clone(),
-                uuid: self.uuid(),
-                routing: self.task_center.disk_directory(),
-                removal: super::RemovalGuard::disk(self.shared.clone(), id),
+                removal: RemovalGuard::disk(self.shared.clone(), id),
             })
             .await
     }
     pub async fn delete_volume(&self, id: VolumeId) -> Outcome<Run<()>> {
-        let volume = self.volumes().await?.into_iter().find(|v| v.id == id);
-        // Retain the confirmed deletion's allocation receipts for retrying cleanup.
-        // Active volumes must use canonical placement after an external remap.
-        let volume = match volume {
-            Some(volume) => volume,
-            None => self.domains.vd.query(Some(id)).await?.remove(0),
-        };
+        let volume = self.metadata.snapshot(&self.id).await?.volume(&id)?;
         let nodes = volume
             .groups
             .iter()
             .flat_map(|group| &group.entries)
-            .filter_map(|entry| {
-                self.task_center
-                    .disk_spec(&entry.disk)
-                    .map(|spec| spec.node)
-            })
+            .filter_map(|entry| self.shared.disk_spec(&entry.disk).map(|spec| spec.node))
             .collect();
         self.task_center
             .submit(DeleteVolumeWorkflow {
@@ -221,7 +158,7 @@ impl PoolHandle {
             let result = async {
                 let mut run = pool
                     .task_center
-                    .submit_admin(super::admin::DeletePoolWorkflow {
+                    .submit_admin(DeletePoolWorkflow {
                         client: pool.admin.clone(),
                     })
                     .await?;
@@ -303,7 +240,7 @@ impl PoolHandle {
         expected_revision: u64,
     ) -> Outcome<Run<PoolDescriptor>> {
         self.task_center
-            .submit(super::admin::RenamePoolWorkflow {
+            .submit(RenamePoolWorkflow {
                 client: self.admin.clone(),
                 name,
                 revision: expected_revision,
@@ -374,7 +311,7 @@ impl PoolHandle {
                 {
                     return immediate(EventDecision::Rejected(Failure::Unavailable));
                 }
-                self.task_center.has_reservation(disk)
+                self.shared.has_reservation(disk)
             }
         };
         let mut cache = self.shared.events.lock().unwrap();
@@ -470,7 +407,7 @@ impl PoolHandle {
                 )
             }
             TopologyChange::DiskAvailability { disk, online } => {
-                match self.task_center.disk_spec(disk) {
+                match self.shared.disk_spec(disk) {
                     Some(spec) if *online => self.task_center.try_submit(
                         OnlineDiskWorkflow {
                             domains: self.domains.clone(),
@@ -523,4 +460,22 @@ fn reply_disk(
         Ok(control) => EventDecision::Accepted(control),
         Err(error) => EventDecision::Rejected(error),
     });
+}
+
+impl PoolHandle {
+    /// Call after acquiring Pool ownership and before recover_tasks. Connectivity/load
+    /// observations still come from the real topology source; this never invents them.
+    pub async fn restore_metadata(&self) -> Outcome<()> {
+        self.descriptor().active()?;
+        let mut run = self
+            .task_center
+            .submit_admin(RestoreMetadataWorkflow {
+                domains: self.domains.clone(),
+            })
+            .await?;
+        run.result().await
+    }
+    pub async fn disk(&self, id: DiskId) -> Outcome<MemberDisk> {
+        self.metadata.snapshot(&self.id).await?.disk(&id)
+    }
 }

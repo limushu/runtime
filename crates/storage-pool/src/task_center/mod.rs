@@ -4,7 +4,6 @@ use crate::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Deref,
     sync::{Arc, Mutex},
 };
 use tokio::{
@@ -18,134 +17,18 @@ use workflow_foundation::{
 };
 
 mod conflicts;
+mod observation;
+mod operation;
+mod scheduler;
+pub use observation::{ConflictMatch, SchedulingSnapshot, TaskObserver, TaskSnapshot};
+pub(crate) use operation::PoolWorkflow;
+pub use operation::{OperationKind, PoolOperation};
+use scheduler::{Entry, State};
 pub mod persistence;
 mod recovery;
 pub use conflicts::{Conflict, ConflictDecision};
 use persistence::{TaskBinding, TaskId, TaskPersistence};
 pub use recovery::PersistentRun;
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OperationKind {
-    ObserveNode {
-        id: NodeId,
-        sequence: u64,
-        connected: bool,
-    },
-    LoadNode(NodeId),
-    OfflineNode {
-        id: NodeId,
-        sequence: u64,
-    },
-    OnlineNode {
-        id: NodeId,
-        sequence: u64,
-    },
-    OnlineDisk(DiskId),
-    OfflineDisk(DiskId),
-    CreateVolume(VolumeId),
-    AttachNode(NodeId),
-    DetachNode(NodeId),
-    CreateTier(TierId),
-    DeleteTier(TierId),
-    RemoveDisk(DiskId),
-    DeleteVolume(VolumeId),
-    DeletePool,
-    RenamePool,
-    UnloadPool,
-    LoadPool,
-    UserTask(String),
-    /// One admitted/running shrink per Pool; queued successors keep their order.
-    Shrink,
-    /// Explicit application extension for topology workflows.
-    Topology(String),
-}
-#[derive(Debug, Clone)]
-pub struct PoolOperation {
-    pub kind: OperationKind,
-    pub objects: Vec<ObjectKey>,
-}
-impl OperationKind {
-    fn task_class(&self) -> persistence::TaskClass {
-        match self {
-            Self::Shrink => persistence::TaskClass::Shrink,
-            kind if kind.is_topology() => persistence::TaskClass::Topology,
-            _ => persistence::TaskClass::General,
-        }
-    }
-    fn from_task(task: &persistence::StoredTask) -> Self {
-        match task.class {
-            persistence::TaskClass::General => Self::UserTask(task.name.clone()),
-            persistence::TaskClass::Shrink => Self::Shrink,
-            persistence::TaskClass::Topology => Self::Topology(task.name.clone()),
-        }
-    }
-}
-
-pub(crate) trait PoolWorkflow: Workflow {
-    fn operation(&self) -> PoolOperation;
-}
-
-#[derive(Debug, Clone)]
-pub struct ConflictMatch {
-    pub existing: WorkflowId,
-    pub conflict: Conflict,
-}
-/// Runtime observation, admission-time conflict explanations and live topology blockers.
-#[derive(Debug, Clone)]
-pub struct TaskSnapshot {
-    pub execution: workflow_foundation::TaskSnapshot,
-    pub conflicts: Vec<ConflictMatch>,
-    /// Live, accepted topology tasks delaying this shrink (including queued topology).
-    pub topology_blockers: Vec<WorkflowId>,
-}
-impl Deref for TaskSnapshot {
-    type Target = workflow_foundation::TaskSnapshot;
-    fn deref(&self) -> &Self::Target {
-        &self.execution
-    }
-}
-pub struct TaskObserver {
-    execution: workflow_foundation::TaskObserver,
-    conflicts: Vec<ConflictMatch>,
-    blockers: Blockers,
-}
-impl TaskObserver {
-    pub fn snapshot(&self) -> TaskSnapshot {
-        let execution = self.execution.snapshot();
-        TaskSnapshot {
-            topology_blockers: self
-                .blockers
-                .lock()
-                .unwrap()
-                .get(&execution.id)
-                .cloned()
-                .unwrap_or_default(),
-            execution,
-            conflicts: self.conflicts.clone(),
-        }
-    }
-    pub async fn changed(&mut self) -> Outcome<TaskSnapshot> {
-        let execution = self.execution.changed().await?;
-        Ok(TaskSnapshot {
-            topology_blockers: self
-                .blockers
-                .lock()
-                .unwrap()
-                .get(&execution.id)
-                .cloned()
-                .unwrap_or_default(),
-            execution,
-            conflicts: self.conflicts.clone(),
-        })
-    }
-}
-#[derive(Debug, Clone, Default)]
-pub struct SchedulingSnapshot {
-    pub queued: usize,
-    pub running: usize,
-    /// Logical ownership fences; only reconciliation can release these (not implemented).
-    pub fenced: usize,
-}
-
 type Explanations = Arc<Mutex<BTreeMap<WorkflowId, Vec<ConflictMatch>>>>;
 type Blockers = Arc<Mutex<BTreeMap<WorkflowId, Vec<WorkflowId>>>>;
 struct Accepted {
@@ -161,146 +44,6 @@ struct Submission {
     accept: Accept,
     administrative: bool,
     recovery_task: Option<TaskId>,
-}
-struct Entry {
-    operation: PoolOperation,
-    control: RunControl,
-    start: Option<StartPermit>,
-    task_id: Option<TaskId>,
-}
-#[derive(Default)]
-struct State {
-    entries: BTreeMap<WorkflowId, Entry>,
-    fences: Vec<(Option<TaskId>, PoolOperation)>,
-    pending_tasks: BTreeMap<TaskId, PoolOperation>,
-}
-impl State {
-    // Reap before every admission too: a terminal notification may still be in the mailbox.
-    fn reap(&mut self) {
-        let terminal: Vec<_> = self
-            .entries
-            .iter()
-            .filter_map(|(id, e)| {
-                matches!(e.control.state(), RunState::Completed | RunState::Failed(_))
-                    .then_some(*id)
-            })
-            .collect();
-        for id in terminal {
-            let entry = self.entries.remove(&id).unwrap();
-            if matches!(
-                entry.control.state(),
-                RunState::Failed(Failure::Uncertain(_))
-            ) {
-                self.fences.push((entry.task_id, entry.operation));
-            }
-        }
-    }
-    fn inspect(
-        &self,
-        operation: &PoolOperation,
-        recovery_task: Option<TaskId>,
-    ) -> Outcome<Vec<ConflictMatch>> {
-        if self
-            .pending_tasks
-            .iter()
-            .any(|(id, pending)| Some(*id) != recovery_task && pending.overlaps(operation))
-        {
-            return Err(crate::support::reject(
-                "unfinished task owns these objects; continue or cancel the original task",
-            ));
-        }
-        let mut matches = Vec::new();
-        for (id, entry) in &self.entries {
-            let conflict = TaskCenter::conflict(operation, &entry.operation);
-            if let ConflictDecision::Reject(reason) = conflict.decision {
-                return Err(crate::support::reject(reason));
-            }
-            if conflict.decision != ConflictDecision::Independent {
-                matches.push(ConflictMatch {
-                    existing: *id,
-                    conflict,
-                });
-            }
-        }
-        Ok(matches)
-    }
-    fn snapshot(&self) -> SchedulingSnapshot {
-        SchedulingSnapshot {
-            queued: self.entries.values().filter(|e| e.start.is_some()).count(),
-            running: self.entries.values().filter(|e| e.start.is_none()).count(),
-            fenced: self.fences.len(),
-        }
-    }
-    fn pump(&mut self) {
-        // All accepted topo tasks block shrink, including queued tasks. A topology fence
-        // retains the pause until business reconciliation; terminal Uncertain is not release.
-        let topo_pending = self
-            .entries
-            .values()
-            .any(|e| e.operation.kind.is_topology())
-            || self.fences.iter().any(|(_, f)| f.kind.is_topology())
-            || self.pending_tasks.values().any(|p| p.kind.is_topology());
-        for entry in self.entries.values() {
-            if entry.operation.kind == OperationKind::Shrink {
-                let _ = entry.control.set_system_pause(topo_pending);
-            }
-        }
-        let owners: Vec<_> = self
-            .entries
-            .iter()
-            .map(|(id, entry)| {
-                (
-                    *id,
-                    entry.operation.clone(),
-                    entry.start.is_none(),
-                    entry.control.pause_acknowledged(),
-                )
-            })
-            .collect();
-        for (id, entry) in self.entries.iter_mut() {
-            if entry.start.is_none() {
-                continue;
-            }
-            if self
-                .fences
-                .iter()
-                .any(|(_, f)| f.overlaps(&entry.operation))
-            {
-                entry
-                    .start
-                    .take()
-                    .unwrap()
-                    .reject(crate::support::reject("object requires reconciliation"));
-                continue;
-            }
-            if entry.operation.kind == OperationKind::Shrink && topo_pending {
-                continue;
-            }
-            let blocked = owners.iter().any(|(other_id, operation, started, paused)| {
-                if other_id == id || (!started && other_id > id) {
-                    return false;
-                }
-                if !operation.overlaps(&entry.operation) {
-                    return false;
-                }
-                // Explicit priority exception. A queued shrink has no effects; a started
-                // shrink can be bypassed ONLY after an actual safe-pause acknowledgement.
-                if entry.operation.kind.is_topology() && operation.kind == OperationKind::Shrink {
-                    return *started && !paused;
-                }
-                true
-            });
-            let recovered = self
-                .pending_tasks
-                .iter()
-                .any(|(owner, p)| Some(*owner) != entry.task_id && p.overlaps(&entry.operation));
-            if !blocked && !recovered {
-                entry.start.take().unwrap().start();
-                // Include this newly started owner when considering later queue entries.
-                // Earlier queued owners already block later conflicts in `owners`.
-            }
-        }
-    }
 }
 enum PersistenceControl {
     Restore {
@@ -325,7 +68,6 @@ pub struct TaskCenter {
     execution: ExecutionView,
     failure: Arc<Mutex<Option<Failure>>>,
     tx: mpsc::Sender<Submission>,
-    routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
     explanations: Explanations,
     blockers: Blockers,
     scheduling: Arc<Mutex<SchedulingSnapshot>>,
@@ -512,7 +254,6 @@ impl TaskCenter {
             execution,
             failure,
             tx,
-            routing: Arc::default(),
             explanations,
             blockers,
             scheduling,
@@ -550,15 +291,6 @@ impl TaskCenter {
     pub(crate) fn stopped(&self) -> bool {
         self.stop.is_cancelled()
     }
-    pub(crate) fn has_reservation(&self, id: &DiskId) -> bool {
-        self.routing.lock().unwrap().contains_key(id)
-    }
-    pub(crate) fn disk_spec(&self, id: &DiskId) -> Option<DiskSpec> {
-        self.routing.lock().unwrap().get(id).cloned()
-    }
-    pub(crate) fn disk_directory(&self) -> Arc<Mutex<BTreeMap<DiskId, DiskSpec>>> {
-        self.routing.clone()
-    }
     pub(crate) fn stop(&self) {
         self.stop.cancel();
     }
@@ -576,27 +308,6 @@ impl TaskCenter {
             p.flush().await?;
         }
         result
-    }
-    pub(crate) fn register_disk(&self, spec: &DiskSpec) -> Outcome<()> {
-        let mut routing = self.routing.lock().unwrap();
-        if let Some(old) = routing.get(&spec.id)
-            && (old.node != spec.node
-                || old.tier != spec.tier
-                || old.capacity_blks != spec.capacity_blks)
-        {
-            return Err(crate::support::reject("disk routing identity is immutable"));
-        }
-        routing.insert(spec.id.clone(), spec.clone());
-        Ok(())
-    }
-    pub(crate) fn node_disks(&self, node: &NodeId) -> Vec<DiskSpec> {
-        self.routing
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|s| &s.node == node)
-            .cloned()
-            .collect()
     }
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.execution

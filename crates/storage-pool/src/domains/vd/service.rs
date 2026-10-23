@@ -4,15 +4,11 @@ use crate::domains::{
     vd::{VirtualDisk, VolumeId},
 };
 use crate::{ports::*, support::reject};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use workflow_foundation::Outcome;
 
 pub(crate) enum VdCommand {
-    Refresh,
     RequireDiskUnreferenced(DiskId),
     Delete(VolumeId),
     RequireAbsent(VolumeId),
@@ -33,10 +29,7 @@ pub(crate) enum VdReply {
     Invalidated,
 }
 pub(crate) struct VdService {
-    authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
-    deleted: Mutex<BTreeMap<VolumeId, VirtualDisk>>,
     pool: PoolId,
-    volumes: Mutex<BTreeMap<VolumeId, VirtualDisk>>,
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
 }
@@ -45,13 +38,9 @@ impl VdService {
         pool: PoolId,
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
-        authoritative_reads: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            authoritative_reads,
-            deleted: Mutex::default(),
             pool,
-            volumes: Mutex::new(BTreeMap::new()),
             metadata,
             data_plane,
         }
@@ -61,30 +50,10 @@ impl VdService {
         request: VdCommand,
         cancel: &CancellationToken,
     ) -> Outcome<VdReply> {
-        if self
-            .authoritative_reads
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && !matches!(request, VdCommand::Refresh)
-        {
-            let snapshot = self.metadata.snapshot(&self.pool).await?;
-            *self.volumes.lock().unwrap() = snapshot
-                .volumes
-                .into_iter()
-                .map(|v| (v.id.clone(), v))
-                .collect();
-        }
+        let snapshot = self.metadata.snapshot(&self.pool).await?;
         match request {
-            VdCommand::Refresh => {
-                let snapshot = self.metadata.snapshot(&self.pool).await?;
-                *self.volumes.lock().unwrap() = snapshot
-                    .volumes
-                    .into_iter()
-                    .map(|v| (v.id.clone(), v))
-                    .collect();
-                Ok(VdReply::Checked)
-            }
             VdCommand::RequireDiskUnreferenced(id) => {
-                if self.volumes.lock().unwrap().values().any(|volume| {
+                if snapshot.volumes.iter().any(|volume| {
                     volume
                         .groups
                         .iter()
@@ -96,16 +65,15 @@ impl VdService {
                 Ok(VdReply::Checked)
             }
             VdCommand::Delete(id) => {
-                if let Some(volume) = self.deleted.lock().unwrap().get(&id).cloned() {
+                if let Some(volume) = snapshot
+                    .deleted_volumes
+                    .iter()
+                    .find(|v| v.id == id)
+                    .cloned()
+                {
                     return Ok(VdReply::Deleted(volume));
                 }
-                let volume = self
-                    .volumes
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .cloned()
-                    .ok_or_else(|| reject("unknown volume"))?;
+                let volume = snapshot.volume(&id)?;
                 self.data_plane
                     .delete_volume(&self.pool, &id, cancel)
                     .await?;
@@ -123,13 +91,11 @@ impl VdService {
                             "volume stopped but deletion not confirmed: {e}"
                         ))
                     })?;
-                self.volumes.lock().unwrap().remove(&id);
-                self.deleted.lock().unwrap().insert(id, volume.clone());
                 Ok(VdReply::Deleted(volume))
             }
             VdCommand::RequireAbsent(id) => {
-                if self.volumes.lock().unwrap().contains_key(&id)
-                    || self.deleted.lock().unwrap().contains_key(&id)
+                if snapshot.volumes.iter().any(|v| v.id == id)
+                    || snapshot.deleted_volumes.iter().any(|v| v.id == id)
                 {
                     Err(reject("volume already exists"))
                 } else {
@@ -137,8 +103,8 @@ impl VdService {
                 }
             }
             VdCommand::Create { id, allocations } => {
-                if self.volumes.lock().unwrap().contains_key(&id)
-                    || self.deleted.lock().unwrap().contains_key(&id)
+                if snapshot.volumes.iter().any(|v| v.id == id)
+                    || snapshot.deleted_volumes.iter().any(|v| v.id == id)
                 {
                     return Err(reject("volume already exists"));
                 }
@@ -152,7 +118,6 @@ impl VdService {
                 self.metadata
                     .commit(&self.pool, MetadataChange::CreateVolume(volume.clone()))
                     .await?;
-                self.volumes.lock().unwrap().insert(id, volume.clone());
                 Ok(VdReply::Created(volume))
             }
             VdCommand::WaitRebuild(disk) => {
@@ -176,9 +141,6 @@ impl VdService {
                             MetadataChange::InvalidateDisk { disk: disk.clone() },
                         )
                         .await?;
-                    for volume in self.volumes.lock().unwrap().values_mut() {
-                        volume.invalidate(&disk);
-                    }
                 }
                 Ok(VdReply::Invalidated)
             }
@@ -189,24 +151,8 @@ impl VdService {
                         MetadataChange::InvalidateDisk { disk: disk.clone() },
                     )
                     .await?;
-                for volume in self.volumes.lock().unwrap().values_mut() {
-                    volume.invalidate(&disk);
-                }
                 Ok(VdReply::Invalidated)
             }
-        }
-    }
-    pub fn query(&self, id: Option<VolumeId>) -> Outcome<Vec<VirtualDisk>> {
-        let volumes = self.volumes.lock().unwrap();
-        match id {
-            Some(id) => Ok(vec![
-                volumes
-                    .get(&id)
-                    .cloned()
-                    .or_else(|| self.deleted.lock().unwrap().get(&id).cloned())
-                    .ok_or_else(|| reject("unknown volume"))?,
-            ]),
-            None => Ok(volumes.values().cloned().collect()),
         }
     }
 }

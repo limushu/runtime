@@ -1,14 +1,10 @@
 use super::*;
 use crate::{
     support::{object, reject},
-    task_center::{OperationKind, PoolOperation, PoolWorkflow},
     workflows::Domains,
 };
 use async_trait::async_trait;
-use workflow_foundation::{
-    ActivityClient, ActivityContext, ObjectKey, ResourceAccess, ServiceHandler, Workflow,
-    WorkflowContext,
-};
+use workflow_foundation::{ActivityClient, ActivityContext, ResourceAccess, ServiceHandler};
 
 pub(crate) enum AdminCommand {
     Rename {
@@ -21,6 +17,7 @@ pub(crate) type AdminClient = ActivityClient<AdminCommand, PoolDescriptor, (), P
 pub(crate) struct AdminHost {
     pub shared: Arc<PoolShared>,
     pub domains: Domains,
+    pub metadata: Arc<dyn MetadataStore>,
 }
 #[async_trait]
 impl ServiceHandler for AdminHost {
@@ -64,16 +61,16 @@ impl ServiceHandler for AdminHost {
                 Ok(descriptor.clone())
             }
             AdminCommand::CheckEmpty => {
-                let (nodes, disks, volumes, tiers) = tokio::try_join!(
-                    self.domains.node.query(None),
-                    self.domains.disk.query(None),
-                    self.domains.vd.query(None),
-                    self.domains.tier.query(None)
-                )?;
+                let nodes = self.domains.node.query(None).await?;
+                let pool = self.shared.descriptor.lock().unwrap().id.clone();
+                let snapshot = self.metadata.snapshot(&pool).await?;
                 if !nodes.is_empty()
-                    || !disks.is_empty()
-                    || !volumes.is_empty()
-                    || !tiers.is_empty()
+                    || snapshot
+                        .disks
+                        .iter()
+                        .any(|d| d.membership == DiskMembership::Member)
+                    || !snapshot.volumes.is_empty()
+                    || !snapshot.tiers.is_empty()
                     || !self.shared.nodes.lock().unwrap().is_empty()
                 {
                     return Err(reject("pool still has children or pending members"));
@@ -95,60 +92,5 @@ impl ServiceHandler for AdminHost {
     }
     fn query(&self, _: ()) -> Outcome<PoolDescriptor> {
         Ok(self.shared.descriptor.lock().unwrap().clone())
-    }
-}
-
-pub(crate) struct RenamePoolWorkflow {
-    pub client: AdminClient,
-    pub name: PoolName,
-    pub revision: u64,
-}
-impl PoolWorkflow for RenamePoolWorkflow {
-    fn operation(&self) -> PoolOperation {
-        PoolOperation {
-            kind: OperationKind::RenamePool,
-            objects: self.objects(),
-        }
-    }
-}
-#[async_trait]
-impl Workflow for RenamePoolWorkflow {
-    type Output = PoolDescriptor;
-    const NAME: &'static str = "storage.rename-pool";
-    fn objects(&self) -> Vec<ObjectKey> {
-        vec![object("pool", "directory")]
-    }
-    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<PoolDescriptor> {
-        ctx.activity(
-            &self.client,
-            AdminCommand::Rename {
-                name: self.name,
-                expected_revision: self.revision,
-            },
-        )
-        .await
-    }
-}
-pub(crate) struct DeletePoolWorkflow {
-    pub client: AdminClient,
-}
-impl PoolWorkflow for DeletePoolWorkflow {
-    fn operation(&self) -> PoolOperation {
-        PoolOperation {
-            kind: OperationKind::DeletePool,
-            objects: self.objects(),
-        }
-    }
-}
-#[async_trait]
-impl Workflow for DeletePoolWorkflow {
-    type Output = ();
-    const NAME: &'static str = "storage.delete-pool";
-    fn objects(&self) -> Vec<ObjectKey> {
-        vec![object("pool", "directory")]
-    }
-    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
-        ctx.activity(&self.client, AdminCommand::CheckEmpty).await?;
-        Ok(())
     }
 }

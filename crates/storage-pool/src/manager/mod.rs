@@ -1,14 +1,8 @@
 //! Shared handle registry. No manager actor, domain scheduler, or global workflow host.
-pub(crate) mod admin;
 mod fanout;
 mod identity;
-mod lifecycle;
-mod ownership;
-mod pool_ops;
 pub use fanout::*;
 pub use identity::*;
-pub(crate) use ownership::{DiskReservation, NodeReservation, RemovalGuard};
-pub(crate) use pool_ops::PoolShared;
 
 use crate::{ports::*, support::reject, *};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -25,86 +19,11 @@ pub(crate) struct Registry {
     pub pools: BTreeMap<PoolId, Pool>,
     pub uuids: BTreeMap<PoolUuid, PoolId>,
     pub names: BTreeMap<PoolName, PoolId>,
-    pub disks: BTreeMap<DiskId, ownership::DiskOwnership>,
+    pub disks: BTreeMap<DiskId, crate::pool::DiskOwnership>,
     pub stopped: bool,
     pub retired: BTreeMap<PoolId, PoolDescriptor>,
     pub history: VecDeque<Pool>,
     pub history_limit: usize,
-}
-
-pub(crate) fn retire_disk(
-    shared: &PoolShared,
-    routing: &Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
-    id: &DiskId,
-) -> Outcome<()> {
-    if let Some(registry) = shared.registry.upgrade() {
-        let mut registry = registry.lock().unwrap();
-        let uuid = shared.descriptor.lock().unwrap().uuid;
-        if registry
-            .disks
-            .get(id)
-            .is_some_and(|owner| owner.owner == uuid)
-        {
-            registry.disks.remove(id);
-        }
-    }
-    routing.lock().unwrap().remove(id);
-    shared.retiring_disks.lock().unwrap().insert(id.clone());
-    Ok(())
-}
-pub(crate) fn restore_disk_directory(
-    shared: &PoolShared,
-    routing: &Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
-    disks: Vec<MemberDisk>,
-) -> Outcome<()> {
-    let registry = shared.registry.upgrade().ok_or(Failure::Unavailable)?;
-    let mut registry = registry.lock().unwrap();
-    let uuid = shared.descriptor.lock().unwrap().uuid;
-    for disk in &disks {
-        if disk.membership == DiskMembership::Member
-            && registry
-                .disks
-                .get(&disk.id)
-                .is_some_and(|owner| owner.owner != uuid)
-        {
-            return Err(reject("restored disk is owned by another pool"));
-        }
-    }
-    let mut directory = routing.lock().unwrap();
-    directory.clear();
-    for disk in disks {
-        if disk.membership == DiskMembership::Removed {
-            shared.retiring_disks.lock().unwrap().insert(disk.id);
-            continue;
-        }
-        registry.disks.insert(
-            disk.id.clone(),
-            ownership::DiskOwnership {
-                owner: uuid,
-                claims: 0,
-                confirmed: true,
-                uncertain: false,
-            },
-        );
-        shared.nodes.lock().unwrap().insert(disk.node.clone());
-        shared
-            .node_claims
-            .lock()
-            .unwrap()
-            .entry(disk.node.clone())
-            .or_default()
-            .confirmed = true;
-        directory.insert(
-            disk.id.clone(),
-            DiskSpec {
-                id: disk.id,
-                node: disk.node,
-                tier: disk.tier,
-                capacity_blks: disk.capacity_blks,
-            },
-        );
-    }
-    Ok(())
 }
 
 /// Clones share registry ownership. Pool handles remain bound to their original UUID.

@@ -32,7 +32,7 @@
 
 ## 源码对应
 
-- [Pool 装配](../crates/storage-pool/src/pool.rs)
+- [Pool 装配](../crates/storage-pool/src/pool/mod.rs)
 - [TaskCenter 外层循环与 State](../crates/storage-pool/src/task_center/mod.rs)
 - [业务冲突判断](../crates/storage-pool/src/task_center/conflicts.rs)
 - [WorkflowDriver / ExecutionView / StartPermit](../crates/workflow-foundation/src/driver.rs)

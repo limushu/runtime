@@ -1,6 +1,13 @@
 mod model;
 pub(crate) mod runtime;
-pub(crate) mod service;
 pub use model::*;
-
-pub(crate) use service::BalanceCommand;
+pub(crate) enum BalanceCommand {
+    Evacuate {
+        disk: crate::DiskId,
+        id: EvacuationId,
+    },
+    Cancel {
+        disk: crate::DiskId,
+        id: EvacuationId,
+    },
+}

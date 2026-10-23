@@ -1,4 +1,4 @@
-use super::{model::*, service::*};
+use super::service::*;
 use crate::support::object;
 use async_trait::async_trait;
 use workflow_foundation::{ActivityContext, Outcome, ResourceAccess, ServiceHandler};
@@ -9,11 +9,10 @@ pub(crate) struct VdHost(pub VdService);
 impl ServiceHandler for VdHost {
     type Request = VdCommand;
     type Reply = VdReply;
-    type Query = Option<VolumeId>;
-    type View = Vec<VirtualDisk>;
+    type Query = ();
+    type View = ();
     fn activity_name(request: &VdCommand) -> &'static str {
         match request {
-            VdCommand::Refresh => "vd.refresh-committed-placement",
             VdCommand::Delete(_) => "vd.delete",
             VdCommand::RequireDiskUnreferenced(_) => "vd.require-disk-unreferenced",
             VdCommand::RequireAbsent(_) => "vd.require-absent",
@@ -39,7 +38,7 @@ impl ServiceHandler for VdHost {
     async fn execute(&self, request: Self::Request, ctx: ActivityContext) -> Outcome<Self::Reply> {
         self.0.execute(request, ctx.control().cancellation()).await
     }
-    fn query(&self, query: Self::Query) -> Outcome<Self::View> {
-        self.0.query(query)
+    fn query(&self, _: ()) -> Outcome<()> {
+        Ok(())
     }
 }

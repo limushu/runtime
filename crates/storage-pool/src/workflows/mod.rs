@@ -11,12 +11,17 @@ use workflow_foundation::{ActivityClient, ObjectKey};
 mod create_volume;
 mod load_node;
 mod manage_children;
+mod manage_pool;
+mod pool_lifecycle;
+pub(crate) use manage_pool::*;
+pub(crate) use pool_lifecycle::*;
 mod observe_node;
 mod offline_disk;
 mod offline_node;
 mod online_disk;
 mod online_node;
 mod restore_metadata;
+pub(crate) use restore_metadata::RestoreMetadataWorkflow;
 mod shrink_disk;
 pub(crate) use manage_children::*;
 pub(crate) use shrink_disk::ShrinkRequest;
@@ -32,11 +37,12 @@ pub use online_node::OnlineNodeWorkflow;
 
 #[derive(Clone)]
 pub(crate) struct Domains {
+    pub membership: crate::pool::MembershipClient,
     pub balance: ActivityClient<crate::domains::balance::BalanceCommand, (), (), ()>,
-    pub tier: ActivityClient<TierCommand, TierReply, Option<TierId>, Vec<Tier>>,
-    pub disk: ActivityClient<DiskCommand, DiskReply, Option<DiskId>, Vec<MemberDisk>>,
+    pub tier: ActivityClient<TierCommand, TierReply, (), ()>,
+    pub disk: ActivityClient<DiskCommand, DiskReply, (), ()>,
     pub node: ActivityClient<NodeCommand, PoolNode, Option<NodeId>, Vec<PoolNode>>,
-    pub vd: ActivityClient<VdCommand, VdReply, Option<VolumeId>, Vec<VirtualDisk>>,
+    pub vd: ActivityClient<VdCommand, VdReply, (), ()>,
 }
 
 fn disk_result(reply: DiskReply) -> Outcome<MemberDisk> {

@@ -25,7 +25,7 @@
 排空 Activity 使用 job/control 资源，不长期占用 Disk/Node 写资源。均衡模块自行拥有复制、放置和 remap 的互斥。
 完成后会刷新并验证真实引用、分配，不能用均衡返回 Ok 代替它们。
 
-Down 与 Removed 置于一个短、不可中途暂停的 Activity（`disk.down-and-remove`）中。
+Down、Removed 和 Pool 目录更新置于一个短、不可中途暂停的 Activity（`pool.finalize-shrink`）中。
 这样 topo 只能在这个步骤之前或之后执行，无法在 Down 后、Removed 前重新打开磁盘。
 元数据提交必须再次原子核验 revision、缩容身份、Inactive、无分配和无引用。
 IO 已发生但元数据结果不明确时返回 Uncertain，保留隔离，不伪装成没有发生过。
@@ -59,13 +59,12 @@ let removed = run.result().await?;
 pause/cancel 成功必须表示在途工作已稳定；resume 应核对当前拓扑；wait 返回真实最终结果。
 均衡适配层串行化同一 job 的控制指令，取消等待不会丢弃已经发送的领域指令。
 
-元数据适配器还需支持 `MetadataStore::snapshot`，提供一致的 tiers/disks/volumes/allocation-owner 视图，
-以及 ShrinkIntent、DisableAllocation、ClearShrink、MarkRemoved 的版本化提交。
-`MetadataChange::Remap` 表达数据复制确认后的原子引用/分配切换，不执行物理复制。
+元数据使用 `metadata::KvMetadata`，接入自己的数据库只需实现 `KvStore`。
+仓储统一提供完整一致视图、revision 校验、意图/分配/成员状态及原子 remap；
+`MetadataChange::Remap` 表达复制确认后的引用/分配切换，不执行物理复制。
 
-均衡开始后，磁盘与 VD 命令会先读取权威元数据，避免 topo、分配或卷删除继续使用 remap 前的 revision/owner。
-Facade 的磁盘和卷查询同样读取已提交状态。当前接口是整池 snapshot；生产适配器可用一致的内存投影提供，
-大规模数据库实现可进一步替换成带版本的定向读取/变更订阅。
+磁盘、VD 命令及 Pool 查询始终读取同一个权威仓储；不再切换缓存模式，也不由 Workflow 显式刷新领域缓存。
+数据库契约、记录布局和可共享数据库的接入示例见 [元数据模块](metadata.md)。
 
 ## topo、条件与取消
 
@@ -98,8 +97,8 @@ let inactive_member = abort.result().await?;
 ## Task 历史与切换后续办
 
 配置 TaskStore 时，`shrink_disk` 自动提交可续办的 Shrink Task 并登记内置恢复函数；未配置时仅在内存运行。
-输入保存磁盘不可变身份和 job ID，检查点保存意图已提交、分配已禁用、排空完成、Removed 等业务边界。
-恢复时以权威事实和领域幂等命令为准，不反序列化 Future，也不只相信检查点位置。
+输入保存磁盘不可变身份和 job ID。意图、分配、placement 和 Removed 等业务事实由元数据仓储持久化。
+恢复时核验这些事实并调用领域幂等命令，不额外保存一份未参与恢复决策的阶段检查点，也不反序列化 Future。
 
 `ControlToken::cancellation_reason()` 区分 Requested 与 Interrupted：用户取消终止 job；
 宿主/服务停止则等待 job 暂停并结束本次执行，保留外部 job 给下一任继续。

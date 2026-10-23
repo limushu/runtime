@@ -172,16 +172,13 @@ async fn complete_workflow_commits_real_remaps_verifies_projections_and_retains_
     assert_eq!(
         names,
         [
-            "disk.refresh-committed-state",
             "disk.inspect",
             "disk.request-shrink",
             "disk.disable-allocation",
             "balance.evacuate-whole-disk",
-            "vd.refresh-committed-placement",
-            "disk.refresh-committed-state",
             "vd.require-disk-unreferenced",
             "disk.require-empty",
-            "disk.down-and-remove"
+            "pool.finalize-shrink"
         ]
     );
     assert!(

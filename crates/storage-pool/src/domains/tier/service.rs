@@ -1,98 +1,71 @@
 use super::*;
-use crate::{Outcome, ports::*, support::reject};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
-};
-
+use crate::{Outcome, metadata::*, support::reject};
+use std::sync::Arc;
 pub(crate) enum TierCommand {
-    Refresh,
     Create(TierId),
     Inspect(TierId),
     Delete(TierId),
 }
 pub(crate) enum TierReply {
-    Checked,
     Tier(Tier),
     Deleted,
 }
 pub(crate) struct TierService {
     pool: PoolId,
     metadata: Arc<dyn MetadataStore>,
-    tiers: Mutex<BTreeMap<TierId, Tier>>,
-    deleted: Mutex<BTreeSet<TierId>>,
 }
 impl TierService {
     pub fn new(pool: PoolId, metadata: Arc<dyn MetadataStore>) -> Self {
-        Self {
-            pool,
-            metadata,
-            tiers: Mutex::default(),
-            deleted: Mutex::default(),
-        }
+        Self { pool, metadata }
     }
     pub async fn execute(&self, request: TierCommand) -> Outcome<TierReply> {
+        let snapshot = self.metadata.snapshot(&self.pool).await?;
         match request {
-            TierCommand::Refresh => {
-                let snapshot = self.metadata.snapshot(&self.pool).await?;
-                *self.tiers.lock().unwrap() = snapshot
-                    .tiers
-                    .into_iter()
-                    .map(|t| (t.id.clone(), t))
-                    .collect();
-                Ok(TierReply::Checked)
-            }
             TierCommand::Create(id) => {
-                if self.deleted.lock().unwrap().contains(&id) {
+                if snapshot.retired_tiers.contains(&id) {
                     return Err(reject("tier identity is retired"));
                 }
-                if let Some(tier) = self.tiers.lock().unwrap().get(&id).cloned() {
-                    return Ok(TierReply::Tier(tier));
+                if let Some(tier) = snapshot.tiers.iter().find(|t| t.id == id) {
+                    return Ok(TierReply::Tier(tier.clone()));
                 }
                 let tier = Tier {
-                    id: id.clone(),
+                    id,
                     pool: self.pool.clone(),
                     revision: 0,
                 };
                 self.metadata
                     .commit(&self.pool, MetadataChange::CreateTier(tier.clone()))
                     .await?;
-                self.tiers.lock().unwrap().insert(id, tier.clone());
                 Ok(TierReply::Tier(tier))
             }
-            TierCommand::Inspect(id) => Ok(TierReply::Tier(self.get(&id)?)),
+            TierCommand::Inspect(id) => Ok(TierReply::Tier(
+                snapshot
+                    .tiers
+                    .iter()
+                    .find(|t| t.id == id)
+                    .cloned()
+                    .ok_or_else(|| reject("unknown tier"))?,
+            )),
             TierCommand::Delete(id) => {
-                if self.deleted.lock().unwrap().contains(&id) {
+                if snapshot.retired_tiers.contains(&id) {
                     return Ok(TierReply::Deleted);
                 }
-                let tier = self.get(&id)?;
+                let tier = snapshot
+                    .tiers
+                    .iter()
+                    .find(|t| t.id == id)
+                    .ok_or_else(|| reject("unknown tier"))?;
                 self.metadata
                     .commit(
                         &self.pool,
                         MetadataChange::DeleteTier {
-                            id: id.clone(),
+                            id,
                             expected_revision: tier.revision,
                         },
                     )
                     .await?;
-                self.tiers.lock().unwrap().remove(&id);
-                self.deleted.lock().unwrap().insert(id);
                 Ok(TierReply::Deleted)
             }
-        }
-    }
-    fn get(&self, id: &TierId) -> Outcome<Tier> {
-        self.tiers
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| reject("unknown tier"))
-    }
-    pub fn query(&self, id: Option<TierId>) -> Outcome<Vec<Tier>> {
-        match id {
-            Some(id) => Ok(vec![self.get(&id)?]),
-            None => Ok(self.tiers.lock().unwrap().values().cloned().collect()),
         }
     }
 }

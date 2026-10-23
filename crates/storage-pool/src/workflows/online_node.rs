@@ -11,7 +11,7 @@ pub struct OnlineNodeWorkflow {
     pub(crate) domains: Domains,
     pub(crate) request: NodeTransitionRequest,
     pub(crate) specs: Vec<DiskSpec>,
-    pub(crate) reservations: Vec<crate::manager::DiskReservation>,
+    pub(crate) reservations: Vec<crate::pool::DiskReservation>,
 }
 
 impl PoolWorkflow for OnlineNodeWorkflow {

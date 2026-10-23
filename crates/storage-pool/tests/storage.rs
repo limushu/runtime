@@ -98,6 +98,10 @@ impl ControlledStore {
 }
 #[async_trait]
 impl MetadataStore for ControlledStore {
+    async fn snapshot(&self, pool: &PoolId) -> Outcome<storage_pool::metadata::MetadataSnapshot> {
+        self.inner.snapshot(pool).await
+    }
+
     async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()> {
         let behavior = {
             let mut next = self.next.lock().unwrap();
@@ -634,7 +638,7 @@ async fn failed_initialization_never_marks_data_valid() {
 }
 
 #[tokio::test]
-async fn ambiguous_commit_fences_followers_and_does_not_publish_unconfirmed_view() {
+async fn ambiguous_commit_fences_followers_while_reads_show_authoritative_metadata() {
     let store = Arc::new(ControlledStore::default());
     let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
     store.fail(
@@ -646,7 +650,9 @@ async fn ambiguous_commit_fences_followers_and_does_not_publish_unconfirmed_view
         result(pool.create_volume(request("v")).await.unwrap()).await,
         Err(Failure::Uncertain(_))
     ));
-    assert!(pool.volumes().await.unwrap().is_empty());
+    // A successful authoritative read can observe the committed record. It does not
+    // resolve the uncertain execution or release its conflict fence.
+    assert_eq!(pool.volumes().await.unwrap()[0].id, volume_id("v"));
     assert!(
         store
             .inner
@@ -1524,6 +1530,9 @@ fn vertical_modules_preserve_model_service_runtime_dependencies() {
         ] {
             assert!(!model.contains(term), "{domain}/model depends on {term}");
         }
+        if domain == "balance" {
+            continue;
+        } // Adapter owns no duplicate forwarding service.
         let service = std::fs::read_to_string(folder.join("service.rs")).unwrap();
         for term in [
             "ServiceHandler",
@@ -1540,15 +1549,35 @@ fn vertical_modules_preserve_model_service_runtime_dependencies() {
     }
     for entry in std::fs::read_dir(src.join("workflows")).unwrap() {
         let source = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-        for term in ["::runtime", "Host", "AdmissionPolicy"] {
+        for term in [
+            "::runtime",
+            "Host",
+            "AdmissionPolicy",
+            "Mutex",
+            "PoolShared",
+            "Registry",
+            "impl PoolHandle",
+            "MetadataStore",
+        ] {
             assert!(!source.contains(term), "workflow depends on {term}");
         }
     }
-    let pool = std::fs::read_to_string(src.join("pool.rs")).unwrap();
+    let pool = std::fs::read_to_string(src.join("pool/mod.rs")).unwrap();
     assert!(!pool.contains("WorkflowRuntime"));
     assert!(!pool.contains("RuntimeHandle"));
     let center = std::fs::read_to_string(src.join("task_center/mod.rs")).unwrap();
     assert_eq!(center.matches("tokio::spawn(").count(), 1);
     assert!(center.contains("driver.tick()"));
     assert!(!center.contains("RuntimeHandle"));
+    assert!(!center.contains("disk_directory"));
+    assert!(!center.contains("DiskSpec"));
+    for file in [
+        "domains/disk/service.rs",
+        "domains/vd/service.rs",
+        "domains/tier/service.rs",
+    ] {
+        let source = std::fs::read_to_string(src.join(file)).unwrap();
+        assert!(!source.contains("authoritative_reads"));
+        assert!(!source.contains("Mutex"));
+    }
 }

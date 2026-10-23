@@ -1,13 +1,13 @@
-use super::{
-    service::{BalanceCommand, BalanceService},
-    *,
-};
+use super::*;
 use crate::{Failure, Outcome, ports::ArcJob, support::object};
 use async_trait::async_trait;
 use std::sync::Arc;
 use workflow_foundation::*;
 
-pub(crate) struct BalanceHost(pub Arc<BalanceService>);
+pub(crate) struct BalanceHost {
+    pub pool: crate::PoolId,
+    pub balancer: Arc<dyn crate::ports::Balancer>,
+}
 struct JobPause {
     job: ArcJob,
     commands: tokio::sync::Mutex<()>,
@@ -48,7 +48,7 @@ impl ServiceHandler for BalanceHost {
         let (disk, id) = match request {
             BalanceCommand::Evacuate { disk, id } => (disk, id),
             BalanceCommand::Cancel { disk, id } => {
-                if let Some(job) = self.0.find(id).await? {
+                if let Some(job) = self.balancer.find(&self.pool, id).await? {
                     if job.progress().borrow().disk != disk {
                         return Err(Failure::Rejected("job belongs to another disk".into()));
                     }
@@ -63,7 +63,7 @@ impl ServiceHandler for BalanceHost {
             }
         };
         // Never abandon an acceptance request: obtain the handle, then stop it if needed.
-        let job = self.0.open(&disk, id).await?;
+        let job = self.balancer.evacuate(&self.pool, &disk, id).await?;
         let control = Arc::new(JobPause {
             job: job.clone(),
             commands: tokio::sync::Mutex::new(()),

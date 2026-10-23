@@ -1,4 +1,3 @@
-mod facade;
 mod model;
 mod recorder;
 #[cfg(feature = "kv-redb")]

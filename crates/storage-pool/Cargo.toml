@@ -21,3 +21,7 @@ kv-redb = ["dep:redb"]
 [[example]]
 name = "task_persistence"
 required-features = ["kv-redb"]
+
+[[example]]
+name = "metadata_kv"
+required-features = ["kv-redb"]

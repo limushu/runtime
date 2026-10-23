@@ -7,17 +7,20 @@
 
 | 位置 | 职责 |
 | --- | --- |
-| [pool.rs](src/pool.rs) | 组合根、Pool 生命周期、对外业务入口 |
+| [pool](src/pool/mod.rs) | 组合根、Pool 生命周期、对外业务入口 |
 | [manager](src/manager/mod.rs) | 多索引句柄目录、公平扇出与逐池汇聚；业务由 Pool 推进 |
 | [task_center](src/task_center/mod.rs) | 协调状态、队列、占用和交接 |
 | [conflicts.rs](src/task_center/conflicts.rs) | 单一业务冲突判断入口 |
 | [workflows](src/workflows/mod.rs) | 完整业务流程，读写步骤均经 Activity |
 | [disk/service.rs](src/domains/disk/service.rs) | 磁盘能力、状态与外部效果协调 |
 | [domains](src/domains/mod.rs) | 按 disk / node / tier / vd / balance 聚合领域服务与托管适配 |
-| [ports.rs](src/ports.rs) | 元数据/数据面端口及失败契约 |
+| [metadata](src/metadata/mod.rs) | 统一业务仓储，可嵌入不同事务 KV |
+| [ports.rs](src/ports.rs) | 数据面与均衡端口及失败契约 |
 | [disk/runtime.rs](src/domains/disk/runtime.rs) | 磁盘服务托管协议与调用适配 |
 
-model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的 runtime。每个领域服务独立托管，
+model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的 runtime。
+Disk/Tier/VD 服务无第二份领域缓存，统一通过元数据仓储读取、提交。接入自己的数据库只需实现
+一致性前缀读取和条件原子批量写入，详见 [KV 元数据模块](../../docs/metadata.md)。每个领域服务独立托管，
 不自行管理业务对象冲突。短暂 Mutex 保护内存访问，不跨 await 持有。
 
 ## 业务范围
@@ -34,7 +37,7 @@ model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的
 - 节点上下线组织批量磁盘步骤；节点交接需等待旧流程及批量动作真正停稳。
 - 缩容：持久意图 → 禁止分配 → 整盘排空 → 核验引用及分配 → Down/关闭/Removed。
   同池 topo 等待排空实际暂停；全部结束后检查条件，再继续同一个 job。移除保留身份记录。
-- 已生效 IO 后元数据未确认是 Uncertain；不能凭旧视图继续修改。领域视图只表示最后确认状态。
+- 已生效 IO 后元数据未确认是 Uncertain，任务保持隔离。查询统一读取仓储事实，读回数据不会解除执行隔离。
 - 拓扑身份在当前模型中不可变。预读只用于稳定路由，影响执行决策的状态必须在 Workflow 内
   通过读 Activity 重新验证；外部观察可以 Query，不承诺跨领域一致快照。
 
@@ -88,6 +91,7 @@ cargo test --locked -p storage-pool
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
 cargo run --locked -p storage-pool --example shrink_disk
+cargo run --locked -p storage-pool --features kv-redb --example metadata_kv -- /tmp/runtime-demo.redb
 cargo run --locked -p storage-pool --example shrink_commands
 cargo run --locked -p storage-pool --features kv-redb --example task_persistence -- /tmp/tasks.redb
 ```

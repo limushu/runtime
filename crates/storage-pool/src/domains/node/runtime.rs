@@ -3,7 +3,7 @@ use crate::support::object;
 use async_trait::async_trait;
 use workflow_foundation::{ActivityContext, Outcome, ResourceAccess, ServiceHandler};
 
-pub(crate) struct NodeHost(pub NodeService);
+pub(crate) struct NodeHost(pub std::sync::Arc<NodeService>);
 
 #[async_trait]
 impl ServiceHandler for NodeHost {

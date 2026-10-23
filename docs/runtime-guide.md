@@ -90,7 +90,7 @@ watch 会合并更新，不能被当作无损或持久化的业务日志。
 
 ## 源码与进一步阅读
 
-- [Pool 装配](../crates/storage-pool/src/pool.rs)
+- [Pool 装配](../crates/storage-pool/src/pool/mod.rs)
 - [TaskCenter 的 State 与外层循环](../crates/storage-pool/src/task_center/mod.rs)
 - [具体冲突规则](../crates/storage-pool/src/task_center/conflicts.rs)
 - [Driver 的 tick / defer](../crates/workflow-foundation/src/driver.rs)

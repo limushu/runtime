@@ -1,19 +1,18 @@
-use super::{model::*, service::*};
+use super::service::*;
 use crate::support::object;
 use async_trait::async_trait;
 use workflow_foundation::{ActivityContext, Outcome, ResourceAccess, ServiceHandler};
 
-pub(crate) struct DiskHost(pub DiskService);
+pub(crate) struct DiskHost(pub std::sync::Arc<DiskService>);
 
 #[async_trait]
 impl ServiceHandler for DiskHost {
     type Request = DiskCommand;
     type Reply = DiskReply;
-    type Query = Option<DiskId>;
-    type View = Vec<MemberDisk>;
+    type Query = ();
+    type View = ();
     fn activity_name(request: &DiskCommand) -> &'static str {
         match request {
-            DiskCommand::Refresh => "disk.refresh-committed-state",
             DiskCommand::ShrinkIntent(..) => "disk.request-shrink",
             DiskCommand::DisableAllocation(..) => "disk.disable-allocation",
             DiskCommand::ClearShrink(..) => "disk.clear-shrink-intent",
@@ -34,27 +33,18 @@ impl ServiceHandler for DiskHost {
         }
     }
     fn resources(request: &DiskCommand) -> Vec<ResourceAccess> {
-        let mut resources = disk_resources(request);
-        resources.push(if matches!(request, DiskCommand::Refresh) {
-            ResourceAccess::write(object("disk", "catalog"))
-        } else {
-            ResourceAccess::read(object("disk", "catalog"))
-        });
-        resources
+        disk_resources(request)
     }
 
     async fn execute(&self, request: Self::Request, ctx: ActivityContext) -> Outcome<Self::Reply> {
         self.0.execute(request, ctx.control().cancellation()).await
     }
-    fn query(&self, query: Self::Query) -> Outcome<Self::View> {
-        self.0.query(query)
+    fn query(&self, _: ()) -> Outcome<()> {
+        Ok(())
     }
 }
 
 fn disk_resources(request: &DiskCommand) -> Vec<ResourceAccess> {
-    if matches!(request, DiskCommand::Refresh) {
-        return vec![];
-    }
     if let DiskCommand::RequireTierEmpty(tier) = request {
         return vec![ResourceAccess::read(object("tier", tier.as_str()))];
     }
@@ -75,7 +65,7 @@ fn disk_resources(request: &DiskCommand) -> Vec<ResourceAccess> {
             .collect();
     }
     let id = match request {
-        DiskCommand::Refresh | DiskCommand::RequireTierEmpty(_) => unreachable!(),
+        DiskCommand::RequireTierEmpty(_) => unreachable!(),
         DiskCommand::ShrinkIntent(id, _)
         | DiskCommand::DisableAllocation(id, _)
         | DiskCommand::ClearShrink(id, _)

@@ -1,5 +1,5 @@
-use super::*;
 use crate::task_center::PersistentRun;
+use crate::task_center::persistence::*;
 use crate::{Outcome, PoolHandle, Run, WorkflowId};
 use std::future::Future;
 use workflow_foundation::Workflow;
@@ -76,5 +76,33 @@ impl PoolHandle {
     }
     pub async fn cancel_task(&self, id: TaskId) -> Outcome<()> {
         self.task_center.cancel_task(id).await
+    }
+}
+
+impl PoolHandle {
+    pub(super) fn register_builtin_recovery(&self) -> Outcome<()> {
+        if !self.task_center.has_task_store() {
+            return Ok(());
+        }
+        let domains = self.domains.clone();
+        let metadata = self.metadata.clone();
+        let balance = self.balancer.clone();
+        let shared = self.shared.clone();
+        self.register_task_recovery("storage.shrink-disk", 1, move |task| {
+            let domains = domains.clone();
+            let metadata = metadata.clone();
+            let balance = balance.clone();
+            let shared = shared.clone();
+            async move {
+                let resume = task
+                    .resume
+                    .ok_or_else(|| crate::support::reject("missing shrink resume input"))?;
+                let request = serde_json::from_slice(&resume.input)
+                    .map_err(|e| crate::support::reject(e.to_string()))?;
+                Ok(super::shrink_disk::build_shrink(
+                    domains, request, metadata, balance, shared,
+                ))
+            }
+        })
     }
 }

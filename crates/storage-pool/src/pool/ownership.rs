@@ -1,5 +1,6 @@
 use super::*;
-use std::sync::Weak;
+use crate::manager::Registry;
+use std::{collections::BTreeMap, sync::Weak};
 
 enum RemovalKind {
     Node(NodeId),
@@ -199,7 +200,7 @@ impl PoolHandle {
         {
             return Err(reject("physical disk belongs to another pool"));
         }
-        self.task_center.register_disk(spec)?;
+        self.shared.register_disk(spec)?;
         let entry = registry
             .disks
             .entry(spec.id.clone())
@@ -214,7 +215,7 @@ impl PoolHandle {
             disk: spec.id.clone(),
             owner: descriptor.uuid,
             registry: self.shared.registry.clone(),
-            routing: self.task_center.disk_directory(),
+            routing: self.shared.disk_directory(),
             effect_pending: false,
         })
     }

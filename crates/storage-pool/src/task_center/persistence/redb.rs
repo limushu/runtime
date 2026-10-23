@@ -5,13 +5,13 @@ use super::{
 };
 use crate::{Failure, Outcome, PoolUuid};
 use ::redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 const TASKS: TableDefinition<&str, &[u8]> = TableDefinition::new("task_records_v1");
 const HISTORY: TableDefinition<&str, &str> = TableDefinition::new("task_history_v1");
 const ACTIVE: TableDefinition<&str, &str> = TableDefinition::new("recoverable_tasks_v1");
 pub struct RedbTaskStore {
-    db: Database,
+    db: Arc<Database>,
 }
 fn err(e: impl std::fmt::Display) -> Failure {
     Failure::Failed(format!("task database: {e}"))
@@ -26,7 +26,10 @@ fn decode(bytes: &[u8]) -> Outcome<StoredTask> {
 impl RedbTaskStore {
     /// Open in a blocking context (before starting a runtime, or via spawn_blocking).
     pub fn open(path: impl AsRef<Path>) -> Outcome<Self> {
-        let db = Database::create(path).map_err(err)?;
+        Self::from_database(Arc::new(Database::create(path).map_err(err)?))
+    }
+    /// Embed task history beside metadata in the application's existing database.
+    pub fn from_database(db: Arc<Database>) -> Outcome<Self> {
         let tx = db.begin_write().map_err(err)?;
         tx.open_table(TASKS).map_err(err)?;
         tx.open_table(HISTORY).map_err(err)?;

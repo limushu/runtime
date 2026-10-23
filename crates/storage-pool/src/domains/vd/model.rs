@@ -2,25 +2,25 @@ use crate::domains::{PoolId, disk::DiskId};
 
 identity!(VolumeId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DataState {
     Valid,
     Invalid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BgEntry {
     pub disk: DiskId,
     pub blk: u32,
     pub data: DataState,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockGroup {
     /// Local to its owning VD.
     pub index: u32,
     pub entries: Vec<BgEntry>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VirtualDisk {
     pub id: VolumeId,
     pub pool: PoolId,

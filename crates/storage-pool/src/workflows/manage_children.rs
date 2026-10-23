@@ -6,13 +6,11 @@ use crate::{
         tier::{TierCommand, TierReply},
         vd::service::{VdCommand, VdReply},
     },
-    manager::{PoolShared, Registry},
     support::{object, reject},
     task_center::{OperationKind, PoolOperation, PoolWorkflow},
     *,
 };
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex, Weak};
 use workflow_foundation::{ObjectKey, Workflow, WorkflowContext};
 
 pub(crate) struct AttachNodeWorkflow {
@@ -20,7 +18,7 @@ pub(crate) struct AttachNodeWorkflow {
     pub id: NodeId,
     pub sequence: u64,
     pub connected: bool,
-    pub reservation: crate::manager::NodeReservation,
+    pub reservation: crate::pool::NodeReservation,
 }
 impl PoolWorkflow for AttachNodeWorkflow {
     fn operation(&self) -> PoolOperation {
@@ -57,8 +55,7 @@ impl Workflow for AttachNodeWorkflow {
 pub(crate) struct DetachNodeWorkflow {
     pub domains: Domains,
     pub id: NodeId,
-    pub shared: Arc<PoolShared>,
-    pub removal: crate::manager::RemovalGuard,
+    pub removal: crate::pool::RemovalGuard,
 }
 impl PoolWorkflow for DetachNodeWorkflow {
     fn operation(&self) -> PoolOperation {
@@ -78,12 +75,13 @@ impl Workflow for DetachNodeWorkflow {
     async fn run(mut self, ctx: &mut WorkflowContext) -> Outcome<()> {
         self.removal.begin();
         let result = ctx
-            .activity(&self.domains.node, NodeCommand::Detach(self.id.clone()))
+            .activity(
+                &self.domains.membership,
+                crate::pool::MembershipCommand::DetachNode(self.id),
+            )
             .await;
         self.removal.settled(&result);
         result?;
-        self.shared.node_claims.lock().unwrap().remove(&self.id);
-        self.shared.nodes.lock().unwrap().remove(&self.id);
         Ok(())
     }
 }
@@ -120,7 +118,7 @@ impl Workflow for CreateTierWorkflow {
 pub(crate) struct DeleteTierWorkflow {
     pub domains: Domains,
     pub id: TierId,
-    pub removal: crate::manager::RemovalGuard,
+    pub removal: crate::pool::RemovalGuard,
 }
 impl PoolWorkflow for DeleteTierWorkflow {
     fn operation(&self) -> PoolOperation {
@@ -158,10 +156,7 @@ impl Workflow for DeleteTierWorkflow {
 pub(crate) struct RemoveDiskWorkflow {
     pub domains: Domains,
     pub spec: DiskSpec,
-    pub registry: Weak<Mutex<Registry>>,
-    pub uuid: PoolUuid,
-    pub routing: Arc<Mutex<std::collections::BTreeMap<DiskId, DiskSpec>>>,
-    pub removal: crate::manager::RemovalGuard,
+    pub removal: crate::pool::RemovalGuard,
 }
 impl PoolWorkflow for RemoveDiskWorkflow {
     fn operation(&self) -> PoolOperation {
@@ -203,19 +198,11 @@ impl Workflow for RemoveDiskWorkflow {
                 DiskCommand::SetIo(id.clone(), IoState::Down),
             )
             .await?;
-            ctx.activity(&self.domains.disk, DiskCommand::RemoveEmpty(id.clone()))
-                .await?;
-            if let Some(registry) = self.registry.upgrade() {
-                let mut registry = registry.lock().unwrap();
-                if registry
-                    .disks
-                    .get(&id)
-                    .is_some_and(|entry| entry.owner == self.uuid)
-                {
-                    registry.disks.remove(&id);
-                }
-            }
-            self.routing.lock().unwrap().remove(&id);
+            ctx.activity(
+                &self.domains.membership,
+                crate::pool::MembershipCommand::RemoveDisk(id),
+            )
+            .await?;
             Ok(())
         }
         .await;
