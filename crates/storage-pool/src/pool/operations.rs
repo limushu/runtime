@@ -209,7 +209,7 @@ impl PoolHandle {
     pub fn uuid(&self) -> PoolUuid {
         self.descriptor().uuid
     }
-    pub fn instance(&self) -> PoolUuid {
+    pub fn instance(&self) -> PoolInstanceId {
         self.shared.instance
     }
     pub fn task_ref(&self, workflow: WorkflowId) -> TaskRef {

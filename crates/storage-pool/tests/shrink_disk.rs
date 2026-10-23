@@ -22,6 +22,20 @@ fn disk(s: &str) -> DiskId {
 fn node(s: &str) -> NodeId {
     NodeId::new(s).unwrap()
 }
+fn topology() -> Vec<TopologyEvent> {
+    (1..=3)
+        .map(|i| {
+            TopologyEvent::new(
+                2,
+                10,
+                TopologyChange::NodeConnectivity {
+                    node: node(&format!("n{i}")),
+                    connected: true,
+                },
+            )
+        })
+        .collect()
+}
 
 struct Fixture {
     manager: PoolManager,
@@ -50,7 +64,7 @@ impl Fixture {
         }
         let pool = manager.create_pool(PoolId::new("pool").unwrap()).unwrap();
         if pool.task_persistence_health().is_ok() {
-            pool.recover_tasks().await.unwrap();
+            pool.takeover(vec![]).await.unwrap();
         }
         done(pool.create_tier(TierId::new("ssd").unwrap()).await.unwrap())
             .await
@@ -297,11 +311,26 @@ async fn cancellation_stops_the_job_preserves_remaps_and_requires_explicit_inten
 
 #[tokio::test]
 async fn handoff_rehydrates_domains_and_continues_the_same_task_and_balancing_job() {
+    handoff(false, true).await;
+}
+#[tokio::test]
+async fn handoff_preserves_user_suspension_and_resume_does_not_submit_another_execution() {
+    handoff(true, true).await;
+}
+#[tokio::test]
+async fn handoff_with_offline_source_waits_then_current_topology_automatically_resumes_it() {
+    handoff(false, false).await;
+}
+async fn handoff(user_paused: bool, source_connected: bool) {
     let tasks = Arc::new(MemoryTaskStore::default());
     let f = Fixture::new(4, true, Some(tasks.clone())).await;
     let mut run = f.pool.shrink_disk(disk("d1")).await.unwrap();
     migrating(&f.pool, run.id(), 1).await;
     let task_id = f.pool.persistent_task_id(run.id()).unwrap();
+    if user_paused {
+        f.pool.suspend_task(task_id).await.unwrap();
+        bounded(f.pool.wait_suspended(run.id())).await.unwrap();
+    }
     let pool_id = f.pool.id().clone();
     let uuid = f.pool.uuid();
     let job = f.pool.disk(disk("d1")).await.unwrap().shrink.unwrap();
@@ -323,15 +352,59 @@ async fn handoff_rehydrates_domains_and_continues_the_same_task_and_balancing_jo
     .unwrap();
     let mut create = CreatePool::new(pool_id, PoolName::new("pool").unwrap());
     create.uuid = uuid;
-    let pool = manager.create(create).unwrap();
-    pool.restore_metadata().await.unwrap();
-    let recovered = pool.recover_tasks().await.unwrap();
-    assert!(
-        recovered
-            .iter()
-            .any(|t| t.id == task_id && t.status == TaskStatus::Ready)
-    );
-    let execution = pool.continue_task(task_id).await.unwrap();
+    let topology = (1..=3)
+        .map(|i| {
+            TopologyEvent::new(
+                2,
+                10,
+                TopologyChange::NodeConnectivity {
+                    node: NodeId::new(format!("n{i}")).unwrap(),
+                    connected: i != 1 || source_connected,
+                },
+            )
+        })
+        .collect();
+    let pool = bounded(manager.open(create, topology)).await.unwrap();
+    assert_eq!(pool.uuid(), uuid);
+    assert_ne!(pool.instance(), f.pool.instance());
+    let report = pool.recovery_report().unwrap();
+    assert!(report.blocked.is_empty());
+    let execution = report.executions[&task_id];
+    if user_paused {
+        bounded(pool.wait_suspended(execution)).await.unwrap();
+        pool.flush_task_history().await.unwrap();
+        assert_eq!(
+            pool.task_detail(task_id).await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            job_handle.progress().borrow().state,
+            EvacuationState::Paused
+        );
+        assert_eq!(pool.resume_task(task_id).await.unwrap(), execution);
+    }
+    if !source_connected {
+        wait_state(&pool, execution, |s| {
+            matches!(s, RunState::WaitingConditions(_))
+        })
+        .await;
+        assert_eq!(
+            job_handle.progress().borrow().state,
+            EvacuationState::Paused
+        );
+        assert_eq!(pool.disk(disk("d1")).await.unwrap().io, IoState::Down);
+        done(
+            pool.online_node(NodeTransitionRequest {
+                node: node("n1"),
+                sequence: 100,
+            })
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(pool.takeover(vec![]).await.is_err());
     wait_state(&pool, execution, |s| {
         matches!(s, RunState::Completed | RunState::Failed(_))
     })
@@ -341,11 +414,123 @@ async fn handoff_rehydrates_domains_and_continues_the_same_task_and_balancing_jo
     let record = pool.task_detail(task_id).await.unwrap();
     assert_eq!(record.status, TaskStatus::Completed);
     assert_eq!(record.executions.len(), 2);
+    assert!(pool.resume_task(task_id).await.is_err());
     assert_eq!(f.balancer.jobs_started(), 1);
     assert_eq!(
         pool.disk(disk("d1")).await.unwrap().membership,
         DiskMembership::Removed
     );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn takeover_requires_complete_topology_and_continues_after_the_waiter_is_dropped() {
+    let tasks = Arc::new(MemoryTaskStore::default());
+    let f = Fixture::new(1, false, Some(tasks.clone())).await;
+    let mut shrink = f.pool.shrink_disk(disk("d1")).await.unwrap();
+    wait_state(&f.pool, shrink.id(), |s| {
+        matches!(s, RunState::WaitingConditions(_))
+    })
+    .await;
+    let id = f.pool.persistent_task_id(shrink.id()).unwrap();
+    let descriptor = f.pool.descriptor();
+    f.manager.shutdown().await.unwrap();
+    assert_eq!(bounded(shrink.result()).await, Err(Failure::Cancelled));
+    let plane = Arc::new(Plane::default());
+    let manager = PoolManager::new(Config::default(), f.metadata.clone(), plane.clone())
+        .with_balancer(f.balancer.clone())
+        .unwrap()
+        .with_task_store(tasks, PersistenceConfig::default())
+        .unwrap();
+    let pool = manager
+        .create(CreatePool {
+            id: descriptor.id,
+            uuid: descriptor.uuid,
+            name: descriptor.name,
+        })
+        .unwrap();
+    assert!(pool.takeover(vec![]).await.is_err());
+    assert!(pool.recovery_report().is_none());
+    assert_eq!(pool.task_detail(id).await.unwrap().executions.len(), 1);
+    assert!(pool.shrink_disk(disk("d1")).await.is_err());
+    let gate = Gate::new();
+    *plane.load.lock().unwrap() = Some(gate.clone());
+    let caller = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.takeover(topology()).await }
+    });
+    gate.wait().await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    gate.open();
+    bounded(async {
+        while pool.recovery_report().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let report = pool.recovery_report().unwrap();
+    assert!(report.blocked.is_empty());
+    wait_state(&pool, report.executions[&id], |s| {
+        matches!(s, RunState::WaitingConditions(_))
+    })
+    .await;
+    pool.flush_task_history().await.unwrap();
+    assert_eq!(pool.task_detail(id).await.unwrap().executions.len(), 2);
+    assert_eq!(f.balancer.jobs_started(), 0);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn takeover_reconstructs_queued_shrinks_before_releasing_their_restored_claims() {
+    let tasks = Arc::new(MemoryTaskStore::default());
+    let f = Fixture::new(1, false, Some(tasks.clone())).await;
+    let first = f.pool.shrink_disk(disk("d1")).await.unwrap();
+    wait_state(&f.pool, first.id(), |s| {
+        matches!(s, RunState::WaitingConditions(_))
+    })
+    .await;
+    let second = f.pool.shrink_disk(disk("d2")).await.unwrap();
+    let first_id = f.pool.persistent_task_id(first.id()).unwrap();
+    let second_id = f.pool.persistent_task_id(second.id()).unwrap();
+    let descriptor = f.pool.descriptor();
+    f.manager.shutdown().await.unwrap();
+    let manager = PoolManager::new(
+        Config::default(),
+        f.metadata.clone(),
+        Arc::new(SimulatedDataPlane),
+    )
+    .with_balancer(f.balancer.clone())
+    .unwrap()
+    .with_task_store(tasks, PersistenceConfig::default())
+    .unwrap();
+    let pool = manager
+        .open(
+            CreatePool {
+                id: descriptor.id,
+                uuid: descriptor.uuid,
+                name: descriptor.name,
+            },
+            topology().into_iter().take(2).collect(),
+        )
+        .await
+        .unwrap();
+    let report = pool.recovery_report().unwrap();
+    assert!(report.blocked.is_empty());
+    assert_eq!(report.executions.len(), 2);
+    // Both were waiting for a third disk. It is attached only after recovery;
+    // topology must still bypass/suspend the restored shrink queue safely.
+    add(&pool, 3).await;
+    wait_state(&pool, report.executions[&first_id], |s| {
+        matches!(s, RunState::Completed)
+    })
+    .await;
+    wait_state(&pool, report.executions[&second_id], |s| {
+        matches!(s, RunState::WaitingConditions(_))
+    })
+    .await;
+    assert_eq!(f.balancer.jobs_started(), 1);
+    pool.cancel_task(second_id).await.unwrap();
     manager.shutdown().await.unwrap();
 }
 
@@ -398,8 +583,13 @@ async fn a_successful_balance_reply_cannot_replace_committed_reference_and_alloc
     )
     .with_balancer(Arc::new(Liar))
     .unwrap();
-    let pool = manager.create_pool(PoolId::new("pool").unwrap()).unwrap();
-    pool.restore_metadata().await.unwrap();
+    let pool = manager
+        .open(
+            CreatePool::new(PoolId::new("pool").unwrap(), PoolName::new("pool").unwrap()),
+            topology(),
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         done(pool.shrink_disk(disk("d1")).await.unwrap()).await,
         Err(Failure::Rejected(_))
@@ -494,9 +684,11 @@ async fn reopened(
     let manager = PoolManager::new(Config::default(), metadata, plane)
         .with_balancer(f.balancer.clone())
         .unwrap();
-    let pool = manager.create_pool(PoolId::new("pool").unwrap()).unwrap();
-    pool.restore_metadata().await.unwrap();
-    done(pool.attach_node(node("n2"), 1, true).await.unwrap())
+    let pool = manager
+        .open(
+            CreatePool::new(PoolId::new("pool").unwrap(), PoolName::new("pool").unwrap()),
+            topology(),
+        )
         .await
         .unwrap();
     (manager, pool)

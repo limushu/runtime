@@ -1,4 +1,4 @@
-use crate::{Failure, PoolUuid};
+use crate::{Failure, PoolInstanceId, PoolUuid};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -127,7 +127,7 @@ impl From<ActivitySnapshot> for RecordedActivity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredExecution {
     pub attempt: u64,
-    pub instance: PoolUuid,
+    pub instance: PoolInstanceId,
     pub workflow: Option<WorkflowId>,
     pub state: RunState,
     pub progress: TaskProgress,
@@ -139,7 +139,7 @@ pub struct StoredExecution {
     pub interrupted: bool,
 }
 impl StoredExecution {
-    pub(crate) fn new(attempt: u64, instance: PoolUuid) -> Self {
+    pub(crate) fn new(attempt: u64, instance: PoolInstanceId) -> Self {
         Self {
             attempt,
             instance,

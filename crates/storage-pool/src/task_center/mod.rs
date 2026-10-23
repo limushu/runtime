@@ -1,5 +1,5 @@
 //! One concrete application service per Pool: admission, queue, ownership and handoff.
-//! Read conflict() in conflicts.rs for business rules; State below implements their lifecycle.
+//! Read conflict() in conflicts.rs for business rules; scheduler.rs implements their lifecycle.
 use crate::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -20,32 +20,20 @@ mod conflicts;
 mod observation;
 mod operation;
 mod scheduler;
+mod submission;
 pub use observation::{ConflictMatch, SchedulingSnapshot, TaskObserver, TaskSnapshot};
 pub(crate) use operation::PoolWorkflow;
 pub use operation::{OperationKind, PoolOperation};
-use scheduler::{Entry, State};
+use scheduler::State;
+use submission::Submission;
 pub mod persistence;
 mod recovery;
 pub use conflicts::{Conflict, ConflictDecision};
-use persistence::{TaskBinding, TaskId, TaskPersistence};
-pub use recovery::PersistentRun;
+use persistence::{TaskId, TaskPersistence};
+pub use recovery::{PersistentRun, RecoveryFailure, RecoveryReport};
 type Explanations = Arc<Mutex<BTreeMap<WorkflowId, Vec<ConflictMatch>>>>;
 type Blockers = Arc<Mutex<BTreeMap<WorkflowId, Vec<WorkflowId>>>>;
-struct Accepted {
-    control: RunControl,
-    start: StartPermit,
-    publish: Box<dyn FnOnce() + Send>,
-    task_id: Option<TaskId>,
-}
-// Heterogeneous workflow submissions preserve their typed result channel in this closure.
-type Accept = Box<dyn FnOnce(Outcome<&mut WorkflowDriver>) -> Option<Accepted> + Send>;
-struct Submission {
-    operation: PoolOperation,
-    accept: Accept,
-    administrative: bool,
-    recovery_task: Option<TaskId>,
-}
-enum PersistenceControl {
+enum SchedulingCommand {
     Restore {
         claims: Vec<(TaskId, PoolOperation)>,
         reply: oneshot::Sender<()>,
@@ -76,7 +64,7 @@ pub struct TaskCenter {
     _host: Arc<Host>,
     admission_closed: Arc<AtomicBool>,
     persistence: Option<TaskPersistence>,
-    persistence_control: mpsc::Sender<PersistenceControl>,
+    scheduling_commands: mpsc::Sender<SchedulingCommand>,
     persistence_initialized: Arc<tokio::sync::Mutex<bool>>,
     persistence_ready: Arc<AtomicBool>,
     task_ids: Arc<Mutex<BTreeMap<WorkflowId, TaskId>>>,
@@ -103,7 +91,7 @@ impl TaskCenter {
         driver: WorkflowDriver,
         config: &Config,
         pool: PoolUuid,
-        instance: PoolUuid,
+        instance: PoolInstanceId,
         store: Arc<dyn persistence::TaskStore>,
         persistence_config: persistence::PersistenceConfig,
     ) -> Outcome<Self> {
@@ -121,8 +109,8 @@ impl TaskCenter {
         persistence: Option<TaskPersistence>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Submission>(config.capacity);
-        let (persistence_control, mut controls) =
-            mpsc::channel::<PersistenceControl>(config.capacity);
+        let (scheduling_commands, mut controls) =
+            mpsc::channel::<SchedulingCommand>(config.capacity);
         let needs_initialization = persistence.is_some();
         let stop = CancellationToken::new();
         let stopping = stop.clone();
@@ -192,55 +180,31 @@ impl TaskCenter {
                     _ = driver.tick() => {}
                     command = controls.recv(), if !closing => {
                         match command {
-                            Some(PersistenceControl::Restore { claims, reply }) => {
-                                state.pending_tasks.extend(claims);
+                            Some(SchedulingCommand::Restore { claims, reply }) => {
+                                state.restored_claims.extend(claims);
                                 let _ = reply.send(());
                             }
-                            Some(PersistenceControl::Release { task, reply }) => {
-                                state.pending_tasks.remove(&task);
+                            Some(SchedulingCommand::Release { task, reply }) => {
+                                state.restored_claims.remove(&task);
                                 let _ = reply.send(());
                             }
                             None => {}
                         }
                     }
                     submission = rx.recv(), if !closing => {
-                        let Some(submission) = submission else { stopping.cancel(); continue; };
-                        state.reap();
-                        let decision = if closed.load(Ordering::SeqCst) && !submission.administrative { Err(Failure::Unavailable) }
-                            else if state.entries.len() >= limit { Err(Failure::Busy) }
-                            else { state.inspect(&submission.operation, submission.recovery_task) };
-                        let matches = match decision {
-                            Ok(matches) => matches,
-                            Err(error) => { (submission.accept)(Err(error)); continue; }
+                        let Some(submission) = submission else {
+                            stopping.cancel();
+                            continue;
                         };
-                        // Runtime capacity/validation can still reject; no cancellation until
-                        // the replacement has actually been accepted and registered.
-                        if let Some(accepted) = (submission.accept)(Ok(&mut driver)) {
-                            state.reap();
-                            if let Some(task) = submission.recovery_task {
-                                state.pending_tasks.remove(&task);
-                                state.fences.retain(|(owner, _)| *owner != Some(task));
+                        if let Some(admitted) = state.admit(
+                            submission, &mut driver, closed.load(Ordering::SeqCst), limit,
+                        ) {
+                            if let Some(task) = admitted.task_id {
+                                task_id_index.lock().unwrap().insert(admitted.id, task);
                             }
-                            let fenced = state.fences.iter().any(|(_, f)| f.overlaps(&submission.operation));
-                            let id = accepted.control.id;
-                            if let Some(task_id) = accepted.task_id { task_id_index.lock().unwrap().insert(id, task_id); }
-                            notes.lock().unwrap().insert(id, matches.clone());
-                            state.entries.insert(id, Entry {
-                                operation: submission.operation,
-                                control: accepted.control,
-                                start: Some(accepted.start),
-                                task_id: accepted.task_id,
-                            });
-                            for found in matches {
-                                if !fenced && found.conflict.decision == ConflictDecision::CancelThenWait
-                                    && let Some(entry) = state.entries.get(&found.existing) {
-                                    entry.control.cancel();
-                                }
-                            }
-                            state.reap();
-                            state.pump();
+                            notes.lock().unwrap().insert(admitted.id, admitted.conflicts);
                             *schedule.lock().unwrap() = state.snapshot();
-                            (accepted.publish)();
+                            (admitted.publish)();
                         }
                     }
                 }
@@ -262,7 +226,7 @@ impl TaskCenter {
             _host: Arc::new(Host(task)),
             admission_closed,
             persistence,
-            persistence_control,
+            scheduling_commands,
             persistence_initialized: Arc::new(tokio::sync::Mutex::new(!needs_initialization)),
             persistence_ready: Arc::new(AtomicBool::new(!needs_initialization)),
             task_ids,
@@ -371,143 +335,6 @@ impl TaskCenter {
     }
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.execution.snapshot()
-    }
-
-    pub(crate) async fn submit<W: PoolWorkflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
-        self.submit_with_access(workflow, false).await
-    }
-    pub(crate) async fn submit_admin<W: PoolWorkflow>(
-        &self,
-        workflow: W,
-    ) -> Outcome<Run<W::Output>> {
-        self.submit_with_access(workflow, true).await
-    }
-    async fn submit_with_access<W: PoolWorkflow>(
-        &self,
-        workflow: W,
-        administrative: bool,
-    ) -> Outcome<Run<W::Output>> {
-        let operation = workflow.operation();
-        let binding = self.persistence.as_ref().map(|p| {
-            p.history_binding(
-                W::NAME.into(),
-                operation.objects.clone(),
-                None,
-                operation.kind.task_class(),
-            )
-        });
-        self.submit_prepared(workflow, operation, administrative, binding)
-            .await
-    }
-    async fn submit_prepared<W: Workflow>(
-        &self,
-        workflow: W,
-        operation: PoolOperation,
-        administrative: bool,
-        binding: Option<TaskBinding>,
-    ) -> Outcome<Run<W::Output>> {
-        if self.stop.is_cancelled() {
-            if let Some(b) = binding {
-                b.rejected(Failure::Unavailable);
-            }
-            return Err(Failure::Unavailable);
-        }
-        let task_id = binding.as_ref().map(|b| b.id);
-        let recovery_task = binding.as_ref().filter(|b| b.is_recovery).map(|b| b.id);
-        let options = binding.as_ref().map(|b| b.options()).unwrap_or_default();
-        let failed_binding = binding.clone();
-        let (reply, response) = oneshot::channel();
-        let sent = self
-            .tx
-            .send(Submission {
-                operation,
-                administrative,
-                recovery_task,
-                accept: Box::new(move |driver| {
-                    let result =
-                        driver.and_then(|driver| driver.defer_with_options(workflow, options));
-                    match result {
-                        Err(error) => {
-                            if let Some(b) = binding {
-                                b.rejected(error.clone());
-                            }
-                            let _ = reply.send(Err(error));
-                            None
-                        }
-                        Ok((run, start)) => Some(Accepted {
-                            control: run.control.clone(),
-                            start,
-                            task_id,
-                            publish: Box::new(move || {
-                                let _ = reply.send(Ok(run));
-                            }),
-                        }),
-                    }
-                }),
-            })
-            .await;
-        if sent.is_err() {
-            if let Some(b) = failed_binding {
-                b.rejected(Failure::Unavailable);
-            }
-            return Err(Failure::Unavailable);
-        }
-        response.await.unwrap_or(Err(Failure::Unavailable))
-    }
-    pub(crate) fn try_submit<W: PoolWorkflow>(
-        &self,
-        workflow: W,
-        source_event: Option<uuid::Uuid>,
-        callback: impl FnOnce(Outcome<Run<W::Output>>) + Send + 'static,
-    ) -> Outcome<()> {
-        if !self.accepts() {
-            return Err(Failure::Unavailable);
-        }
-        let operation = workflow.operation();
-        let binding = self.persistence.as_ref().map(|p| {
-            p.history_binding(
-                W::NAME.into(),
-                operation.objects.clone(),
-                source_event,
-                operation.kind.task_class(),
-            )
-        });
-        let task_id = binding.as_ref().map(|b| b.id);
-        let options = binding.as_ref().map(|b| b.options()).unwrap_or_default();
-        let failed_binding = binding.clone();
-        self.tx
-            .try_send(Submission {
-                operation,
-                administrative: false,
-                recovery_task: None,
-                accept: Box::new(move |driver| {
-                    match driver.and_then(|driver| driver.defer_with_options(workflow, options)) {
-                        Err(error) => {
-                            if let Some(b) = binding {
-                                b.rejected(error.clone());
-                            }
-                            callback(Err(error));
-                            None
-                        }
-                        Ok((run, start)) => Some(Accepted {
-                            control: run.control.clone(),
-                            start,
-                            task_id,
-                            publish: Box::new(move || callback(Ok(run))),
-                        }),
-                    }
-                }),
-            })
-            .map_err(|error| {
-                let failure = match error {
-                    mpsc::error::TrySendError::Full(_) => Failure::Busy,
-                    mpsc::error::TrySendError::Closed(_) => Failure::Unavailable,
-                };
-                if let Some(b) = failed_binding {
-                    b.rejected(failure.clone());
-                }
-                failure
-            })
     }
 }
 

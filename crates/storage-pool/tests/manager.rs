@@ -561,7 +561,7 @@ async fn task_references_are_scoped_by_uuid_and_instance() {
     assert!(
         manager
             .task(TaskRef {
-                instance: PoolUuid::new(),
+                instance: PoolInstanceId::new(),
                 ..task
             })
             .is_err()

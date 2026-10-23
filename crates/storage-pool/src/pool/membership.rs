@@ -11,6 +11,7 @@ pub(crate) enum MembershipCommand {
     FinalizeShrink(DiskId, crate::domains::balance::EvacuationId),
     Restore,
     ApplyObservation(TopologyEvent),
+    RestoreObservation(TopologyEvent),
 }
 pub(crate) enum MembershipReply {
     Updated,
@@ -37,6 +38,7 @@ impl ServiceHandler for MembershipHost {
             MembershipCommand::FinalizeShrink(..) => "pool.finalize-shrink",
             MembershipCommand::Restore => "pool.restore-membership",
             MembershipCommand::ApplyObservation(_) => "pool.apply-node-observation",
+            MembershipCommand::RestoreObservation(_) => "pool.restore-node-observation",
         }
     }
     fn resources(request: &MembershipCommand) -> Vec<ResourceAccess> {
@@ -54,7 +56,8 @@ impl ServiceHandler for MembershipHost {
                 crate::support::object("node", id.as_str()),
             )),
             MembershipCommand::Restore => {}
-            MembershipCommand::ApplyObservation(event) => {
+            MembershipCommand::ApplyObservation(event)
+            | MembershipCommand::RestoreObservation(event) => {
                 keys.push(ResourceAccess::write(event.key()))
             }
         }
@@ -65,6 +68,7 @@ impl ServiceHandler for MembershipHost {
         request: MembershipCommand,
         ctx: ActivityContext,
     ) -> Outcome<MembershipReply> {
+        let restoring = matches!(&request, MembershipCommand::RestoreObservation(_));
         match request {
             MembershipCommand::RetireDisk(id) => {
                 retire_disk(&self.shared, &self.shared.routing, &id)?
@@ -108,7 +112,8 @@ impl ServiceHandler for MembershipHost {
                 let disks = self.metadata.snapshot(&pool).await?.disks;
                 restore_disk_directory(&self.shared, &self.shared.routing, disks)?;
             }
-            MembershipCommand::ApplyObservation(event) => {
+            MembershipCommand::ApplyObservation(event)
+            | MembershipCommand::RestoreObservation(event) => {
                 let TopologyChange::NodeConnectivity { node, connected } = &event.change else {
                     return Err(reject("load requires node connectivity snapshots"));
                 };
@@ -121,16 +126,32 @@ impl ServiceHandler for MembershipHost {
                     sequence.saturating_add(1),
                     std::sync::atomic::Ordering::SeqCst,
                 );
+                let command = if restoring {
+                    crate::domains::node::service::NodeCommand::Attach {
+                        id: node.clone(),
+                        sequence,
+                        connected: *connected,
+                    }
+                } else {
+                    crate::domains::node::service::NodeCommand::Observe {
+                        id: node.clone(),
+                        sequence,
+                        connected: *connected,
+                    }
+                };
                 self.nodes
-                    .execute(
-                        crate::domains::node::service::NodeCommand::Observe {
-                            id: node.clone(),
-                            sequence,
-                            connected: *connected,
-                        },
-                        ctx.control().cancellation(),
-                    )
+                    .execute(command, ctx.control().cancellation())
                     .await?;
+                if restoring {
+                    self.shared.nodes.lock().unwrap().insert(node.clone());
+                    self.shared
+                        .node_claims
+                        .lock()
+                        .unwrap()
+                        .entry(node.clone())
+                        .or_default()
+                        .confirmed = true;
+                }
                 let descriptor = self.shared.descriptor.lock().unwrap().clone();
                 let receipt = PoolEventReceipt::immediate(
                     descriptor.uuid,

@@ -72,7 +72,9 @@ submit_resumable(workflow, resume_spec)  额外持久保存续办描述
 list_tasks(filter, cursor)               查询本池当前/历史任务
 task_detail(task_id)                     查看全部执行和步骤
 list_recoverable()                       列举可续办任务
-continue_task(task_id)                   续办同一个 Task
+recover_tasks()                         系统初始化时自动重建可续办任务
+suspend_task / resume_task(task_id)       控制当前执行，不提交新工作流
+retry_task(task_id)                      对账或补装工厂后的显式修复
 ```
 
 TaskStore 是统一存储协议，支持创建任务、追加执行/步骤记录、查询历史、
@@ -92,7 +94,8 @@ ActivityObservation 创建/开始/结束。由池内适配器附加 TaskId、Poo
 迁移步骤的暂停/恢复委托同一个均衡 job，见 [缩容与 topo 协调](shrink-workflow.md)。
 该接口是新的持久能力，与现有仅检查取消/执行边界的 WorkflowContext::checkpoint() 区分。
 检查点落盘通过受控上下文或专用 Activity 接入，Workflow 不直接操作具体 KV。
-如持久保存后运行准入失败，保留待执行/受阻状态及原因，不展示虚假的 Running。
+新请求如在持久保存后被准入拒绝，保留 Failed 历史及原因，不能在接管时复活。
+既有任务的执行重建失败则保留占用及恢复失败原因，不展示虚假的 Running。
 
 ## 缩容与切换接入流程
 
@@ -104,10 +107,11 @@ ActivityObservation 创建/开始/结束。由池内适配器附加 TaskId、Poo
     → 阶段推进并保存检查点，同时记录 Activity 历史
 
 接管：
-  Pool 完成现有加载/接管准备
+  系统取得所有权后调用 manager.open(原 Pool 身份, 当前拓扑)
+    → Pool 恢复成员并按当前拓扑加载服务
     → TaskCenter 查询本池未完成且声明可续办的 Task
     → 恢复为待继续，保留用户暂停及待核对状态
-    → 调用缩容恢复函数，核对真实进度和旧工作是否已停稳
+    → 自动调用缩容恢复函数，核对真实进度和旧工作是否已停稳
     → 在原 TaskId 下提交新一次执行，重新经过准入和冲突判断
 ```
 
@@ -136,4 +140,4 @@ Pool → 任务列表 → Task → 执行记录 / Activity，保留 Running / Hi
 3. 用缩容模拟任务验证切换后发现原 Task、续办新执行、关联前后 Activity、维持暂停状态。
 
 本文保留设计目标；当前实现范围见 [任务持久化](task-persistence.md) 与 [完整缩容工作流](shrink-workflow.md)。
-shrink_commands 仍只是进程内控制示例；正式 shrink_disk 已支持指定任务续办，真实复制由注入的均衡模块实现。
+shrink_commands 仍只是进程内控制示例；正式 shrink_disk 已支持 Pool 接管时自动续办，真实复制由注入的均衡模块实现。

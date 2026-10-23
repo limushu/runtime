@@ -501,13 +501,27 @@ async fn redb_reopen_restores_evacuated_intent_and_completes_shrink() {
         .with_balancer(balancer)
         .unwrap();
         let p = manager
-            .create(CreatePool {
-                id: descriptor.id,
-                uuid: descriptor.uuid,
-                name: descriptor.name,
-            })
+            .open(
+                CreatePool {
+                    id: descriptor.id,
+                    uuid: descriptor.uuid,
+                    name: descriptor.name,
+                },
+                (1..=3)
+                    .map(|i| {
+                        TopologyEvent::new(
+                            2,
+                            10,
+                            TopologyChange::NodeConnectivity {
+                                node: NodeId::new(format!("n{i}")).unwrap(),
+                                connected: true,
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .await
             .unwrap();
-        p.restore_metadata().await.unwrap();
         let removed = done(p.shrink_disk(disk("d1")).await.unwrap())
             .await
             .unwrap();

@@ -41,6 +41,17 @@ pub struct PoolManager {
     )>,
 }
 impl PoolManager {
+    /// System startup/takeover entry. Caller already owns the Pool; no TaskIds are needed.
+    /// Restores metadata/topology and automatically reconstructs unfinished tasks.
+    pub async fn open(
+        &self,
+        request: CreatePool,
+        topology: Vec<TopologyEvent>,
+    ) -> Outcome<PoolHandle> {
+        let pool = self.create(request)?;
+        pool.takeover(topology).await?;
+        Ok(pool)
+    }
     pub fn with_balancer(mut self, balancer: Arc<dyn Balancer>) -> Outcome<Self> {
         if !self.registry.lock().unwrap().pools.is_empty() {
             return Err(reject("configure balancing before creating pools"));

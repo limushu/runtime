@@ -6,7 +6,7 @@ use workflow_foundation::{RunControl, RunState};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskRef {
     pub pool: PoolUuid,
-    pub instance: PoolUuid,
+    pub instance: PoolInstanceId,
     pub workflow: WorkflowId,
 }
 #[derive(Debug, Clone)]
@@ -64,7 +64,7 @@ pub(crate) enum EventDecision {
 pub struct PoolEventReceipt {
     pub pool: PoolUuid,
     pub event: uuid::Uuid,
-    pub(crate) instance: PoolUuid,
+    pub(crate) instance: PoolInstanceId,
     pub(crate) decision: watch::Receiver<EventDecision>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub struct DispatchReceipt {
 impl PoolEventReceipt {
     pub(crate) fn immediate(
         pool: PoolUuid,
-        instance: PoolUuid,
+        instance: PoolInstanceId,
         event: uuid::Uuid,
         decision: EventDecision,
     ) -> Self {

@@ -80,6 +80,7 @@ impl PoolHandle {
                         domains: pool.domains.clone(),
                         snapshot,
                         disks,
+                        attach_nodes: false,
                     })
                     .await?;
                 run.result().await

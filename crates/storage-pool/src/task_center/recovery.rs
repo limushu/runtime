@@ -2,8 +2,22 @@ use super::{persistence::*, *};
 use futures_util::future::BoxFuture;
 use std::future::Future;
 
-pub(crate) type RecoveryFn =
-    Arc<dyn Fn(TaskCenter, StoredTask) -> BoxFuture<'static, Outcome<WorkflowId>> + Send + Sync>;
+pub(crate) type RecoveryFn = Arc<
+    dyn Fn(TaskCenter, StoredTask, bool) -> BoxFuture<'static, Outcome<WorkflowId>> + Send + Sync,
+>;
+
+/// Result of system-driven startup recovery. No TaskId is required from the caller.
+#[derive(Debug, Default, Clone)]
+pub struct RecoveryReport {
+    pub executions: BTreeMap<TaskId, WorkflowId>,
+    /// Unknown factories and uncertain outcomes retain their scheduling claims.
+    pub blocked: Vec<RecoveryFailure>,
+}
+#[derive(Debug, Clone)]
+pub struct RecoveryFailure {
+    pub task_id: TaskId,
+    pub error: Failure,
+}
 
 /// Stable logical task identity plus this execution's typed Run.
 pub struct PersistentRun<T> {
@@ -23,7 +37,10 @@ impl<T> std::ops::DerefMut for PersistentRun<T> {
 }
 
 impl TaskCenter {
-    fn persistence(&self) -> Outcome<&TaskPersistence> {
+    pub(crate) fn recovery_initialized(&self) -> bool {
+        self.persistence_ready.load(Ordering::SeqCst)
+    }
+    pub(super) fn persistence(&self) -> Outcome<&TaskPersistence> {
         self.persistence
             .as_ref()
             .ok_or_else(|| Failure::Rejected("TaskStore is not configured".into()))
@@ -57,18 +74,22 @@ impl TaskCenter {
     pub async fn task_detail(&self, id: TaskId) -> Outcome<StoredTask> {
         self.persistence()?.get(id).await
     }
-    /// Call only after the previous Pool owner has stopped. Discovery does not run workflows.
-    pub async fn recover_tasks(&self) -> Outcome<Vec<StoredTask>> {
+    /// Called once after this host owns the Pool and its services/topology are ready.
+    /// Reconstruct eligible tasks automatically, preserving user suspension. Never replay
+    /// NeedsCheck tasks or unknown task kinds; their claims remain and failures are reported.
+    pub async fn recover_tasks(&self) -> Outcome<RecoveryReport> {
         if self.stop.is_cancelled() {
             return Err(Failure::Unavailable);
         }
         let mut initialized = self.persistence_initialized.lock().await;
         if *initialized {
             return Err(Failure::Rejected(
-                "task recovery is already initialized; query history instead".into(),
+                "task recovery is already initialized".into(),
             ));
         }
-        let tasks = self.persistence()?.recover().await?;
+        let mut tasks = self.persistence()?.recover().await?;
+        // Preserve the original queue order when several resumable tasks share objects.
+        tasks.sort_by_key(|t| (t.created_at, t.id));
         let claims = tasks
             .iter()
             .filter(|t| t.recoverable())
@@ -83,110 +104,36 @@ impl TaskCenter {
             })
             .collect();
         let (reply, received) = oneshot::channel();
-        self.persistence_control
-            .send(PersistenceControl::Restore { claims, reply })
+        self.scheduling_commands
+            .send(SchedulingCommand::Restore { claims, reply })
             .await
             .map_err(|_| Failure::Unavailable)?;
         received.await.map_err(|_| Failure::Unavailable)?;
+        let mut report = RecoveryReport::default();
+        for task in tasks.into_iter().filter(|t| t.recoverable()) {
+            let id = task.id;
+            if task.status == TaskStatus::NeedsCheck {
+                report.blocked.push(RecoveryFailure {
+                    task_id: id,
+                    error: task.last_error.unwrap_or(Failure::Uncertain(
+                        "business reconciliation required".into(),
+                    )),
+                });
+                continue;
+            }
+            match self.rebuild_task(task, true).await {
+                Ok(run) => {
+                    report.executions.insert(id, run);
+                }
+                Err(error) => report.blocked.push(RecoveryFailure { task_id: id, error }),
+            }
+        }
         *initialized = true;
         self.persistence_ready.store(true, Ordering::SeqCst);
         self.open_admission();
-        Ok(tasks)
+        Ok(report)
     }
 
-    /// Extension point for application-owned workflows. Uses the same conflict/object rules.
-    pub async fn submit_task<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
-        self.submit_classified(workflow, OperationKind::UserTask(W::NAME.into()))
-            .await
-    }
-    /// Shrink participates in pool-wide topology coordination and retains its single slot
-    /// while paused or waiting on business conditions. A read-only guard is required.
-    pub async fn submit_shrink<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
-        if workflow.continuation_guard().is_none() {
-            return Err(Failure::Rejected(
-                "shrink requires a continuation guard".into(),
-            ));
-        }
-        self.submit_classified(workflow, OperationKind::Shrink)
-            .await
-    }
-    pub async fn submit_topology<W: Workflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
-        self.submit_classified(workflow, OperationKind::Topology(W::NAME.into()))
-            .await
-    }
-    async fn submit_classified<W: Workflow>(
-        &self,
-        workflow: W,
-        kind: OperationKind,
-    ) -> Outcome<Run<W::Output>> {
-        let operation = PoolOperation {
-            kind,
-            objects: workflow.objects(),
-        };
-        let binding = self.persistence.as_ref().map(|p| {
-            p.history_binding(
-                W::NAME.into(),
-                operation.objects.clone(),
-                None,
-                operation.kind.task_class(),
-            )
-        });
-        self.submit_prepared(workflow, operation, false, binding)
-            .await
-    }
-    pub async fn submit_resumable<W: Workflow>(
-        &self,
-        workflow: W,
-        resume: ResumeSpec,
-    ) -> Outcome<PersistentRun<W::Output>> {
-        self.submit_resumable_class(workflow, resume, TaskClass::General)
-            .await
-    }
-    pub async fn submit_resumable_shrink<W: Workflow>(
-        &self,
-        workflow: W,
-        resume: ResumeSpec,
-    ) -> Outcome<PersistentRun<W::Output>> {
-        if workflow.continuation_guard().is_none() {
-            return Err(Failure::Rejected(
-                "shrink requires a continuation guard".into(),
-            ));
-        }
-        self.submit_resumable_class(workflow, resume, TaskClass::Shrink)
-            .await
-    }
-    async fn submit_resumable_class<W: Workflow>(
-        &self,
-        workflow: W,
-        resume: ResumeSpec,
-        class: TaskClass,
-    ) -> Outcome<PersistentRun<W::Output>> {
-        if !self.accepts() {
-            return Err(Failure::Unavailable);
-        }
-        let operation = PoolOperation {
-            kind: if class == TaskClass::Shrink {
-                OperationKind::Shrink
-            } else {
-                OperationKind::UserTask(W::NAME.into())
-            },
-            objects: workflow.objects(),
-        };
-        if operation.objects.is_empty() {
-            return Err(Failure::Rejected(
-                "resumable tasks must declare their objects".into(),
-            ));
-        }
-        let binding = self
-            .persistence()?
-            .resumable_binding(W::NAME.into(), operation.objects.clone(), resume, class)
-            .await?;
-        let task_id = binding.id;
-        let run = self
-            .submit_prepared(workflow, operation, false, Some(binding))
-            .await?;
-        Ok(PersistentRun { task_id, run })
-    }
     /// The factory must verify real business progress/old effects before rebuilding the workflow.
     /// No service clients or futures are deserialized. Register against the NEW host's services.
     pub fn register_recovery<W, F, Fut>(
@@ -205,7 +152,7 @@ impl TaskCenter {
             return Err(Failure::Rejected("invalid recovery kind/version".into()));
         }
         let factory = Arc::new(factory);
-        let handler: RecoveryFn = Arc::new(move |center, task| {
+        let handler: RecoveryFn = Arc::new(move |center, task, startup| {
             let factory = factory.clone();
             Box::pin(async move {
                 let workflow = factory(task.clone()).await?;
@@ -226,7 +173,7 @@ impl TaskCenter {
                     objects: workflow.objects(),
                 };
                 let run = center
-                    .submit_prepared(workflow, operation, false, Some(binding))
+                    .submit_prepared(workflow, operation, startup, Some(binding))
                     .await?;
                 Ok(run.id())
             })
@@ -240,14 +187,20 @@ impl TaskCenter {
         recovery.insert((kind, version), handler);
         Ok(())
     }
-    pub async fn continue_task(&self, id: TaskId) -> Outcome<WorkflowId> {
+    /// Explicit repair/retry after a blocked recovery has been reconciled or a factory installed.
+    /// Ordinary suspend/resume never creates another execution.
+    pub async fn retry_task(&self, id: TaskId) -> Outcome<WorkflowId> {
         if !self.accepts() {
             return Err(Failure::Unavailable);
         }
-        let task = self.task_detail(id).await?;
-        // A business checkpoint failure only fences the TaskCenter's logical objects.
-        // Uncertain Activities also fence the runtime resource broker, which has no in-place
-        // reconciliation API. Keep those fences until a properly reconciled host takeover.
+        self.rebuild_task(self.task_detail(id).await?, false).await
+    }
+    async fn rebuild_task(&self, task: StoredTask, startup: bool) -> Outcome<WorkflowId> {
+        if self.current_run(task.id).is_some() {
+            return Err(Failure::Rejected(
+                "task already has a live execution".into(),
+            ));
+        }
         if task.executions.last().is_some_and(|e| {
             e.instance == self.persistence.as_ref().unwrap().instance
                 && e.activities.values().any(|a| {
@@ -257,18 +210,19 @@ impl TaskCenter {
                     )
                 })
         }) {
-            return Err(Failure::Rejected("uncertain activity resources require reconciliation and host takeover before continuation".into()));
+            return Err(Failure::Rejected("uncertain activity resources require reconciliation and host takeover before retry".into()));
         }
         let resume = task
             .resume
             .as_ref()
             .ok_or_else(|| Failure::Rejected("task is history-only".into()))?;
-        if !matches!(task.status, TaskStatus::Ready | TaskStatus::NeedsCheck)
-            || task.pause_requested
-            || task.cancellation_requested
+        if !matches!(
+            task.status,
+            TaskStatus::Ready | TaskStatus::Paused | TaskStatus::NeedsCheck
+        ) || task.cancellation_requested
         {
             return Err(Failure::Rejected(
-                "task is not ready for continuation".into(),
+                "task cannot be reconstructed in its current state".into(),
             ));
         }
         let handler = self
@@ -280,43 +234,47 @@ impl TaskCenter {
             .ok_or_else(|| {
                 Failure::Rejected("no recovery function for task kind/version".into())
             })?;
-        handler(self.clone(), task).await
+        handler(self.clone(), task, startup).await
     }
-    fn current_run(&self, t: &StoredTask) -> Option<WorkflowId> {
-        let instance = self.persistence.as_ref()?.instance;
-        t.executions
-            .last()
-            .filter(|e| e.instance == instance && !e.interrupted && e.finished_at.is_none())
-            .and_then(|e| e.workflow)
+    fn current_run(&self, id: TaskId) -> Option<WorkflowId> {
+        let runs: Vec<_> = self
+            .task_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter_map(|(run, task)| (*task == id).then_some(*run))
+            .collect();
+        runs.into_iter().find(|run| {
+            self.execution
+                .task(*run)
+                .is_ok_and(|t| !matches!(t.state, RunState::Completed | RunState::Failed(_)))
+        })
     }
-    pub async fn pause_task(&self, id: TaskId) -> Outcome<()> {
-        let task = self.task_detail(id).await?;
+    pub async fn suspend_task(&self, id: TaskId) -> Outcome<()> {
         let run = self
-            .current_run(&task)
+            .current_run(id)
             .ok_or_else(|| Failure::Rejected("task has no live execution".into()))?;
         self.suspend(run)?;
         self.flush_history().await
     }
     pub async fn resume_task(&self, id: TaskId) -> Outcome<WorkflowId> {
-        let task = self.task_detail(id).await?;
-        if let Some(run) = self.current_run(&task) {
-            self.resume(run)?;
-            self.flush_history().await?;
-            return Ok(run);
-        }
-        self.persistence()?.clear_pause(id).await?;
-        self.continue_task(id).await
+        let run = self.current_run(id).ok_or_else(|| {
+            Failure::Rejected("task has no live execution; inspect its recovery report".into())
+        })?;
+        self.resume(run)?;
+        self.flush_history().await?;
+        Ok(run)
     }
     pub async fn cancel_task(&self, id: TaskId) -> Outcome<()> {
-        let task = self.task_detail(id).await?;
-        if let Some(run) = self.current_run(&task) {
+        if let Some(run) = self.current_run(id) {
             self.cancel(run)?;
             self.flush_history().await
         } else {
             self.persistence()?.cancel_inactive(id).await?;
             let (reply, received) = oneshot::channel();
-            self.persistence_control
-                .send(PersistenceControl::Release { task: id, reply })
+            self.scheduling_commands
+                .send(SchedulingCommand::Release { task: id, reply })
                 .await
                 .map_err(|_| Failure::Unavailable)?;
             received.await.map_err(|_| Failure::Unavailable)

@@ -242,7 +242,7 @@ impl Fixture {
             driver,
             &config,
             pool,
-            PoolUuid::new(),
+            PoolInstanceId::new(),
             store.clone(),
             PersistenceConfig::default(),
         )
@@ -634,7 +634,7 @@ async fn recoverable_shrink_restores_pool_wide_slot_and_rechecks_before_starting
             }
         })
         .unwrap();
-    let workflow = next.center.continue_task(id).await.unwrap();
+    let workflow = next.center.retry_task(id).await.unwrap();
     let start = next.call(Command::Start).await;
     start.reply.send(Ok(())).unwrap();
     next.call(Command::Finalize)

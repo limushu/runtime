@@ -109,9 +109,10 @@ Disk/Tier/VD 服务及 Pool 查询统一读取仓储，不保留可切换的领�
 如果一次提交返回 Uncertain，后续成功读取可能看到已提交数据；读取不会解除原任务的隔离，
 外部 IO 的实际效果仍需要业务对账。
 
-接管既有 Pool 时先确保旧所有者停稳，绑定原 Pool 身份，再 `restore_metadata` 重建成员目录。
-节点连接和加载状态仍由实际拓扑源提供，数据库中的 IO Up 不代表新宿主已取得实时拓扑事实。
-配置 TaskStore 时再恢复原 Task 并显式续办，见 [任务持久化](task-persistence.md)。
+系统接管既有 Pool 时，确保旧所有者停稳，再调用 `manager.open(原 Pool 身份, 当前完整拓扑)`。
+池内依次恢复元数据、成员目录和真实连接/加载状态，随后自动重建可续办 Task。
+数据库中的 IO Up 不代表新宿主已取得实时拓扑事实，离线源盘的缩容继续等待条件，
+见 [任务持久化](task-persistence.md)。`restore_metadata` 仍可单独用于目录恢复，它本身不创建任务执行。
 
 ```sh
 cargo test --offline --locked -p storage-pool --all-features --test metadata

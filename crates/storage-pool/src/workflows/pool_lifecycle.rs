@@ -37,6 +37,7 @@ pub(crate) struct LoadPoolWorkflow {
     pub domains: Domains,
     pub snapshot: Vec<TopologyEvent>,
     pub disks: Vec<MemberDisk>,
+    pub attach_nodes: bool,
 }
 impl PoolWorkflow for LoadPoolWorkflow {
     fn operation(&self) -> PoolOperation {
@@ -65,7 +66,11 @@ impl Workflow for LoadPoolWorkflow {
             };
             ctx.activity(
                 &self.domains.membership,
-                crate::pool::MembershipCommand::ApplyObservation(event.clone()),
+                if self.attach_nodes {
+                    crate::pool::MembershipCommand::RestoreObservation(event.clone())
+                } else {
+                    crate::pool::MembershipCommand::ApplyObservation(event.clone())
+                },
             )
             .await?;
             if *is_connected {
@@ -75,6 +80,14 @@ impl Workflow for LoadPoolWorkflow {
             }
         }
         for disk in self.disks {
+            if self.attach_nodes && disk.io == IoState::Up && !connected.contains(&disk.node) {
+                ctx.activity(
+                    &self.domains.disk,
+                    DiskCommand::SetIo(disk.id, IoState::Down),
+                )
+                .await?;
+                continue;
+            }
             if disk.io == IoState::Up && connected.contains(&disk.node) {
                 ctx.activity(&self.domains.disk, DiskCommand::Open(disk.id.clone()))
                     .await?;

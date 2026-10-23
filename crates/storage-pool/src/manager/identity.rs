@@ -32,6 +32,27 @@ impl fmt::Display for PoolUuid {
     }
 }
 
+/// Identifies one in-memory Pool host. Never substitutes for stable PoolUuid or an HA term.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct PoolInstanceId(uuid::Uuid);
+impl PoolInstanceId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+impl Default for PoolInstanceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl fmt::Display for PoolInstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PoolName(String);
 impl PoolName {

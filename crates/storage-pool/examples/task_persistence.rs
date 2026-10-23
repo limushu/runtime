@@ -109,7 +109,7 @@ async fn main() -> Outcome<()> {
         driver,
         &config,
         pool,
-        PoolUuid::new(),
+        PoolInstanceId::new(),
         store.clone(),
         PersistenceConfig::default(),
     )?;
@@ -131,7 +131,7 @@ async fn main() -> Outcome<()> {
         .await?;
     let id = task.task_id;
     started.acquire().await.map_err(codec)?.forget();
-    old.pause_task(id).await?;
+    old.suspend_task(id).await?;
     release.add_permits(1);
     old.wait_suspended(task.id()).await?;
     old.shutdown().await?;
@@ -156,7 +156,7 @@ async fn main() -> Outcome<()> {
         driver,
         &config,
         pool,
-        PoolUuid::new(),
+        PoolInstanceId::new(),
         store,
         PersistenceConfig::default(),
     )?;
@@ -179,7 +179,9 @@ async fn main() -> Outcome<()> {
             })
         }
     })?;
-    new.recover_tasks().await?;
+    let report = new.recover_tasks().await?;
+    new.wait_suspended(report.executions[&id]).await?;
+    new.flush_history().await?;
     assert_eq!(new.task_detail(id).await?.status, TaskStatus::Paused);
     let execution = new.resume_task(id).await?;
     let mut observer = new.observe_task(execution)?;

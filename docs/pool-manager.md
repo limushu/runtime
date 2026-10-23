@@ -7,6 +7,8 @@ PoolManager 是可克隆的句柄目录；每个 Pool 保留自己的 TaskCenter
 
 - `create(CreatePool)` 创建本地 Pool；`create_pool(PoolId)` 是名称默认等于 ID 的便捷入口。
   当前创建只启动内存运行结构，没有外部初始化步骤，因此不生成虚假的初始化 Workflow。
+- `open(CreatePool, topology)` 是系统启动/接管入口：创建本地句柄，由 Pool 串联元数据、当前拓扑与 Task 自动恢复。
+  系统需先完成旧所有者隔离；不要求用户指定待恢复 TaskId。自定义恢复工厂可先 create、注册，再调用 pool.takeover。
 - `get(PoolSelector)` 支持类型化的 ID、UUID、名称；名称区分大小写。
 - `list()` 返回描述符；`PoolHandle::rename(name, expected_revision)` 原子更新名称索引和修订号。
 - UUID 与 ID 不复用；删除成功后名称可以复用。旧句柄仍绑定原来的 UUID 和实例。
@@ -48,10 +50,10 @@ Accepted 只表示任务已接受；完成、失败、队列满、不相关、�
 `load` 要求覆盖全部已加入节点的完整、有效版本事实，恢复节点加载与可用盘状态后再开放准入。
 `shutdown` 结束本地运行宿主，不能通过 load 重启，也不等同于外部卸载已经确认。
 
-跨池 TaskRef 包含 Pool UUID、实例 UUID、WorkflowId；观测和控制均校验作用域。
+跨池 TaskRef 包含稳定 PoolUuid、运行期 PoolInstanceId、WorkflowId；观测和控制均校验作用域。
 Manager 汇总本池 Task 快照，选中任务可以订阅 observer；历史与 Activity 均在内存中有界保留。
 删除池的运行历史另按 `Config::task_history` 限制保留的池数量；已有 observer 不受目录淘汰影响。
-可选注入 TaskStore 后，TaskCenter 另外提供 KV 历史查询与指定 Task 的检查点续办，不受热缓存淘汰影响，
+可选注入 TaskStore 后，TaskCenter 另外提供 KV 历史查询与任务自动重建及显式检查点续办，不受热缓存淘汰影响，
 见 [持久化接入说明](task-persistence.md)。
 
 ## 当前边界

@@ -135,6 +135,11 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(pool: PoolUuid, store: Arc<dyn TaskStore>, domain: Arc<Domain>) -> Self {
+        let fixture = Self::uninitialized(pool, store, domain);
+        fixture.center.recover_tasks().await.unwrap();
+        fixture
+    }
+    fn uninitialized(pool: PoolUuid, store: Arc<dyn TaskStore>, domain: Arc<Domain>) -> Self {
         let config = Config {
             activity_history: 1,
             task_history: 1,
@@ -146,12 +151,11 @@ impl Fixture {
             driver,
             &config,
             pool,
-            PoolUuid::new(),
+            PoolInstanceId::new(),
             store,
             PersistenceConfig::default(),
         )
         .unwrap();
-        center.recover_tasks().await.unwrap();
         Self { center, client }
     }
     fn work(&self, target: &str, chunks: u32, durable: bool) -> Work {
@@ -259,7 +263,7 @@ async fn history_keeps_all_activities_after_memory_eviction_without_observers() 
             .values()
             .all(|a| a.state == RecordedActivityState::Completed && a.finished_at.is_some())
     );
-    assert!(f.center.continue_task(id).await.is_err());
+    assert!(f.center.retry_task(id).await.is_err());
     f.center.shutdown().await.unwrap();
 }
 
@@ -292,7 +296,7 @@ async fn history_only_uncertain_task_remains_visible_but_is_not_resumable() {
         new.center.task_detail(id).await.unwrap().status,
         TaskStatus::NeedsCheck
     );
-    assert!(new.center.continue_task(id).await.is_err());
+    assert!(new.center.retry_task(id).await.is_err());
     assert!(
         new.center
             .task_history(TaskQuery {
@@ -318,20 +322,25 @@ async fn paused_shrink_keeps_task_id_and_links_two_executions_across_takeover() 
     let run = old.center.submit_resumable(work, spec).await.unwrap();
     let id = run.task_id;
     bounded(domain.started.acquire()).await.unwrap().forget();
-    old.center.pause_task(id).await.unwrap();
+    old.center.suspend_task(id).await.unwrap();
     domain.release.add_permits(1);
     bounded(old.center.wait_suspended(run.id())).await.unwrap();
     let paused = old.center.task_detail(id).await.unwrap();
     assert_eq!(paused.resume.unwrap().checkpoint, b"1");
     old.center.shutdown().await.unwrap();
-    let new = Fixture::new(pool, store, domain.clone()).await;
+    let new = Fixture::uninitialized(pool, store, domain.clone());
     new.register();
+    let report = new.center.recover_tasks().await.unwrap();
+    assert!(report.blocked.is_empty());
+    let next = report.executions[&id];
+    bounded(new.center.wait_suspended(next)).await.unwrap();
+    new.center.flush_history().await.unwrap();
     assert_eq!(
         new.center.task_detail(id).await.unwrap().status,
         TaskStatus::Paused
     );
-    assert!(new.center.continue_task(id).await.is_err());
-    let next = new.center.resume_task(id).await.unwrap();
+    assert!(new.center.retry_task(id).await.is_err());
+    assert_eq!(new.center.resume_task(id).await.unwrap(), next);
     finished(&new.center, next).await;
     let task = new.center.task_detail(id).await.unwrap();
     assert_eq!(task.id, id);
@@ -344,7 +353,106 @@ async fn paused_shrink_keeps_task_id_and_links_two_executions_across_takeover() 
         *domain.calls.lock().unwrap(),
         vec![("a".into(), 1), ("a".into(), 2), ("a".into(), 3)]
     );
-    assert!(new.center.continue_task(id).await.is_err());
+    assert!(new.center.retry_task(id).await.is_err());
+    new.center.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_automatically_reconstructs_ready_work_without_a_task_id_from_the_caller() {
+    let store = Arc::new(MemoryTaskStore::default());
+    let pool = PoolUuid::new();
+    let domain = Domain::new(false);
+    let id = pending(pool, store.clone(), domain.clone()).await;
+    let new = Fixture::uninitialized(pool, store, domain.clone());
+    new.register();
+    let report = new.center.recover_tasks().await.unwrap();
+    assert!(report.blocked.is_empty());
+    let next = report.executions[&id];
+    finished(&new.center, next).await;
+    assert_eq!(
+        new.center.task_detail(id).await.unwrap().status,
+        TaskStatus::Completed
+    );
+    assert_eq!(domain.calls.lock().unwrap().len(), 3);
+    assert!(new.center.recover_tasks().await.is_err());
+    new.center.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_recovery_reports_uncertain_work_and_preserves_its_claim_without_replaying() {
+    let store = Arc::new(MemoryTaskStore::default());
+    let pool = PoolUuid::new();
+    let domain = Domain::new(false);
+    let id = pending(pool, store.clone(), domain.clone()).await;
+    let mut record = store.get(pool, id).unwrap().unwrap();
+    let revision = record.revision;
+    record.status = TaskStatus::NeedsCheck;
+    record.last_error = Some(Failure::Uncertain("effect requires verification".into()));
+    record.revision += 1;
+    assert!(store.compare_and_set(Some(revision), &record).unwrap());
+    let new = Fixture::uninitialized(pool, store, domain.clone());
+    new.register();
+    let report = new.center.recover_tasks().await.unwrap();
+    assert!(report.executions.is_empty());
+    assert_eq!(report.blocked.len(), 1);
+    assert_eq!(report.blocked[0].task_id, id);
+    assert!(matches!(report.blocked[0].error, Failure::Uncertain(_)));
+    assert!(new.center.resume_task(id).await.is_err());
+    assert!(new.center.cancel_task(id).await.is_err());
+    assert_eq!(
+        new.center.task_detail(id).await.unwrap().executions.len(),
+        1
+    );
+    assert_eq!(domain.calls.lock().unwrap().len(), 1);
+    assert!(
+        new.center
+            .submit_task(new.work("a", 3, false))
+            .await
+            .is_err()
+    );
+    let mut independent = new
+        .center
+        .submit_task(new.work("b", 1, false))
+        .await
+        .unwrap();
+    bounded(independent.result()).await.unwrap();
+    new.center.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_new_request_is_history_only_and_is_never_resurrected_by_takeover() {
+    let store = Arc::new(MemoryTaskStore::default());
+    let pool = PoolUuid::new();
+    let domain = Domain::new(false);
+    let old = Fixture::new(pool, store.clone(), domain.clone()).await;
+    let mut work = old.work("a", 3, true);
+    work.wait_at = Some(1);
+    let spec = resume(&work.spec);
+    let original = old.center.submit_resumable(work, spec).await.unwrap();
+    wait_state(&old.center, original.id(), |s| {
+        *s == RunState::WaitingSignal
+    })
+    .await;
+    let duplicate = old.work("a", 3, true);
+    let spec = resume(&duplicate.spec);
+    assert!(old.center.submit_resumable(duplicate, spec).await.is_err());
+    old.center.shutdown().await.unwrap();
+    let history = old.center.task_history(TaskQuery::default()).await.unwrap();
+    assert_eq!(
+        history
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Failed)
+            .count(),
+        1
+    );
+    let new = Fixture::uninitialized(pool, store, domain.clone());
+    new.register();
+    let report = new.center.recover_tasks().await.unwrap();
+    assert!(report.blocked.is_empty());
+    assert_eq!(report.executions.len(), 1);
+    finished(&new.center, report.executions[&original.task_id]).await;
+    assert_eq!(domain.calls.lock().unwrap().len(), 3);
     new.center.shutdown().await.unwrap();
 }
 
@@ -359,7 +467,7 @@ async fn recovered_claim_blocks_new_conflicting_work_until_original_task_continu
         new.center.submit_task(new.work("a", 3, false)).await,
         Err(Failure::Rejected(_))
     ));
-    assert!(new.center.continue_task(id).await.is_err()); // missing recovery version handler
+    assert!(new.center.retry_task(id).await.is_err()); // missing recovery version handler
     assert_eq!(
         new.center.task_detail(id).await.unwrap().executions.len(),
         1
@@ -371,7 +479,7 @@ async fn recovered_claim_blocks_new_conflicting_work_until_original_task_continu
         .unwrap();
     bounded(independent.result()).await.unwrap();
     new.register();
-    let next = new.center.continue_task(id).await.unwrap();
+    let next = new.center.retry_task(id).await.unwrap();
     finished(&new.center, next).await;
     assert_eq!(
         new.center.task_detail(id).await.unwrap().status,
@@ -393,7 +501,7 @@ async fn cancelling_ready_task_removes_claim_but_does_not_restart_it() {
         new.center.task_detail(id).await.unwrap().status,
         TaskStatus::Cancelled
     );
-    assert!(new.center.continue_task(id).await.is_err());
+    assert!(new.center.retry_task(id).await.is_err());
     // A distinct business request is admitted after explicit cancellation.
     let mut next = new.work("a", 2, false);
     next.from = 1;
@@ -410,7 +518,7 @@ async fn concurrent_continuations_claim_exactly_one_new_execution() {
     let id = pending(pool, store.clone(), domain.clone()).await;
     let new = Fixture::new(pool, store, domain.clone()).await;
     new.register();
-    let (a, b) = tokio::join!(new.center.continue_task(id), new.center.continue_task(id));
+    let (a, b) = tokio::join!(new.center.retry_task(id), new.center.retry_task(id));
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
     let next = a.or(b).unwrap();
     finished(&new.center, next).await;
@@ -460,7 +568,7 @@ async fn failed_checkpoint_stops_next_effect_and_requires_business_verification(
     assert_eq!(domain.calls.lock().unwrap().len(), 1);
     assert!(f.center.cancel_task(run.task_id).await.is_err());
     f.register(); // queries actual progress, then safely continues at chunk 2
-    let next = f.center.continue_task(run.task_id).await.unwrap();
+    let next = f.center.retry_task(run.task_id).await.unwrap();
     finished(&f.center, next).await;
     assert_eq!(
         f.center.task_detail(run.task_id).await.unwrap().status,
@@ -598,7 +706,7 @@ async fn configured_store_records_builtin_pool_tasks_and_survives_manager_recrea
     let request = CreatePool::new(PoolId::new("pool-a").unwrap(), PoolName::new("a").unwrap());
     let manager = make_manager();
     let pool = manager.create(request.clone()).unwrap();
-    pool.recover_tasks().await.unwrap();
+    pool.takeover(vec![]).await.unwrap();
     let mut run = pool
         .attach_node(NodeId::new("node-1").unwrap(), 1, true)
         .await
@@ -635,11 +743,11 @@ async fn configured_store_records_builtin_pool_tasks_and_survives_manager_recrea
     manager.shutdown().await.unwrap();
     let next_manager = make_manager();
     let next_pool = next_manager.create(request).unwrap();
-    next_pool.recover_tasks().await.unwrap();
+    next_pool.takeover(vec![]).await.unwrap();
     let task = next_pool.task_detail(id).await.unwrap();
     assert_eq!(task.status, TaskStatus::Completed);
     assert!(!task.executions[0].activities.is_empty());
-    assert!(next_pool.continue_task(id).await.is_err());
+    assert!(next_pool.retry_task(id).await.is_err());
     next_manager.shutdown().await.unwrap();
 }
 
@@ -669,7 +777,7 @@ async fn recovery_factory_cannot_change_the_original_task_objects() {
         })
         .unwrap();
     assert!(matches!(
-        new.center.continue_task(id).await,
+        new.center.retry_task(id).await,
         Err(Failure::Rejected(_))
     ));
     assert_eq!(

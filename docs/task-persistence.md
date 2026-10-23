@@ -13,13 +13,15 @@ let manager = PoolManager::new(config, metadata, data_plane)
         queue_capacity: 1024,
         max_resume_bytes: 1024 * 1024,
     })?;
-let pool = manager.create(request)?;
-// 已完成系统原有的 Pool 加载/所有权接管，旧执行者已停止。
-pool.recover_tasks().await?;
+// 系统已取得 Pool 所有权，旧执行者已停稳；topology 来自当前真实拓扑源。
+let pool = manager.open(request, topology).await?;
+let report = pool.recovery_report().unwrap();
 ```
 
-启用存储后，新 TaskCenter 的普通准入保持关闭，必须调用一次 recover_tasks；新建的空池也一样。
-恢复过程先识别旧实例记录、安装未结束任务的对象占用，再开放准入；仅发现任务，不自动续跑。
+启用存储后，新 TaskCenter 的普通准入保持关闭。`PoolManager::open` 创建本地宿主并调用
+`PoolHandle::takeover`：恢复元数据与成员目录，应用完整的当前拓扑并加载服务，然后自动重建可续办任务。
+任务恢复先安装所有未结束任务的对象占用，再按原请求顺序重建执行，最后开放普通准入。
+新建空池也可走相同入口，系统调用时不需要提供任何 TaskId。
 未配置 TaskStore 时保持原有纯内存行为。数据库地址、连接池、表名和编码由适配器自行配置。
 
 TaskStore 协议只有三个存储操作：
@@ -86,7 +88,8 @@ let task = center.submit_resumable(workflow, ResumeSpec {
 
 kind/version 必须注册匹配的恢复函数；input/checkpoint 是业务自行编码的字节数组，数据库不解释它们。
 任务须声明非空对象集合，所有执行继续遵循同一个 TaskCenter 冲突规则。
-参数和初始检查点耐久提交后才允许执行；准入拒绝保留 Ready 及拒绝原因，便于解释和续办。
+参数和初始检查点耐久提交后才允许执行。新请求被准入拒绝时记录 Failed 及原因；
+它未获受理，不会在下次接管时自动执行。既有任务的重建被拒绝则保留 Ready/Paused 与原对象占用。
 
 任务内部在确认一批业务工作后执行：
 
@@ -101,26 +104,52 @@ save_checkpoint 等待耐久确认，失败停止后续依赖步骤并保留 Nee
 
 ## 切换与控制
 
-1. 计划切换时暂停任务并 wait_suspended，确认当前 Activity 停稳且检查点保存，再 shutdown。
-2. 新宿主绑定同一 Pool UUID，注册新宿主的恢复函数和服务客户端。
-3. recover_tasks 发现旧任务并恢复占用。暂停任务保持 Paused，其他可续办任务显示 Ready/NeedsCheck。
-4. 用户或业务策略调用 continue_task；暂停任务通过 resume_task 明确恢复。
-5. 恢复函数查询真实业务状态及下游任务，核对后构造 Workflow；在原 TaskId 下新增执行。
+正常接管由系统已有的主权切换回调触发，用户不需要选择历史 Task 或重新提交缩容：
 
-```rust,ignore
-center.register_recovery("shrink", 1, move |stored_task| async move {
-    // 解码、查询实际进度，确认旧工作停稳，再构造新宿主的 Workflow。
-    restore_shrink(stored_task).await
-})?;
-center.recover_tasks().await?;
-let execution = center.continue_task(task_id).await?;
+```text
+系统取得 Pool 所有权并确认旧执行停稳
+  → manager.open(原 Pool ID/UUID/名称, 当前完整拓扑)
+  → Pool.takeover：恢复元数据、成员目录、真实节点连接与加载状态
+  → TaskCenter.recover_tasks：读 TaskStore、恢复占用、调用已注册工厂
+  → 工厂构造绑定新宿主领域服务的 Workflow
+  → 在原 TaskId 下创建新 execution，交给本池 WorkflowDriver 推进
 ```
 
-PoolHandle 对应提供 register_task_recovery、recover_tasks、continue_task、pause_task、resume_task、cancel_task。
+`PoolUuid` 始终是同一个池的稳定身份。`PoolInstanceId` 只区分本地 Pool 宿主的运行期，
+用于关联执行和过滤旧审计，既不改变 Pool UUID，也不是选主代次或所有权凭证。
+仓库没有选主服务；生产系统须在已有的所有权交接入口调用 `open`，不由 TaskCenter 猜测是否切主。
+
+控制语义分开：
+
+- `suspend_task` / `resume_task`：只控制当前内存执行，resume 返回同一个 WorkflowId，不提交新 Workflow。
+- 接管恢复：自动重建 Workflow，保留 TaskId，新增一次 execution；不恢复旧 Future 或调用栈。
+- 用户原本挂起：新宿主自动重建一个仍挂起的执行，用户明确 resume 后才继续，不会覆盖暂停意图。
+- 系统 topo 暂停：按新宿主当前阻塞重建，解除后自动检查条件并继续。
+- `retry_task`：仅供对账完成、补装工厂等异常修复，普通暂停/恢复不经过它。
+
+`RecoveryReport.executions` 给出自动重建的映射，`blocked` 给出每个无法重建任务的原因。
+NeedsCheck 不自动重放；未知工厂、版本不兼容或容量不足等准入失败保留占用并报告，
+不会静默当成完成，也没有无限自动重试。未配置恢复能力的普通历史只标记 Interrupted。
+启动恢复报告是一次接管的结果；后续执行状态仍通过任务观察和历史查询获取。
+
+缩容的恢复工厂由 Pool 组装时自动注册。自定义工作流需在接管前注册，例如：
+
+```rust,ignore
+let pool = manager.create(same_pool_id_and_uuid)?;
+pool.register_task_recovery("shrink", 1, move |stored_task| async move {
+    // 只解码、查询和验证；使用新宿主的服务客户端构造 Workflow。
+    restore_shrink(stored_task).await
+})?;
+let report = pool.takeover(current_topology).await?;
+```
+
+独立嵌入 TaskCenter 时，应用初始化器负责准备领域服务、注册 `register_recovery`，
+再调用一次 `recover_tasks()`；它现在会自动重建，返回 `RecoveryReport`。
+PoolHandle 不再暴露第二个仅扫描记录的 `recover_tasks` 入口。
+
 缩容使用 `submit_resumable_shrink`（PoolHandle 为 `submit_resumable_shrink_task`），并实现 Workflow 的
 continuation_guard；`StoredTask.class` 保存 Shrink 分类，接管后仍保留池级单缩容名额，不按名字猜测任务类型。
-正式 `PoolHandle::shrink_disk` 已封装上述提交，配置 TaskStore 即自动登记 `storage.shrink-disk` v1 恢复函数。
-接管时先 `restore_metadata` 并获取真实拓扑，再 `recover_tasks`、`continue_task`；详见 [完整缩容](shrink-workflow.md)。
+正式 `PoolHandle::shrink_disk` 已封装提交与恢复，详见 [完整缩容](shrink-workflow.md)。
 同 Task 的并发续办由任务 revision CAS 排斥；恢复函数不能改变 Workflow 名称和声明对象。
 恢复函数应只查询/验证及构造流程，副作用仍放到受准入控制的 Workflow Activity 中。
 未知 kind/version、错误对象或终态任务不会被重新执行。
@@ -133,7 +162,7 @@ NeedsCheck 不能通过简单 cancel 释放隔离；先由业务确认实际效�
 若当前宿主的 Activity 本身返回 Uncertain，其底层资源隔离仍保留，本版不提供原地解除接口；
 需完成业务对账及宿主接管后再续办。单纯检查点保存失败可在核对后于同宿主续办。
 
-本版复用已有的单 Pool 所有者约束，不提供跨主租约/fencing；调用 recover_tasks 前必须确保旧执行者已停止。
+本版复用已有的单 Pool 所有者约束，不提供跨主租约/fencing；调用 open/takeover（独立使用时为 recover_tasks）前必须确保旧执行者已停止。
 不尝试恢复 Future、任意等待信号或计时器；其业务语义由显式恢复函数负责。
 
 ## 关闭与示例
@@ -147,7 +176,7 @@ cargo test --locked -p storage-pool --all-features --test task_persistence
 ```
 
 示例是模拟缩容：暂停于确认第一块迁移后，切换控制宿主，再完成两块；同 TaskId 下关联两次执行。
-KV 真实持久化，迁移领域状态用进程内模拟器表示；不宣称已经实现真实缩容或断电自动恢复。
+KV 真实持久化，迁移领域状态用进程内模拟器表示；不执行真实磁盘复制，也不提供跨主所有权协议。
 该分块示例仅验证持久化协议；真实硬盘缩容一次提交完整排空给均衡模块，按 [阶段流程](shrink-workflow.md) 推进。
 `examples/shrink_disk.rs` 调用正式业务工作流，`tests/shrink_disk.rs` 验证同 TaskId、同外部 job 的接管。
 KV 参考适配器每次更新事务替换完整任务记录，适用于首版验证；超长任务需进一步拆分步骤存储及设计保留/清理策略。

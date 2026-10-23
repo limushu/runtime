@@ -68,14 +68,15 @@ execution() 提供 Runtime 执行计数。ID 只在当前 Pool 实例内唯一�
 原有暂停在当前进程安全边界生效，并保留对象占用；纯内存模式不支持切换续办。
 
 可选注入 TaskStore 后，TaskCenter 保存独立的 KV 历史，并为显式声明的任务提供检查点续办。
-普通任务仍只查询历史；新配置的池需先 recover_tasks，再接收业务。
+普通任务仍只查询历史；系统接管入口 `manager.open(原池身份, 当前完整拓扑)` 自动装载并重建可续办任务，
+无需用户传 TaskId。当前执行的 suspend_task/resume_task 不提交新 Workflow；恢复失败通过 RecoveryReport 报告。
 数据库接口、PoolHandle 入口和缩容模拟示例见 [TaskCenter 持久化](../../docs/task-persistence.md)。
 
 正式缩容入口是 `pool.shrink_disk(id)`，实现见 [ShrinkDiskWorkflow](src/workflows/shrink_disk.rs)。
 创建池前用 `PoolManager::with_balancer` 注入已有均衡服务；未配置时明确拒绝。
 一次 Activity 提交整盘 job，转发实际进度并处理暂停/恢复；BG 规划、复制和 remap 由均衡模块负责。
 取消保留已迁移数据及 Inactive 意图，显式 `abort_shrink_disk` 确认 job 停稳后才清除意图。
-配置 TaskStore 后自动登记可续办 Task，新宿主先恢复元数据及实际拓扑，再恢复并继续原任务。
+配置 TaskStore 后自动登记可续办 Task，新宿主由 Pool.takeover 先恢复元数据及实际拓扑，再自动继续原任务，用户暂停意图仍保留。
 完整阶段、端口契约与接管顺序见 [缩容工作流](../../docs/shrink-workflow.md)。
 
 规则扩展见 [TaskCenter 开发说明](../../docs/task-center.md)。本轮删除 with_policy/with_rules、

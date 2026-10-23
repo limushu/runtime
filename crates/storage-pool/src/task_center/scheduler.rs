@@ -1,5 +1,12 @@
 //! Queue ownership, topology suspension and uncertain-result fences.
+use super::submission::Submission;
 use super::*;
+pub(super) struct Admitted {
+    pub id: WorkflowId,
+    pub task_id: Option<TaskId>,
+    pub conflicts: Vec<ConflictMatch>,
+    pub publish: Box<dyn FnOnce() + Send>,
+}
 pub(super) struct Entry {
     pub(super) operation: PoolOperation,
     pub(super) control: RunControl,
@@ -10,9 +17,71 @@ pub(super) struct Entry {
 pub(super) struct State {
     pub(super) entries: BTreeMap<WorkflowId, Entry>,
     pub(super) fences: Vec<(Option<TaskId>, PoolOperation)>,
-    pub(super) pending_tasks: BTreeMap<TaskId, PoolOperation>,
+    pub(super) restored_claims: BTreeMap<TaskId, PoolOperation>,
 }
 impl State {
+    /// Admission is a synchronous scheduling transaction. No database work runs here.
+    pub(super) fn admit(
+        &mut self,
+        submission: Submission,
+        driver: &mut WorkflowDriver,
+        closed: bool,
+        limit: usize,
+    ) -> Option<Admitted> {
+        self.reap();
+        let decision = if closed && !submission.administrative {
+            Err(Failure::Unavailable)
+        } else if self.entries.len() >= limit {
+            Err(Failure::Busy)
+        } else {
+            self.inspect(&submission.operation, submission.restored_task)
+        };
+        let conflicts = match decision {
+            Ok(matches) => matches,
+            Err(error) => {
+                (submission.accept)(Err(error));
+                return None;
+            }
+        };
+        // A replacement must exist before transferring claims or cancelling predecessors.
+        let accepted = (submission.accept)(Ok(driver))?;
+        self.reap();
+        if let Some(task) = submission.restored_task {
+            // Transfer a logical claim, not a running Future. No old execution is cancelled.
+            self.restored_claims.remove(&task);
+            self.fences.retain(|(owner, _)| *owner != Some(task));
+        }
+        let fenced = self
+            .fences
+            .iter()
+            .any(|(_, f)| f.overlaps(&submission.operation));
+        let id = accepted.control.id;
+        self.entries.insert(
+            id,
+            Entry {
+                operation: submission.operation,
+                control: accepted.control,
+                start: Some(accepted.start),
+                task_id: accepted.task_id,
+            },
+        );
+        for found in &conflicts {
+            if !fenced
+                && found.conflict.decision == ConflictDecision::CancelThenWait
+                && let Some(entry) = self.entries.get(&found.existing)
+            {
+                entry.control.cancel();
+            }
+        }
+        self.reap();
+        self.pump();
+        Some(Admitted {
+            id,
+            task_id: accepted.task_id,
+            conflicts,
+            publish: accepted.publish,
+        })
+    }
     // Reap before every admission too: a terminal notification may still be in the mailbox.
     pub(super) fn reap(&mut self) {
         let terminal: Vec<_> = self
@@ -36,16 +105,26 @@ impl State {
     pub(super) fn inspect(
         &self,
         operation: &PoolOperation,
-        recovery_task: Option<TaskId>,
+        restored_task: Option<TaskId>,
     ) -> Outcome<Vec<ConflictMatch>> {
-        if self
-            .pending_tasks
-            .iter()
-            .any(|(id, pending)| Some(*id) != recovery_task && pending.overlaps(operation))
+        // Restored executions can join the queue together. pump keeps their start permits
+        // blocked by any overlapping claim that has not been transferred or reconciled.
+        if restored_task.is_none()
+            && self
+                .restored_claims
+                .iter()
+                .any(|(_, pending)| pending.overlaps(operation))
         {
             return Err(crate::support::reject(
-                "unfinished task owns these objects; continue or cancel the original task",
+                "unfinished task owns these objects; inspect its recovery report",
             ));
+        }
+        if restored_task.is_some()
+            && self.fences.iter().any(|(owner, operation_fence)| {
+                *owner != restored_task && operation_fence.overlaps(operation)
+            })
+        {
+            return Err(crate::support::reject("object requires reconciliation"));
         }
         let mut matches = Vec::new();
         for (id, entry) in &self.entries {
@@ -77,7 +156,7 @@ impl State {
             .values()
             .any(|e| e.operation.kind.is_topology())
             || self.fences.iter().any(|(_, f)| f.kind.is_topology())
-            || self.pending_tasks.values().any(|p| p.kind.is_topology());
+            || self.restored_claims.values().any(|p| p.kind.is_topology());
         for entry in self.entries.values() {
             if entry.operation.kind == OperationKind::Shrink {
                 let _ = entry.control.set_system_pause(topo_pending);
@@ -129,7 +208,7 @@ impl State {
                 true
             });
             let recovered = self
-                .pending_tasks
+                .restored_claims
                 .iter()
                 .any(|(owner, p)| Some(*owner) != entry.task_id && p.overlaps(&entry.operation));
             if !blocked && !recovered {

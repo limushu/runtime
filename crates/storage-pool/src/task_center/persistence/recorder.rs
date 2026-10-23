@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Failure, Outcome, PoolUuid};
+use crate::{Failure, Outcome, PoolInstanceId, PoolUuid};
 use std::{
     sync::{
         Arc, Mutex,
@@ -21,7 +21,7 @@ enum Message {
 #[derive(Clone)]
 pub(crate) struct TaskPersistence {
     pub pool: PoolUuid,
-    pub instance: PoolUuid,
+    pub instance: PoolInstanceId,
     tx: mpsc::Sender<Message>,
     config: PersistenceConfig,
     health: Arc<Mutex<PersistenceHealth>>,
@@ -30,7 +30,8 @@ pub(crate) struct TaskPersistence {
 pub(crate) struct TaskBinding {
     pub id: TaskId,
     pub attempt: u64,
-    pub is_recovery: bool,
+    pub is_restored: bool,
+    pub initial_pause: bool,
     persistence: TaskPersistence,
     checkpoint_failed: Arc<AtomicBool>,
 }
@@ -65,7 +66,7 @@ fn edit<T>(
 impl TaskPersistence {
     pub fn new(
         pool: PoolUuid,
-        instance: PoolUuid,
+        instance: PoolInstanceId,
         store: Arc<dyn TaskStore>,
         config: PersistenceConfig,
     ) -> Outcome<Self> {
@@ -210,7 +211,8 @@ impl TaskPersistence {
         TaskBinding {
             id,
             attempt: 1,
-            is_recovery: false,
+            is_restored: false,
+            initial_pause: false,
             persistence: self.clone(),
             checkpoint_failed: Arc::default(),
         }
@@ -245,7 +247,8 @@ impl TaskPersistence {
         Ok(TaskBinding {
             id,
             attempt: 1,
-            is_recovery: false,
+            is_restored: false,
+            initial_pause: false,
             persistence: self.clone(),
             checkpoint_failed: Arc::default(),
         })
@@ -254,6 +257,7 @@ impl TaskPersistence {
         let pool = self.pool;
         let instance = self.instance;
         let id = previous.id;
+        let initial_pause = previous.pause_requested;
         let attempt = self
             .request(move |store| {
                 let mut task = store
@@ -263,8 +267,10 @@ impl TaskPersistence {
                     return Err(Failure::Busy);
                 }
                 if task.resume.is_none()
-                    || !matches!(task.status, TaskStatus::Ready | TaskStatus::NeedsCheck)
-                    || task.pause_requested
+                    || !matches!(
+                        task.status,
+                        TaskStatus::Ready | TaskStatus::NeedsCheck | TaskStatus::Paused
+                    )
                     || task.cancellation_requested
                 {
                     return Err(Failure::Rejected(
@@ -293,7 +299,8 @@ impl TaskPersistence {
         Ok(TaskBinding {
             id,
             attempt,
-            is_recovery: true,
+            is_restored: true,
+            initial_pause,
             persistence: self.clone(),
             checkpoint_failed: Arc::default(),
         })
@@ -362,22 +369,6 @@ impl TaskPersistence {
                 }
             }
             Ok(recovered)
-        })
-        .await
-    }
-    pub async fn clear_pause(&self, id: TaskId) -> Outcome<()> {
-        let pool = self.pool;
-        self.request(move |s| {
-            edit(s, pool, id, |t| {
-                if t.resume.is_none() || t.status != TaskStatus::Paused {
-                    return Err(Failure::Rejected(
-                        "task is not an inactive paused task".into(),
-                    ));
-                }
-                t.pause_requested = false;
-                t.status = TaskStatus::Ready;
-                Ok(())
-            })
         })
         .await
     }
@@ -490,7 +481,9 @@ impl TaskBinding {
                     e.state = RunState::Failed(error.clone());
                     e.finished_at = Some(SystemTime::now());
                     task.last_error = Some(error.clone());
-                    task.status = if task.resume.is_some() {
+                    task.status = if binding.is_restored && task.pause_requested {
+                        TaskStatus::Paused
+                    } else if binding.is_restored {
                         TaskStatus::Ready
                     } else {
                         TaskStatus::Failed
@@ -567,7 +560,7 @@ mod tests {
         let pool = PoolUuid::new();
         let old = TaskPersistence::new(
             pool,
-            PoolUuid::new(),
+            PoolInstanceId::new(),
             store.clone(),
             PersistenceConfig::default(),
         )
@@ -587,8 +580,13 @@ mod tests {
             .await
             .unwrap();
         binding.save(vec![1]).await.unwrap();
-        let new = TaskPersistence::new(pool, PoolUuid::new(), store, PersistenceConfig::default())
-            .unwrap();
+        let new = TaskPersistence::new(
+            pool,
+            PoolInstanceId::new(),
+            store,
+            PersistenceConfig::default(),
+        )
+        .unwrap();
         new.recover().await.unwrap();
         let next = new.claim(new.get(binding.id).await.unwrap()).await.unwrap();
         next.save(vec![2]).await.unwrap();

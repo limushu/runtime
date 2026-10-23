@@ -7,6 +7,7 @@ mod ownership;
 mod recovery;
 mod shrink_disk;
 mod state;
+mod takeover;
 use crate::domains::tier::{TierService, runtime::TierHost};
 use crate::domains::{
     disk::{runtime::DiskHost, service::DiskService},

@@ -43,10 +43,12 @@ Workflow：按顺序调用 Activity
 5. `metadata/kv.rs`：接入自己的 KV；`repository.rs` 和 `state.rs`：编码与统一业务约束。
 
 TaskCenter 的其他文件分别是 `operation.rs`（分类与对象声明）、`observation.rs`（只读视图）、
-`recovery.rs`（任务续办）、`persistence/`（存储与审计）。`mod.rs` 保留唯一事件循环和提交接口。
+`submission.rs`（提交与可选审计绑定）、`recovery.rs`（自动重建及稳定 TaskId 控制）、
+`persistence/`（存储与审计）。`mod.rs` 保留唯一事件循环；它调用同步的 `State::admit`，
+事件循环不执行数据库 IO，也不包含泛型工作流及持久化绑定的构造细节。
 
 Pool 的 `membership.rs` 封装领域变化后的目录更新；`operations.rs`、`lifecycle.rs`、`shrink_disk.rs`
-组织对应业务入口。所有业务 Workflow 均位于 `workflows/`，Pool 模块不再混入流程体。
+组织对应业务入口；`takeover.rs` 串联系统接管时的元数据、当前拓扑和 Task 自动恢复。所有业务 Workflow 均位于 `workflows/`，Pool 模块不再混入流程体。
 
 ## 状态由谁负责
 
@@ -79,6 +81,8 @@ WorkflowDriver 推进 Futures，不再做一次业务排队；Activity 资源锁
 
 TaskStore 独立保存历史和可续办 Task，可与元数据共用物理数据库，但不与整个 Workflow 组成长事务。
 同一 Task 可以关联多次执行，缩容根据持久意图、真实 placement 和外部 job 核验后继续。
+系统获得主权后调用 `PoolManager::open`，池内自动完成恢复及重提交；用户无需提供 TaskId。
+当前执行的 suspend/resume 只控制原 Run，不创建 execution；无法安全重建的任务单独报告并保留占用。
 
 当前没有跨主租约、确定性 Future 重放或真实磁盘复制。离线重建等待仍是明确失败的占位能力。
 本地强制 Drop 不能证明远端工作已经停止；接管必须沿用系统的所有权交接机制。

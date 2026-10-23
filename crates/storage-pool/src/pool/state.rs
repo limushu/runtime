@@ -7,10 +7,12 @@ use std::{
     sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
 pub(crate) struct PoolShared {
+    pub takeover: tokio::sync::Mutex<bool>,
+    pub recovery_report: Mutex<Option<crate::task_center::RecoveryReport>>,
     pub routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
     pub descriptor: Mutex<PoolDescriptor>,
     pub registry: Weak<Mutex<Registry>>,
-    pub instance: PoolUuid,
+    pub instance: PoolInstanceId,
     pub nodes: Mutex<BTreeSet<NodeId>>,
     pub node_claims: Mutex<BTreeMap<NodeId, super::ownership::NodeClaim>>,
     pub detaching: Mutex<BTreeSet<NodeId>>,
@@ -33,10 +35,12 @@ impl PoolShared {
         config: &Config,
     ) -> Self {
         Self {
+            takeover: tokio::sync::Mutex::new(false),
+            recovery_report: Mutex::new(None),
             routing: Arc::default(),
             descriptor: Mutex::new(descriptor),
             registry,
-            instance: PoolUuid::new(),
+            instance: PoolInstanceId::new(),
             nodes: Mutex::default(),
             node_claims: Mutex::default(),
             detaching: Mutex::default(),

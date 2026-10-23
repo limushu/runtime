@@ -31,18 +31,40 @@ async fn main() -> Outcome<()> {
     )
     .with_balancer(balancer)?
     .with_task_store(history, PersistenceConfig::default())?;
-    let p = manager.create(CreatePool {
-        id: PoolId::new("metadata-demo")?,
-        name: PoolName::new("metadata-demo")?,
-        uuid: "556c6101-6983-45c6-b856-52596df956d3".parse()?,
-    })?;
-    // Existing Pool ownership must already be held by this host.
-    p.restore_metadata().await?;
-    let tasks = p.recover_tasks().await?;
-    if tasks.iter().any(StoredTask::recoverable) {
-        manager.shutdown().await?;
-        return Err(Failure::Rejected("unfinished tasks exist; inspect and explicitly continue them before starting this demo".into()));
-    }
+    let id = PoolId::new("metadata-demo")?;
+    let known = metadata.snapshot(&id).await?;
+    let nodes: std::collections::BTreeSet<_> = known.disks.iter().map(|d| d.node.clone()).collect();
+    // This example explicitly simulates fresh connectivity for these nodes.
+    // Production must obtain the facts from its topology source, never from persisted IO Up.
+    let topology = nodes
+        .into_iter()
+        .map(|node| {
+            TopologyEvent::new(
+                2,
+                10,
+                TopologyChange::NodeConnectivity {
+                    node,
+                    connected: true,
+                },
+            )
+        })
+        .collect();
+    let p = manager
+        .open(
+            CreatePool {
+                id,
+                name: PoolName::new("metadata-demo")?,
+                uuid: "556c6101-6983-45c6-b856-52596df956d3".parse()?,
+            },
+            topology,
+        )
+        .await?;
+    let report = p.recovery_report().unwrap();
+    println!(
+        "Automatically reconstructed {} task(s), {} blocked",
+        report.executions.len(),
+        report.blocked.len()
+    );
     let existing = metadata.snapshot(p.id()).await?;
     if existing
         .disks

@@ -59,16 +59,13 @@ impl PoolHandle {
     pub fn task_persistence_health(&self) -> Outcome<PersistenceHealth> {
         self.task_center.persistence_health()
     }
-    /// The caller must have completed the system's existing Pool takeover procedure first.
-    pub async fn recover_tasks(&self) -> Outcome<Vec<StoredTask>> {
-        self.task_center.recover_tasks().await
-    }
-    pub async fn continue_task(&self, id: TaskId) -> Outcome<WorkflowId> {
+    /// Explicit operator repair after reconciling a task reported as blocked.
+    pub async fn retry_task(&self, id: TaskId) -> Outcome<WorkflowId> {
         self.descriptor().active()?;
-        self.task_center.continue_task(id).await
+        self.task_center.retry_task(id).await
     }
-    pub async fn pause_task(&self, id: TaskId) -> Outcome<()> {
-        self.task_center.pause_task(id).await
+    pub async fn suspend_task(&self, id: TaskId) -> Outcome<()> {
+        self.task_center.suspend_task(id).await
     }
     pub async fn resume_task(&self, id: TaskId) -> Outcome<WorkflowId> {
         self.descriptor().active()?;

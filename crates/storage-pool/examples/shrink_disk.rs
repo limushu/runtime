@@ -23,8 +23,12 @@ async fn main() -> Outcome<()> {
             Arc::new(MemoryTaskStore::default()),
             PersistenceConfig::default(),
         )?;
-    let pool = manager.create_pool(PoolId::new("pool-1")?)?;
-    pool.recover_tasks().await?;
+    let pool = manager
+        .open(
+            CreatePool::new(PoolId::new("pool-1")?, PoolName::new("pool-1")?),
+            vec![],
+        )
+        .await?;
     let tier = TierId::new("ssd")?;
     finish(pool.create_tier(tier.clone()).await?).await?;
     for index in 1..=3 {

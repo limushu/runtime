@@ -83,6 +83,7 @@ struct ShrinkGuard {
     balance: Arc<dyn Balancer>,
     pool: PoolId,
     shared: Arc<PoolShared>,
+    domains: Domains,
 }
 #[async_trait]
 impl ContinuationGuard for ShrinkGuard {
@@ -110,6 +111,21 @@ impl ContinuationGuard for ShrinkGuard {
                 Err(reject("disk identity is removed"))
             };
         }
+        if disk.io != IoState::Up {
+            return Ok(ContinueDecision::Wait("source disk is not online".into()));
+        }
+        if !self
+            .domains
+            .node
+            .query(None)
+            .await?
+            .iter()
+            .any(|node| node.id == disk.node && node.serving())
+        {
+            return Ok(ContinueDecision::Wait(
+                "source node is not loaded and connected".into(),
+            ));
+        }
         if let Some(job) = self.balance.find(&self.pool, self.request.job).await?
             && job.progress().borrow().state == EvacuationState::Cancelled
         {
@@ -136,6 +152,7 @@ pub(super) fn build_shrink(
     let pool = shared.descriptor.lock().unwrap().id.clone();
     let guard = Arc::new(ShrinkGuard {
         request: request.clone(),
+        domains: domains.clone(),
         metadata,
         balance,
         pool,

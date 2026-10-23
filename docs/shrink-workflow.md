@@ -39,9 +39,8 @@ Removed 不是遗忘身份；同一 Pool 不重新接纳该成员身份，旧观
 let manager = PoolManager::new(config, metadata, data_plane)
     .with_balancer(balancer)?;
 // 可选：.with_task_store(your_store, persistence_config)?
-let pool = manager.create_pool(pool_id)?;
-// 配置 TaskStore 时，完成恢复初始化后才开放普通任务准入：
-// pool.recover_tasks().await?;
+// 系统已取得主权；首次新建时拓扑可以为空，接管时传入完整当前事实。
+let pool = manager.open(pool_descriptor, current_topology).await?;
 
 let mut run = pool.shrink_disk(disk_id).await?;
 let task = pool.observe_task(run.id())?;
@@ -104,18 +103,23 @@ let inactive_member = abort.result().await?;
 宿主/服务停止则等待 job 暂停并结束本次执行，保留外部 job 给下一任继续。
 该区别不改变 token 的协作语义，领域适配器仍须主动感知它。
 
-新宿主获得既有 Pool 所有权、旧执行停稳后：
+新宿主获得既有 Pool 所有权、旧执行停稳后，系统的切主入口调用：
 
 ```rust,ignore
-let pool = manager.create(same_pool_id_and_uuid)?;
-pool.restore_metadata().await?;      // 重建 Tier/Disk/VD 与路由/物理归属
-// 从实际拓扑源重新获取连接与加载状态；restore_metadata 不捏造这些事实。
-let tasks = pool.recover_tasks().await?;
-let workflow_id = pool.continue_task(task_id).await?;
-// 用户原本暂停的任务，显式调用 resume_task(task_id)。
+let pool = manager.open(same_pool_id_and_uuid, current_topology).await?;
+let report = pool.recovery_report().unwrap(); // 查询接管结果，不用用户指定 TaskId
 ```
 
-同一个 TaskId 关联新的执行，重连同一个外部 job。未解 Uncertain 仍需业务对账；没有自动解除隔离或分布式租约。
+`PoolHandle::takeover` 先恢复元数据和路由/物理归属，再依据完整真实拓扑重建 Node 连接及加载状态，
+然后调用 TaskCenter 自动读取持久 Task、构造新的缩容 Workflow 并提交给本池 Driver。
+源节点离线时将旧 IO Up 校正为 Down，缩容等待业务条件；后续上线 topo 完成后自动重查并继续。
+不能仅凭数据库里的 IO Up 判定新宿主可以继续迁移。
+
+Pool UUID 和 TaskId 保持不变；本地 PoolInstanceId 与 execution 改变，仍重连同一个外部 job。
+用户主动暂停的任务会自动重建为暂停的执行，`resume_task` 只唤醒该执行，不再隐含重提交。
+接管失败保留关闭准入；放弃等待不会丢下已经开始的接管。重复接管不创建第二次执行。
+未解 Uncertain 和缺少恢复工厂等情况保留占用并在报告中列出，不盲目重放。
+选主与旧执行隔离由已有系统提供，此库不以随机实例 ID 替代所有权协议。
 
 ## 运行与验证
 
