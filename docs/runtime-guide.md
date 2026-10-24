@@ -1,114 +1,110 @@
-# TaskCenter 系统导读：从总览到执行细节
+# 最新架构运行导读：统一 Task、调度与恢复
 
-[打开五图导读：支持翻页、缩放和打印](diagrams/task-center-guide/index.html)
+[打开交互导读](diagrams/unified-task-guide/index.html)：六图翻页、运行步骤高亮、组件职责查询、缩放与打印，离线可用。
 
-面向首次了解系统的开发者。先读第一张，再按需要展开后四张。
-图中的 task 指 Tokio task，不代表专属操作系统线程。
-本次只增加说明，不修改执行语义；实现依据为 `7b3b408` 的 Rust 代码。
+本组图按实现提交 `53b5ea6` 重绘。Task 是业务管理身份；Tokio task 是执行宿主。
+逻辑分层不等于部署拆分；TaskCenter 与各服务宿主的实际执行边界见第二图。
 
-## 1. 整体框架与驱动闭环
+## 1. 逻辑分层：各组件负责什么
 
-![整体框架与驱动闭环](diagrams/task-center-guide/01-overview.png)
+![逻辑分层](diagrams/unified-task-guide/01-layers.png)
 
-Pool 负责装配；TaskCenter 决定流程准入并推进 Workflow；各领域服务独立执行 Activity。
-Driver、Broker、LockTable、Context 都不是额外的执行 task。
+- 应用入口和组合根装配依赖、主轮次分配器、TaskCenter 与领域客户端。
+- Workflow 定义步骤、持久化、checkpoint、附加信息和继续执行的业务条件。
+- SchedulingPolicy 定义跨任务关系；TaskCenter 管队列、占用、隔离与停稳交接。
+- Driver 推进 Future，Context 提供 Activity 与控制机制。两者不是额外的 Tokio task。
+- 领域服务负责命令合法性和真实动作；TaskStore 保存同一个 Task 的恢复记录。
 
-这里最重要的关系是资源分支与 Workflow 分支共享同一个驱动器：
+[可编辑 SVG](diagrams/unified-task-guide/01-layers.svg)
 
-1. 外层循环轮询 `driver.tick()`，其中 `running.next()` 轮询就绪的 Workflow Future。
-2. Workflow 在 `ctx.activity()` 内通过 Broker 把 Acquire 发入资源事件队列。
-3. 没有立即可用的 Permit 时，等待的 Future 返回 Pending；这不是阻塞线程或阻塞整个 TaskCenter。
-4. 资源队列就绪，Driver 通过 `events.recv()` 取得事件并调用 `LockTable.event()`；锁表决定立即放行或继续排队。
-5. 放行通过 oneshot 发回 Permit，唤醒等待链。FuturesUnordered 将对应 Future 标记为可再次轮询，并向外传播唤醒。
-6. Tokio 再次调度 TaskCenter 后，由 Driver 继续 poll Workflow；它取到 Permit，注册 Guard，再调用 ActivityClient。
-7. 服务的结果也通过 oneshot 唤醒同一条等待链，Workflow 才能解释结果并推进下一步骤。
+## 2. 实际执行：一次 Activity 如何推进和返回
 
-唤醒是“可以再次轮询”的通知，不是 LockTable 或服务宿主直接执行 Workflow。
-`running.next()` 被轮询时会推进内部 Future，但仅当一个 Workflow 整体完成时返回
-`Ready(Some(id))`；步骤完成、拿到许可都不意味着 Workflow 已经结束。
-资源事件分支每处理一个事件便结束这一轮 tick，外层循环随后再次进行 reap / pump / select。
+![运行闭环](diagrams/unified-task-guide/02-runtime.png)
 
-Permit 接收等待封装在 Broker.acquire() 内；总览将其画到 WorkflowContext，是为了表达所属执行链，
-不是 Context 越过 Broker 直接操作 LockTable。
+TaskCenter 的循环处理提交、关闭、提交确认回执和 driver.tick()。Driver 同时轮询 Workflow
+Future 集合及资源事件；Workflow 等待资源或服务结果时返回 Pending，不阻塞整个循环。
+Context 经 Broker 请求资源，LockTable 在 Driver 内处理事件并发回 Permit。取得许可后，
+ActivityClient 将请求、Context、Guard 发送到服务邮箱。服务宿主独立轮询执行 Future，
+调用 Handler → Service → Ports。Guard 跟随实际执行停稳，再通知 Tracker 并投递 Release。
 
-[SVG 原图](diagrams/task-center-guide/01-overview.svg)
+服务的 oneshot 回复唤醒原等待链；是 Tokio 再次调度 TaskCenter 后继续 poll Workflow，
+不是服务宿主直接执行 Workflow。Workflow 整体完成后，State 才回收对象或保留 Uncertain 隔离。
+图中资源框合并展示 Broker、事件队列和 LockTable；Acquire/Permit 与 Release 均由这条资源路径处理。
 
-## 2. 资源许可：请求、等待、放行、释放
+[可编辑 SVG](diagrams/unified-task-guide/02-runtime.svg)
 
-![资源许可时序](diagrams/task-center-guide/02-resources.png)
+## 3. 调度：topo 如何暂停缩容并取得执行权
 
-这是 Activity 的读写资源保护，不是完整 Workflow 的业务对象准入。
-Broker 发送事件，LockTable 只由 Driver 更新，服务携带 Guard 执行。
-Guard/Permit 的生命周期跟随实际执行，不跟随调用方是否还在等待结果。
-Release 先入队；Driver 处理它的时机可以和服务回复交错。不确定结果保留资源隔离。
+![调度交接](diagrams/unified-task-guide/03-scheduling.png)
 
-[SVG 原图](diagrams/task-center-guide/02-resources.svg)
+默认 PoolSchedulingPolicy 声明缩容 YieldTo topo。TaskCenter 先完成准入；Durable 任务还须
+确认初始记录写入，才激活调度并影响既有任务。暂停原因写入同一个 Task 的控制状态。
+迁移实际停稳、当前控制代次 ACK 有效后，TaskCenter 才发放 topo Workflow 的 StartPermit。
+许可发给流程执行体，不交给外部调用者。
 
-## 3. 领域服务：步骤究竟在哪里执行
+topo 完成只清除它自己的暂停原因；其他 topo 或用户暂停仍有效。全部原因清除后，Workflow
+重新检查继续执行的业务条件。用户 resume 不能绕过仍在运行的 topo。
+此图采用保留调用的方式，另一种方式见第四图。策略不能构成 YieldTo 环。
 
-![领域服务内部](diagrams/task-center-guide/03-services.png)
+[可编辑 SVG](diagrams/unified-task-guide/03-scheduling.svg)
 
-每个服务拥有自己的邮箱、宿主循环和 Activity Future 集合。
-宿主经 Host 适配器调用 Service 与 Model，再通过端口访问外部依赖。
-资源放行发生在步骤进入服务之前，领域服务不维护 Workflow 业务冲突队列。
-Query 同样由服务宿主接收，但直接读取已确认视图，不作为业务编排步骤取得 Activity 许可。
+## 4. 暂停：原 await 保留，还是先返回部分结果
 
-例子：磁盘上线是一个 Workflow，不是 Add、Open 两个 Workflow。
-它依次通过 Activity 检查节点服务资格、Add、Open、SetIo(Up)；任一步失败都会停止正常后续步骤。
-其中 Node Inspect 也走 Activity，不以观察 Query 替代有业务意义的步骤。
+![两种暂停契约](diagrams/unified-task-guide/04-pause.png)
 
-[SVG 原图](diagrams/task-center-guide/03-services.svg)
+两种方式都使用原有 ctx.activity(...).await，TaskId 不变。
 
-## 4. 冲突交接：同一磁盘上线未结束，又收到下线
+- 保留调用：ActivityControl 发送领域 suspend 命令并等待停稳。原 await 继续等待；
+  暂停原因清除后，Workflow guard 先检查，满足才执行所选 resume 命令。
+- 停稳返回：服务观察控制 token，自行停稳后返回业务部分结果。Workflow 保存 checkpoint，
+  再进入 safe_point 确认 Task 暂停；恢复并通过 guard 后发起下一次普通 Activity。
 
-![取消后等待与对象交接](diagrams/task-center-guide/04-handoff.png)
+Workflow 可覆盖下一次调用的控制适配器，因此缩容和扩容可以选择不同领域命令。
+完全不支持暂停的服务需等自然完成。保留调用仍持有 Activity 资源锁，topo 若需要同一资源，
+应选停稳返回方式或调整真实资源边界。控制失败不会被当成成功停稳。
 
-当前 `OfflineDisk` 遇到同盘 `OnlineDisk` 的规则为 CancelThenWait。
-必须先检查全部冲突与容量、成功登记新任务，再请求取消旧任务。
-取消请求本身不释放对象；只有旧流程与已接受步骤停稳后，才可能移交给后继。
-结果不确定时保留隔离，不能把“没有成功结果”当作“可以开始另一个流程”。
+[可编辑 SVG](diagrams/unified-task-guide/04-pause.svg)
 
-其他规则包括无对象交集独立、重复拒绝、普通重叠等待。
-实际对象集合可能包含节点，因此“磁盘不同”不自动意味着没有冲突。
-此图展示调度语义，不表示下线流程的真实重建或删除已全部实现。
+## 5. 切主：恢复同一 Task 的业务进度
 
-[SVG 原图](diagrams/task-center-guide/04-handoff.svg)
+![持久化与恢复](diagrams/unified-task-guide/05-recovery.png)
 
-## 5. 控制：暂停、取消与观察
+Workflow 自声明 Memory 或 Durable。持久化流程通过 Journal 保存 input/version、checkpoint、
+details、对象、控制意图和终态；TaskStore 校验 owner_epoch 与 revision，写入走 spawn_blocking。
 
-![控制与观察](diagrams/task-center-guide/05-control.png)
+新主先获得严格递增的轮次、完成数据面 fencing 与领域恢复，再绑定 Workflow 定义和依赖，
+claim 存储、全量预检待恢复记录并 CAS 接管。TaskCenter::from_restored 一次装回全部任务占用，
+之后才放行许可。恢复保留原 TaskId 和用户暂停，policy 暂停原因重新计算。
+未知类型、版本不匹配、NeedsCheck 或待核对取消记录会阻止恢复，不能静默丢弃旧占用。
 
-暂停在安全边界确认，不强制中断已发出的 Activity，仍保留 Workflow 的对象占用。
-恢复继续当前进程内的同一个执行，不是重放或跨进程恢复。
-取消通过令牌传递到步骤，并等待实际停稳；不自动回滚已经完成的效果。
-TaskRegistry、ExecutionView、Observer 是共享状态与控制句柄的访问关系，不是新的事件处理管道。
-watch 会合并更新，不能被当作无损或持久化的业务日志。
+这是 checkpoint 重建，不是恢复 Rust 栈或确定性事件重放。远端动作完成而 checkpoint 未写入的
+窗口需要业务幂等键或对账；TaskStore 的 fencing 不能替代数据面 fencing。默认 PoolManager
+业务仍为内存运行，完整生产切主还需要实际后端和领域接入。
 
-按类型自动暂停、按业务阶段恢复、持久化重放与跨进程恢复仍未实现。
+[可编辑 SVG](diagrams/unified-task-guide/05-recovery.svg)
 
-[SVG 原图](diagrams/task-center-guide/05-control.svg)
+## 6. 观察：一个 Task，多种访问方式
 
-## 源码与进一步阅读
+![统一观察与控制](diagrams/unified-task-guide/06-observation.png)
 
-- [Pool 装配](../crates/storage-pool/src/pool.rs)
-- [TaskCenter 的 State 与外层循环](../crates/storage-pool/src/task_center/mod.rs)
-- [具体冲突规则](../crates/storage-pool/src/task_center/conflicts.rs)
-- [Driver 的 tick / defer](../crates/workflow-foundation/src/driver.rs)
-- [Broker、LockTable 与 Permit](../crates/workflow-foundation/src/locks.rs)
-- [WorkflowContext、Tracker 与执行包装](../crates/workflow-foundation/src/workflow.rs)
-- [ActivityClient 与服务宿主](../crates/workflow-foundation/src/service.rs)
-- [磁盘上线 Workflow](../crates/storage-pool/src/workflows/online_disk.rs)
-- [单张完整协作图：适合查实现](runtime-collaboration.md)
+TaskSnapshot 汇总身份、执行状态、进度、业务 details、Activity 历史和调度解释；conflicts
+是准入解释，blockers 是实时阻塞者。ExecutionView / TaskObserver 访问同一个观察模型，
+Run 等提交确认和类型化结果，SavedTask 是该 Task 的可选存储表示。
 
-## 本次交付与验收
+PoolTaskSnapshot 只是既有多池路由信封；不生成另一个任务 ID、不维护第二个状态机。
+观察通知可以合并；Activity 历史仅属于当前宿主，不作为跨恢复幂等键或持久事件日志。
 
-范围：把原来的总览和 Driver 图合并，并细化资源申请、Pending、许可唤醒和再次轮询；
-后四张分别展开资源、服务、冲突与控制。不修改 Rust、依赖或业务行为。
+[可编辑 SVG](diagrams/unified-task-guide/06-observation.svg)
 
-验收：第一张同时呈现核心组件、内部结构和主要运行闭环；后续每张回答一个具体问题；
-不同 task 的边界、对象占用和步骤资源保护不混淆；未实现能力不画成已实现。
+## 源码与验证
 
-交付：五份可编辑 SVG、五份 PNG，以及无需联网或安装依赖的 HTML 导读。
-验证通过：源码对照、浏览器渲染与逐图检查；五份 SVG XML、文档链接和 HTML 嵌入一致性检查；
-真实浏览器检查五页切换、页签/hash、上一页、键盘翻页、缩放、画布边界与唯一 DOM id。
-外围工程 `npm run verify` 通过（Harness、lint、TypeScript 和生产构建）。未修改 Rust，未重跑 Rust 测试。
+- [TaskCenter 与调度激活](../crates/storage-pool/src/task_center/mod.rs)
+- [默认业务策略](../crates/storage-pool/src/task_center/conflicts.rs)、[通用关系规划](../crates/workflow-foundation/src/scheduling.rs)
+- [Driver](../crates/workflow-foundation/src/driver.rs)、[Context 与收尾](../crates/workflow-foundation/src/workflow.rs)
+- [暂停与继续执行](../crates/workflow-foundation/src/workflow/control.rs)、[控制代次与 ACK](../crates/workflow-foundation/src/control.rs)
+- [服务宿主](../crates/workflow-foundation/src/service.rs)、[资源机制](../crates/workflow-foundation/src/locks.rs)
+- [恢复](../crates/workflow-foundation/src/driver/recovery.rs)、[存储](../crates/workflow-foundation/src/persistence.rs)
+- [统一观察](../crates/workflow-foundation/src/tasks.rs)、[缩容接入示例](../crates/storage-pool/examples/managed_shrink.rs)
+- [图示规格与验证记录](changes/2026-10-24-runtime-guide.md)
+
+旧版五图与单张协作图保留作历史资料，不代表新架构的全部控制和持久化能力。

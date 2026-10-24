@@ -23,6 +23,7 @@ scripts/verify.ps1           # workspace 验证入口
 ## 从哪里开始
 
 - [架构与依赖边界](docs/architecture.md)
+- [最新架构运行图：六图导读与交互查看](docs/runtime-guide.md)
 - [如何新增业务冲突规则](docs/task-center.md)
 - [存储业务与安全限制](crates/storage-pool/README.md)
 - [通用执行基础](crates/workflow-foundation/README.md)

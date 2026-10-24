@@ -1,0 +1,496 @@
+[
+  {
+    "slug": "01-layers",
+    "title": "逻辑分层：谁决定业务，谁负责推进？",
+    "subtitle": "先认清职责。层是代码职责边界，不代表进程、线程或独立服务部署。",
+    "components": {
+      "root": {
+        "title": "Pool / 组合根",
+        "detail": "装配 TaskCenter、客户端、依赖；新主轮次由外部选主系统提供"
+      },
+      "entry": {
+        "title": "PoolHandle / 业务调用方",
+        "detail": "提交 Workflow；按 TaskId 管理；一个主的各池共享 TaskIds"
+      },
+      "defs": {
+        "title": "Workflow 类型定义",
+        "detail": "声明 input、details、persistence；需要恢复的类型绑定 dependencies"
+      },
+      "wf": {
+        "title": "业务 Workflow",
+        "detail": "组织步骤与 checkpoint；定义恢复前业务条件 guard"
+      },
+      "policy": {
+        "title": "SchedulingPolicy",
+        "detail": "准入决策 + 有方向的运行关系；默认 topo → 缩容；可替换策略"
+      },
+      "center": {
+        "title": "TaskCenter / State",
+        "detail": "队列、占用、隔离、启动许可；计算暂停原因；等待真实 ACK"
+      },
+      "driver": {
+        "title": "WorkflowDriver",
+        "detail": "由 TaskCenter 轮询 Future 集合；不是额外的 Tokio task"
+      },
+      "context": {
+        "title": "WorkflowContext",
+        "detail": "Activity / safe_point / 控制；资源申请、停稳跟踪、续跑记录"
+      },
+      "index": {
+        "title": "TaskRegistry / ExecutionView",
+        "detail": "同一个 Task 的观察与控制入口；Snapshot / Observer / RunControl"
+      },
+      "host": {
+        "title": "ServiceHost / ServiceHandler",
+        "detail": "邮箱 + Activity Futures；每个服务有独立 Tokio 宿主"
+      },
+      "domain": {
+        "title": "Disk / Node / VD / Migration",
+        "detail": "命令校验、状态和实际业务动作；迁移示例也通过普通 client 接入"
+      },
+      "ports": {
+        "title": "Ports / Adapters",
+        "detail": "元数据、数据面等外部接口；领域停稳确认来自真实执行"
+      },
+      "store": {
+        "title": "TaskStore",
+        "detail": "同一个 Task 的存储表示；epoch fencing + revision CAS"
+      },
+      "io": {
+        "title": "数据面 / 元数据后端",
+        "detail": "执行真实 IO 与领域状态提交；TaskStore 不能替代数据面 fencing"
+      },
+      "scope": {
+        "title": "当前实现范围",
+        "detail": "领域侧仍为模拟；无确定性重放；完整跨主接入需领域恢复与对账"
+      }
+    },
+    "steps": [
+      {
+        "title": "从业务定义开始",
+        "body": "Workflow 决定步骤、持久化和续跑条件；策略决定不同任务如何共存。",
+        "keys": [
+          "wf",
+          "policy",
+          "defs"
+        ]
+      },
+      {
+        "title": "TaskCenter 负责协调",
+        "body": "维护队列与占用，按策略发控制请求；拿到真实停稳 ACK 后才能交接。",
+        "keys": [
+          "center"
+        ]
+      },
+      {
+        "title": "Driver 负责推进",
+        "body": "Driver 只是可轮询的执行集合，嵌在 TaskCenter 循环内；Context 连接 Workflow 与领域客户端。",
+        "keys": [
+          "driver",
+          "context"
+        ]
+      },
+      {
+        "title": "服务执行实际动作",
+        "body": "各服务宿主独立接收命令，领域校验与真实停稳属于服务。",
+        "keys": [
+          "host",
+          "domain",
+          "ports"
+        ]
+      },
+      {
+        "title": "观察和存储属于同一任务",
+        "body": "所有 Workflow 都有 Task；持久化只改变该 Task 是否保存恢复记录。",
+        "keys": [
+          "index",
+          "store",
+          "scope"
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "02-runtime",
+    "title": "运行闭环：谁在 poll，谁在等待，谁唤醒谁？",
+    "subtitle": "每池一个 TaskCenter Tokio task；每个领域服务另有自己的宿主。其余框是对象或 Future。",
+    "components": {
+      "state": {
+        "title": "State.reap / pump + select",
+        "detail": "处理提交、关闭、driver.tick() 和提交确认回执；准入已确认后才激活调度；持有 StartPermit，按策略放行"
+      },
+      "future": {
+        "title": "running.next()",
+        "detail": "FuturesUnordered<Workflow Future>；轮询就绪流程；整体完成才返回 ID"
+      },
+      "resource": {
+        "title": "Broker / 队列 / LockTable",
+        "detail": "Broker 发送 Acquire / Release；LockTable 决定等待或返回 Permit；状态仅在 Driver 循环中修改"
+      },
+      "context": {
+        "title": "WorkflowContext",
+        "detail": "safe_point → ctx.activity()；等待 Permit / 业务结果时 Pending；Tracker 等待真实 Activity 停稳"
+      },
+      "client": {
+        "title": "ActivityClient",
+        "detail": "发送 Execute + Context + Guard；通过 oneshot 等待类型化结果"
+      },
+      "domain": {
+        "title": "Handler → Service → Ports",
+        "detail": "领域校验、命令、外部效果；停稳结果决定资源释放 / 隔离"
+      },
+      "host": {
+        "title": "ServiceHost 循环",
+        "detail": "轮询 Activity Futures；接收命令和 Query；处理停止"
+      },
+      "mail": {
+        "title": "有界服务邮箱",
+        "detail": "收到 Execute 后登记执行 Future；服务结果通过 oneshot 返回"
+      }
+    },
+    "steps": [
+      {
+        "title": "准入与放行",
+        "body": "State 依据策略持有或发放 StartPermit，TaskCenter 一直同时处理提交与执行推进。",
+        "keys": [
+          "state"
+        ]
+      },
+      {
+        "title": "轮询 Workflow",
+        "body": "Driver 的 running.next() poll 就绪 Future；await 等待不阻塞整个循环。",
+        "keys": [
+          "future",
+          "context"
+        ]
+      },
+      {
+        "title": "取得资源许可",
+        "body": "Context 通过 Broker 发 Acquire；LockTable 处理事件，Permit 回复唤醒原等待链。",
+        "keys": [
+          "resource",
+          "context"
+        ]
+      },
+      {
+        "title": "派发并执行 Activity",
+        "body": "普通客户端发送 Execute；服务宿主单独轮询执行，调用领域能力。",
+        "keys": [
+          "client",
+          "mail",
+          "host",
+          "domain"
+        ]
+      },
+      {
+        "title": "结果返回与收尾",
+        "body": "服务真实停稳后 Guard 通知 Tracker 并发送 Release；oneshot 返回结果，Workflow 再次被 poll。",
+        "keys": [
+          "context",
+          "future",
+          "resource",
+          "state"
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "03-scheduling",
+    "title": "调度交接：topo 到来，缩容何时真的让出？",
+    "subtitle": "以保留 Activity 调用的暂停方式展开。默认业务规则在 Policy，通用交接机制在 TaskCenter。",
+    "components": {
+      "lane180": {
+        "title": "调用方",
+        "detail": ""
+      },
+      "lane490": {
+        "title": "TaskCenter",
+        "detail": ""
+      },
+      "lane800": {
+        "title": "topo Workflow",
+        "detail": ""
+      },
+      "lane1110": {
+        "title": "缩容 Workflow",
+        "detail": ""
+      },
+      "lane1420": {
+        "title": "迁移服务",
+        "detail": ""
+      }
+    },
+    "steps": [
+      {
+        "title": "topo 准入",
+        "body": "检查全部冲突与容量；Durable 的初始记录成功后，任务才激活调度。",
+        "keys": [
+          "lane180",
+          "lane490"
+        ]
+      },
+      {
+        "title": "策略产生暂停原因",
+        "body": "默认策略将缩容对 topo 的关系定义为 YieldTo。多个 topo 各自形成原因。",
+        "keys": [
+          "lane490",
+          "lane1110"
+        ]
+      },
+      {
+        "title": "领域确认停稳",
+        "body": "Driver 调用所选 suspend 适配器。仅发送命令不构成 ACK；此时 topo 仍不能启动。",
+        "keys": [
+          "lane1110",
+          "lane1420"
+        ]
+      },
+      {
+        "title": "确认后交接",
+        "body": "TaskCenter 使用当前控制代次的有效 ACK 重新规划，才发放 topo 的启动许可。",
+        "keys": [
+          "lane490",
+          "lane1110"
+        ]
+      },
+      {
+        "title": "恢复仍要检查",
+        "body": "topo 完成只清除自身原因。用户暂停还在就继续等；条件未满足则 WaitingConditions。",
+        "keys": [
+          "lane1110",
+          "lane1420"
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "04-pause",
+    "title": "同一个 Activity 接口，两种暂停契约",
+    "subtitle": "上游 Workflow 选择语义；迁移服务仍通过普通 client / command 接口提供能力。",
+    "components": {
+      "a1": {
+        "title": "1  普通 ctx.activity(...).await",
+        "detail": "服务注册默认 ActivityControl；Workflow 也可覆盖下一次调用"
+      },
+      "a2": {
+        "title": "2  收到暂停 → suspend 命令",
+        "detail": "适配器等待真实停稳 ACK；原 Activity Future 继续存在"
+      },
+      "a3": {
+        "title": "3  Task = Paused",
+        "detail": "原调用与资源锁保留；TaskCenter 此时才可安全交接"
+      },
+      "a4": {
+        "title": "4  暂停原因清除 → guard 检查",
+        "detail": "不满足：WaitingConditions；满足：调用所选 resume，原 await 继续"
+      },
+      "b1": {
+        "title": "1  普通 ctx.activity(...).await",
+        "detail": "服务读取控制 token；暂停时自行停止并结算已完成进度"
+      },
+      "b2": {
+        "title": "2  返回类型化部分结果",
+        "detail": "原 await 返回 cursor / 业务结果；没有新增统一的 Suspended Activity"
+      },
+      "b3": {
+        "title": "3  保存 checkpoint → safe_point",
+        "detail": "Workflow 保存进度，再确认 Task 暂停；已结束 Activity 释放其资源"
+      },
+      "b4": {
+        "title": "4  暂停原因清除 → guard 检查",
+        "detail": "满足后 Workflow 发起下一次 Activity；仍然使用同一个 TaskId"
+      }
+    },
+    "steps": [
+      {
+        "title": "仍然只有普通 Activity",
+        "body": "两种方式都用 ctx.activity。上游可以选择不同 suspend/resume 命令，不新增 Activity 类型。",
+        "keys": [
+          "a1",
+          "b1"
+        ]
+      },
+      {
+        "title": "await 是否返回",
+        "body": "A 等最终业务结果；B 停稳后返回领域定义的部分结果，Workflow 有机会保存续跑数据。",
+        "keys": [
+          "a2",
+          "b2"
+        ]
+      },
+      {
+        "title": "何时确认 Task 暂停",
+        "body": "A 是停稳适配器 ACK；B 是 Workflow 消费结果、保存 checkpoint 后进入 safe_point。",
+        "keys": [
+          "a3",
+          "b3"
+        ]
+      },
+      {
+        "title": "恢复前重新准入",
+        "body": "guard 属于 Workflow。条件变化用 recheck 唤醒；检查通过后才继续迁移。",
+        "keys": [
+          "a4",
+          "b4"
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "05-recovery",
+    "title": "持久化与切主：重建同一个 Task，继续业务",
+    "subtitle": "可恢复的是显式业务 checkpoint；不是序列化 Rust Future，也不是 Temporal 确定性重放。",
+    "components": {
+      "persist": {
+        "title": "Workflow::persistence()",
+        "detail": "默认 Memory：仍有完整 Task；Durable：声明 version + input"
+      },
+      "journal": {
+        "title": "Journal → TaskStore",
+        "detail": "初始保存确认后才执行 / 激活调度；checkpoint、details、控制意图、终态"
+      },
+      "cas": {
+        "title": "TaskStore 写入约束",
+        "detail": "owner_epoch 校验旧主；revision CAS；存储写入通过 spawn_blocking 等待"
+      },
+      "outcome": {
+        "title": "中断 / 完成记录",
+        "detail": "停稳中断 Pending；用户取消 Cancelled；不确定效果 NeedsCheck，需对账"
+      },
+      "fence": {
+        "title": "1  外部选主 / 领域恢复",
+        "detail": "新轮次严格递增；阻止旧主数据面写入；恢复领域状态，再绑定当前服务客户端"
+      },
+      "define": {
+        "title": "2  define → enable_persistence",
+        "detail": "绑定 Workflow::restore 与 dependencies；claim(pool, epoch)；普通准入保持关闭"
+      },
+      "restore": {
+        "title": "3  restore 全量预检与 CAS 接管",
+        "detail": "校验类型 / input / version / objects；未知类型或需对账记录：停止恢复"
+      },
+      "install": {
+        "title": "4  from_restored → guard → 执行",
+        "detail": "一次安装全部任务占用，再放行许可；用户暂停恢复；policy 原因重新计算"
+      }
+    },
+    "steps": [
+      {
+        "title": "持久性由 Workflow 决定",
+        "body": "Memory 和 Durable 是同一 Task 管理模型。Durable 需要输入版本和 restore 构造。",
+        "keys": [
+          "persist"
+        ]
+      },
+      {
+        "title": "保存续跑状态",
+        "body": "report_details 更新观察；save_checkpoint 保存进度及 details。取消意图写盘后才交付取消令牌。",
+        "keys": [
+          "journal",
+          "cas",
+          "outcome"
+        ]
+      },
+      {
+        "title": "外部选主是前提",
+        "body": "所有池共享新轮次 TaskIds；TaskStore fencing 不能替代数据面 fencing 和领域状态恢复。",
+        "keys": [
+          "fence"
+        ]
+      },
+      {
+        "title": "全量预检与接管",
+        "body": "restore 在打开任何流程前校验全部待恢复记录，更新 owner_epoch/revision，保留原 TaskId。",
+        "keys": [
+          "define",
+          "restore"
+        ]
+      },
+      {
+        "title": "恢复原任务",
+        "body": "TaskCenter 安装所有占用再启动。Workflow 从 checkpoint 继续；用户暂停和业务 guard 仍有效。",
+        "keys": [
+          "install"
+        ]
+      }
+    ]
+  },
+  {
+    "slug": "06-observation",
+    "title": "观察与控制：所有入口指向同一个 Task",
+    "subtitle": "Run 是类型化结果句柄；Snapshot 是观察快照；SavedTask 是存储表示。它们不会生成新的 TaskId。",
+    "components": {
+      "caller": {
+        "title": "用户 / 调度策略 / 业务事件",
+        "detail": "用户：pause / resume / cancel；策略：维护各自的暂停原因；业务：条件变化后 recheck"
+      },
+      "control": {
+        "title": "RunControl / ControlToken",
+        "detail": "请求 ≠ 确认；控制代次使旧 ACK 失效；用户原因与 policy 原因独立；wait_paused 等实际停稳"
+      },
+      "actor": {
+        "title": "Workflow / Activity",
+        "detail": "Driver 处理控制与条件检查；领域执行者确认停稳 / 返回结果；取消也必须等待实际动作结束"
+      },
+      "identity": {
+        "title": "身份与结果状态",
+        "detail": "TaskId / name / objects / RunState；progress / cancellation_requested"
+      },
+      "pauses": {
+        "title": "调度与暂停",
+        "detail": "conflicts：准入时解释；blockers / pause_reasons / ACK"
+      },
+      "details": {
+        "title": "业务与步骤观察",
+        "detail": "details：类型化业务附加信息；activities：当前宿主内调用历史"
+      },
+      "view": {
+        "title": "ExecutionView / TaskObserver",
+        "detail": "同一快照；watch 可合并更新；不是无损事件日志"
+      },
+      "saved": {
+        "title": "SavedTask / TaskStore",
+        "detail": "同一 ID 的可选恢复记录；不持久化 Activity 历史 / Rust 栈"
+      },
+      "run": {
+        "title": "Run<T>",
+        "detail": "accepted()：提交确认；result()：本次执行的类型化结果"
+      }
+    },
+    "steps": [
+      {
+        "title": "请求进入同一控制对象",
+        "body": "用户控制和策略控制是不同原因。resume 只去掉用户原因，不越过仍存在的 topo 阻塞。",
+        "keys": [
+          "caller",
+          "control"
+        ]
+      },
+      {
+        "title": "实际执行决定确认",
+        "body": "命令送达不代表完成。Workflow/Activity 的停稳状态决定 pause ACK 和最终结果。",
+        "keys": [
+          "actor"
+        ]
+      },
+      {
+        "title": "统一观察",
+        "body": "任务状态、业务 details、调度解释、Activity 历史汇集到一个 TaskSnapshot。",
+        "keys": [
+          "identity",
+          "pauses",
+          "details"
+        ]
+      },
+      {
+        "title": "不同入口，没有新任务",
+        "body": "Observer 观察、Run 等结果、SavedTask 用于恢复；全部指向同一 TaskId。",
+        "keys": [
+          "view",
+          "saved",
+          "run"
+        ]
+      }
+    ]
+  }
+]

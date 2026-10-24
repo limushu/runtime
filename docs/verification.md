@@ -29,3 +29,14 @@ $env:Path = (Join-Path $env:TEMP 'workflow-binutils\mingw64\bin') + ';C:\rustup-
 
 这些路径仅为当前开发机的验证记录，不是项目依赖。其他机器安装普通 Rust 工具链即可。
 外围 JurisDesk 工程仍单独执行 `npm run verify`，不并入本 Rust workspace。
+
+## 最新运行图
+
+```sh
+python scripts/render-unified-task-guide.py
+node scripts/verify-unified-task-guide.mjs --render
+```
+
+需要 Python、Node 22 和 Chrome（可用 CHROME_PATH 指定）。生成 SVG、离线 HTML 与 PNG，
+并检查文字边界、导航、高亮、组件交互、移动端、打印与离线运行。
+不传 --render 可仅执行检查。图示对应实现提交固定于导读页，改变执行机制时应同步更新。
