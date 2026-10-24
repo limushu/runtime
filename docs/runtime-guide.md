@@ -1,5 +1,7 @@
 # 最新架构运行导读：统一 Task、调度与恢复
 
+**想观察请求实际流转、冲突排队、暂停与交接：先打开 [Runtime Lab 动态演示](diagrams/task-center-simulation/index.html)。**
+
 [打开交互导读](diagrams/unified-task-guide/index.html)：六图翻页、运行步骤高亮、组件职责查询、缩放与打印，离线可用。
 
 本组图按实现提交 `53b5ea6` 重绘。Task 是业务管理身份；Tokio task 是执行宿主。

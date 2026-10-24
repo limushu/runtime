@@ -1,4 +1,6 @@
-# TaskCenter 动态运行演示
+# TaskCenter 动态运行演示（2026-10-22 历史记录）
+
+原地址已升级为 [Runtime Lab：多任务冲突与交接动画](2026-10-24-runtime-lab.md)。以下记录描述旧版，不作为当前行为说明。
 
 [打开交互动画](../diagrams/task-center-simulation/index.html) · [返回静态导读](../runtime-guide.md)
 

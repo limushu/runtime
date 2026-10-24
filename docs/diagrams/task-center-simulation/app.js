@@ -1,193 +1,64 @@
-/* Presentation only: immutable teaching snapshots, no application runtime. */
-(function () {
+/* Offline animation player. UI state is committed only at complete teaching events. */
+(function(){
   "use strict";
-  const { frames, steps } = globalThis.TaskCenterScenario;
-  const byId = id => document.getElementById(id);
-  const put = (id, value) => { byId(id).textContent = value; };
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)");
-  const nodes = [...document.querySelectorAll("[data-node]")];
-  const paths = [...document.querySelectorAll("[data-route]")];
-  const details = {
-    caller: ["PoolHandle", "请求入口。把完整业务操作提交给所属 Pool 的 TaskCenter；不直接执行领域步骤。"],
-    state: ["State · 流程协调", "维护业务冲突规则、排队、容量与 Workflow 对象占用。先检查冲突，再给出 StartPermit。对象占用贯穿完整流程，最终停稳后才交接；不同于每一步的资源锁。本演示没有竞争流程，冲突判断走允许分支。"],
-    loop: ["TaskCenter 主循环", "由 Tokio 驱动的一个 task。循环 reap 已完成流程、pump 准入队列，再 select 请求、停止信号和 driver.tick()。Driver 由它持有，不是另一个 task。"],
-    tick: ["WorkflowDriver.tick()", "在同一个 task 中选择资源事件分支或 Workflow Future 分支。Acquire 到来时处理 LockTable；就绪 Future 由 running.next() 轮询。一次 tick 处理资源事件后返回外层循环。"],
-    futures: ["Workflow Futures", "FuturesUnordered 保存多个 Workflow Future。Waker 只标记可以再次轮询，不执行 Workflow。running.next() 会推进就绪 Future，只有整个 Workflow 完成时才返回 Some(id)。"],
-    context: ["WorkflowContext", "Workflow 使用 ctx.activity() 编排步骤：经过安全边界、请求资源许可、注册 Guard、调用服务并等待结果。这里不是独立 task，也不直接修改 LockTable。"],
-    broker: ["Broker", "Workflow 与资源驱动器之间的协议端点。发送 Acquire 到事件队列，通过 oneshot 等待 Permit；等待导致当前 Future Pending。图中许可画到 Context，实际接收封装在 Broker.acquire() 内。"],
-    queue: ["资源事件队列", "mpsc 管道，传送 Acquire / Release。Broker 申请许可、Permit Drop 投递释放；只有 Driver 消费事件后才更新锁表。入队不等于资源已分配或释放。"],
-    locks: ["LockTable", "由 Driver 独占维护 waiting、held 与隔离信息。判断 Activity 资源读写是否兼容，再发 Permit。本演示没有竞争者或隔离，均立即获准。它不负责完整 Workflow 的业务准入。"],
-    client: ["ActivityClient", "把命令、取消上下文和 ActivityGuard 放入对应服务邮箱，等待独立 oneshot 返回结果。不是另一个执行 task；执行者是右侧服务宿主。"],
-    tracker: ["Tracker / Completion", "追踪真实在途步骤。Guard 结束后 pending 减一，Permit Drop 发出 Release。Workflow 收尾等待步骤停稳，然后发布终态。终态与对象占用回收是两个动作。"],
-    node: ["Node 服务", "独立服务宿主 task 驱动自己的 Activity Future。本流程通过 Inspect Activity 读取已确认节点状态，再由 Workflow 检查 serving()；不是绕过步骤的观察 Query。"],
-    disk: ["Disk 服务", "独立宿主接收 Add、Open、SetIo。服务通过端口访问元数据和数据面。Open 只确认打开成功，不代表 IO Up；资源许可随 Guard 覆盖真实执行寿命。"],
-    vd: ["VD 服务", "拥有独立宿主和领域能力。本次磁盘上线不调用它，保留在图中用于说明服务运行边界。"]
+  const scenarios=globalThis.RuntimeScenarios,$=id=>document.getElementById(id);
+  const colors={A:'#b59aff',B:'#71d9df',C:'#f5a6cb'};
+  const routeNames={submit:'提交',policy:'策略判断',defer:'登记 Task',poll:'poll',persist:'写入',accepted:'确认',start:'StartPermit',run:'推进',acquire:'Acquire',events:'消费事件',lock:'仲裁资源',permit:'Permit',wake:'Wake',dispatch:'派发',send:'Execute',execute:'执行',settle:'Guard 停稳',release:'Release',reply:'结果',observe:'终态',reap:'reap / pump',control:'控制请求',stop:'领域控制',checkpoint:'checkpoint','control-ack':'暂停确认','stop-ack':'停稳 ACK','user-control':'用户控制',restore:'恢复'};
+  const details={
+    caller:['业务调用方','PoolHandle 提交完整业务 Workflow。用户按同一个 TaskId 观察、暂停、恢复或取消；不能直接取得 StartPermit。'],
+    state:['TaskCenter / State','每池一个执行循环。维护准入、业务等待队列、逻辑占用、隔离、暂停来源和启动许可；实际策略由应用注入。'],
+    policy:['SchedulingPolicy','admission 给出允许、等待、取消后等待或拒绝；relation 定义 Independent、Exclusive、YieldTo。它是纯判断，不发送领域命令。'],
+    driver:['WorkflowDriver.tick()','被 TaskCenter 轮询的驱动器。资源事件与 Workflow Future 在同一宿主内推进。Driver 本身不 spawn 一个新的执行循环。'],
+    futures:['Workflow Futures','FuturesUnordered 保存多个执行 Future。Waker 只标记就绪；再次 poll 才继续业务。整个 Workflow 完成时 running.next() 才返回任务 ID。'],
+    context:['WorkflowContext','提供普通 Activity、safe_point、checkpoint 和控制机制。Workflow 定义 ContinuationGuard；条件不满足保持 WaitingConditions，recheck 唤醒后重新检查。'],
+    broker:['Broker / 资源事件队列','图中合并展示发送端与 mpsc 队列：Broker 发 Acquire 并等待 Permit；Guard/Permit 的释放投递 Release。队列被 Driver 消费后才修改资源表。'],
+    locks:['LockTable','只由 Driver 修改的步骤资源表，负责读写许可、等待和隔离。与 TaskCenter 的完整 Workflow 逻辑占用分开；释放一个 Activity 不等于流程可以交接。'],
+    client:['ActivityClient','普通类型化命令通道。请求携带 ActivityContext、取消 token 和 Guard。迁移与其他领域服务一样接入；调用通过 oneshot 等结果。'],
+    mail:['服务邮箱','有界邮箱承载 Execute / Query。收到 Execute 后服务宿主登记执行 Future，不在邮箱读取分支阻塞等待整个领域动作。'],
+    service:['独立服务宿主 / 领域动作','每个服务有自己的 Tokio task 和 Activity Futures。实际领域动作负责合法性、IO 与停稳。暂停适配器必须等真实 ACK；不支持暂停的动作只能等自然完成。'],
+    tracker:['Tracker / Completion','Guard 跟随实际服务执行。Tracker 确认在途步骤停稳后才能发布终态；不可用取消通知或丢弃等待 Future 冒充效果已结束。'],
+    observe:['唯一 Task 观察模型','TaskSnapshot 合并状态、details、Activity 历史、conflicts 与 blockers。Run、Observer、SavedTask 是同一身份的句柄或表示；watch 可合并通知。'],
+    store:['TaskStore / Journal','Workflow 决定是否 Durable。初始记录确认后才启动或抢占。TaskStore 以 owner_epoch 和 revision 防旧主写入；不替代数据面 fencing，也不提供确定性重放。']
   };
-  let cursor = 0, motion = null, playing = false, raf = 0, lastTime = null;
-  let checkpointVisited = false, selected = null;
-  const chapterButtons = steps.map((step, i) => {
-    const button = document.createElement("button");
-    button.type = "button"; button.className = "chapter";
-    const number = document.createElement("span"); number.className = "number"; number.textContent = i + 1;
-    const label = document.createElement("span"); label.textContent = step.name;
-    const command = document.createElement("small"); command.textContent = step.command;
-    label.append(command); button.append(number, label);
-    button.addEventListener("click", () => seek(step.startFrame));
-    byId("chapters").append(button); return button;
-  });
-  byId("timeline").max = frames.length - 1;
-  byId("event-title").setAttribute("aria-live", "polite");
-
-  function tags(id, values, className = "tag") {
-    const parent = byId(id); parent.replaceChildren();
-    for (const value of values.length ? values : ["无"]) {
-      const span = document.createElement("span");
-      span.className = values.length ? className : "empty"; span.textContent = value; parent.append(span);
-    }
+  let scenario=scenarios[0],cursor=0,playing=false,motion=null,raf=0,last=null,selected=null,zoom=false;
+  const reduced=matchMedia('(prefers-reduced-motion: reduce)');
+  const nodes=[...document.querySelectorAll('[data-node]')],routes=[...document.querySelectorAll('[data-route]')];
+  const groups=[['normal','完整请求'],['fifo','互斥排队'],['yield','topo 抢占'],['cancel','取消交接'],['uncertain','不确定隔离'],['recovery','切主续跑']];
+  const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
+  const current=()=>scenario.frames[cursor];
+  function chips(id,items,cls=''){const box=$(id);box.replaceChildren();if(!items.length){box.append(el('span','无','empty'));return}for(const item of items){const token=el('span',undefined,'token '+cls);token.append(el('b',item[0]),el('span',item[1]));box.append(token)}}
+  function tasks(state){$('tasks').replaceChildren();if(!Object.keys(state.tasks).length){$('tasks').append(el('div','尚未提交请求。点击开始，观察第一条消息进入 TaskCenter。','empty'));return}
+    for(const [id,t] of Object.entries(state.tasks)){const row=el('article',undefined,'task-row');row.style.setProperty('--color',colors[id]);const identity=el('div');identity.append(el('div',t.label,'task-name'),el('div',t.registered?t.id:'请求 '+id+' · 尚未登记 Task','task-id'));const reasons=[];if(t.blockers.length)reasons.push('阻塞者 '+t.blockers.join('、'));if(t.reasons.length)reasons.push('暂停原因 '+t.reasons.join(' + '));if(t.reasons.length)reasons.push(t.ack?'已停稳 ACK ✓':'尚未确认停稳');if(reasons.length)identity.append(el('div',reasons.join(' ｜ '),'task-reason'));const status=el('div');const style=['Uncertain','Rejected'].includes(t.status)?'bad':t.status==='Completed'?'good':/Queued|Waiting|Paused|Pausing|取消/.test(t.status)?'wait':'';status.append(el('div',t.status,'status '+style),el('div',(t.durable?'Durable':'Memory')+' · Activity '+t.activity+(t.checkpoint!==null?' · cp '+t.checkpoint:''),'task-metrics'));row.append(el('div',id,'task-letter'),identity,status);$('tasks').append(row)}
   }
-  function snapshot() {
-    const s = frames[cursor].state;
-    put("workflow-state", s.workflow); put("future-state", s.future); put("pending-state", s.pending);
-    tags("ownership", s.owners);
-    put("lock-count", `waiting ${s.waiting.length} / held ${s.held.length}`);
-    tags("resource-state", [
-      ...s.waiting.map(r => `等待 · ${r.access}(${r.key})`),
-      ...s.held.map(r => `持有 · ${r.access}(${r.key})`)
-    ], "resource-entry");
-    put("queue-state", s.queue.join("，") || "空");
-    put("member-state", s.disk.member ? "已加入" : "未加入");
-    put("open-state", s.disk.openConfirmed ? "已成功" : "未执行");
-    put("io-state", s.disk.io);
-    const labels = {
-      caller: cursor ? "OnlineDisk · D1" : "准备提交", state: `对象占用 ${s.owners.length}`,
-      loop: "reap / pump / select", tick: "资源事件 | Future", futures: s.future,
-      context: s.step < 0 ? "尚未开始" : steps[s.step].command.replace(/\w+Command::/, ""),
-      broker: s.workflow === "WaitingResources" ? "等待 Permit" : "协议端点",
-      queue: s.queue.length ? s.queue[0].split(" ")[0] + " ×1" : "空",
-      locks: `waiting ${s.waiting.length} · held ${s.held.length}`,
-      client: s.pending ? "等待服务结果" : "无在途步骤",
-      tracker: `pending = ${s.pending} · ${s.finalized ? "Completed" : "尚未发布终态"}`,
-      node: s.services.node, disk: s.services.disk, vd: s.services.vd
-    };
-    Object.entries(labels).forEach(([key, value]) => put("state-" + key, value));
-    chapterButtons.forEach((b, i) => {
-      b.classList.toggle("current", s.step === i); b.classList.toggle("done", s.done > i);
-      if (s.step === i) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
-    });
-    byId("timeline").value = cursor;
-    byId("timeline").setAttribute("aria-valuetext", frames[cursor].title);
-    put("position", `${cursor} / ${frames.length - 1}`);
-    put("log-count", `(${cursor})`);
-    const log = byId("event-log"); log.replaceChildren();
-    frames.slice(1, cursor + 1).forEach(frame => {
-      const li = document.createElement("li"); li.textContent = frame.title; log.append(li);
-    });
-    log.scrollTop = log.scrollHeight;
+  function delta(frame){$('delta').replaceChildren();const before=cursor>0?scenario.frames[cursor-1].state:null,after=frame.state,changes=[];
+    for(const [id,t]of Object.entries(after.tasks)){const b=before?.tasks[id];if(!b)changes.push([id+' 请求','—',t.status]);else{if(b.status!==t.status)changes.push([id+' 状态',b.status,t.status]);if(b.ack!==t.ack)changes.push([id+' ACK',String(b.ack),String(t.ack)]);if(b.reasons.join()!==t.reasons.join())changes.push([id+' 原因',b.reasons.join(' + ')||'无',t.reasons.join(' + ')||'无'])}}
+    if(before?.queue.join()!==after.queue.join())changes.push(['业务队列',before?.queue.join(' → ')||'空',after.queue.join(' → ')||'空']);
+    if(before&&JSON.stringify(before.resources)!==JSON.stringify(after.resources))changes.push(['步骤资源',String(before.resources.length),String(after.resources.length)]);
+    if(!changes.length)changes.push(['执行事件','',frame.title]);
+    for(const [name,old,next]of changes.slice(0,4)){const n=el('div',undefined,'delta-row');n.append(el('span',name+'  '+(old?old+' → ':'')),el('strong',next));$('delta').append(n)}
   }
-  function presentation() {
-    const frame = frames[motion ? motion.target : cursor], s = frames[cursor].state;
-    const color = /-(acquire|resource|grant|release)$/.test(frame.id) ? "resource" :
-      /-(wake|reply|settle)$|^(complete|reap)$/.test(frame.id) ? "result" : "execution";
-    byId("architecture").setAttribute("data-tone", color);
-    nodes.forEach(n => {
-      n.classList.toggle("is-active", frame.nodes.includes(n.dataset.node));
-      n.classList.toggle("is-selected", selected === n.dataset.node);
-      n.classList.toggle("is-pending", n.dataset.node === "futures" && s.future.startsWith("Pending"));
-      n.classList.toggle("is-ready", n.dataset.node === "futures" && s.ready);
-    });
-    paths.forEach(p => p.classList.toggle("active", frame.routes.includes(p.dataset.route)));
-    put("frame-count", `事件 ${motion ? motion.target : cursor} / ${frames.length - 1}`);
-    put("event-title", frame.title); put("event-explain", frame.explain);
-    put("motion-status", motion ? (playing ? "正在演示此事件" : "演示已暂停") : "事件已完成");
-    put("live-caption", motion ? `正在演示：${frame.title}` : frame.title);
-    put("clock-status", motion ? "状态面板：上一已完成事件" : "状态面板：当前事件之后");
-    put("play", playing ? "Ⅱ 暂停演示" : cursor === frames.length - 1 ? "↺ 重新播放" : cursor || motion ? "▶ 继续演示" : "▶ 开始演示");
-    byId("play").setAttribute("aria-pressed", String(playing));
-    byId("back-step").disabled = cursor === 0 && !motion;
-    byId("next-step").disabled = cursor === frames.length - 1;
-    byId("checkpoint").hidden = !!motion || !frames[cursor].checkpoint;
-    document.body.dataset.playing = String(playing);
-    drawPacket();
+  function graph(frame){const actor=colors[frame.actor]||colors.A;document.body.style.setProperty('--actor',actor);nodes.forEach(n=>{n.classList.toggle('active',frame.nodes.includes(n.dataset.node)||selected===n.dataset.node);n.classList.toggle('waiting',n.dataset.node==='state'&&current().state.queue.length>0);n.classList.toggle('fenced',n.dataset.node==='locks'&&current().state.fences.length>0)});routes.forEach(r=>{r.classList.toggle('active',frame.routes.includes(r.dataset.route));r.style.setProperty('--route-color',/permit|ack|wake/.test(r.dataset.route)?'#d7ff83':/stop|control/.test(r.dataset.route)?'#e9b56f':actor)})}
+  function render(){const f=current(),s=f.state;$('event-counter').textContent=String(cursor).padStart(2,'0')+' / '+String(scenario.frames.length-1).padStart(2,'0');$('event-kind').textContent='已完成事件';$('event-title').textContent=f.title;$('event-why').textContent=f.why;$('motion-state').textContent=playing?'继续推进下一事件':'已停在：'+f.title;$('timeline').value=cursor;$('position').textContent=cursor+' / '+(scenario.frames.length-1);$('back-step').disabled=cursor===0&&!motion;$('next-step').disabled=cursor===scenario.frames.length-1;$('gate').hidden=!(f.gate&&!playing&&!motion);$('gate-text').textContent='下一步：'+(scenario.frames[cursor+1]?.title||'场景结束，可重播或切换场景');$('future').textContent=s.futureTask+' · '+s.future;$('service').textContent=s.service;$('resource-events').textContent=s.events.join(' / ')||'空';$('guard').textContent=s.guard;$('store').textContent=s.store;$('decision-badge').textContent=s.decision;
+    tasks(s);chips('business-queue',s.queue.map(id=>[id,'等待 '+(s.tasks[id].blockers.join('、')||'启动许可')]));chips('owners',s.owners.map(o=>[o.task,o.objects.join(' · ')]));chips('resources',s.resources.map(r=>[r.task,r.key+' · '+r.state]),'resource');chips('fences',s.fences.map(f=>[f.task,f.objects.join(' · ')]),'danger');delta(f);graph(f);
+    const chapters=[...$('chapters').children];let active=-1;chapters.forEach((b,i)=>{if(+b.dataset.frame<=cursor)active=i});chapters.forEach((b,i)=>b.classList.toggle('active',i===active));$('play').textContent=playing?'Ⅱ 暂停播放':cursor===scenario.frames.length-1?'↺ 重新播放':cursor===0?'▶ 开始演示':'▶ 继续播放';
   }
-  function drawPacket() {
-    const routes = motion ? frames[motion.target].routes : [];
-    const visible = !!motion && routes.length > 0 && !reduced.matches;
-    ["packet", "packet-halo"].forEach(id => byId(id).toggleAttribute("hidden", !visible));
-    if (!visible) return;
-    const fraction = Math.min(.999999, motion.elapsed / frames[motion.target].duration);
-    const position = fraction * routes.length;
-    const path = byId("route-" + routes[Math.floor(position)]);
-    const point = path.getPointAtLength(path.getTotalLength() * (position % 1));
-    ["packet", "packet-halo"].forEach(id => {
-      byId(id).setAttribute("cx", point.x); byId(id).setAttribute("cy", point.y);
-    });
+  function stop(){playing=false;last=null;cancelAnimationFrame(raf);render();if(motion){showTransit();drawPacket()}}
+  function seek(n){playing=false;cancelAnimationFrame(raf);motion=null;last=null;cursor=Math.max(0,Math.min(scenario.frames.length-1,n));document.body.dataset.moving='false';render()}
+  function showTransit(){const f=scenario.frames[motion.index];$('event-kind').textContent=playing?'传递中 · 下方仍为上一状态':'动画暂停 · 消息位置保留';$('event-title').textContent=f.title;$('event-why').textContent=f.why;$('motion-state').textContent=(playing?'正在传递：':'已暂停：')+f.title;graph(f);$('gate').hidden=true}
+  function drawPacket(){if(!motion)return;const f=scenario.frames[motion.index],list=f.routes;if(!list.length||reduced.matches){document.body.dataset.moving='false';return}document.body.dataset.moving='true';const progress=Math.min(.9999,motion.elapsed/motion.duration),slot=progress*list.length,key=list[Math.floor(slot)],path=$('route-'+key),p=path.getPointAtLength(path.getTotalLength()*(slot%1));$('packet').setAttribute('transform',`translate(${p.x},${p.y})`);$('packet-label').setAttribute('transform',`translate(${Math.max(5,Math.min(1170,p.x+15))},${Math.max(5,p.y-31)})`);$('packet-text').textContent=f.actor+' · '+routeNames[key];document.body.style.setProperty('--packet-color',/permit|ack|wake/.test(key)?'#d7ff83':/stop|control/.test(key)?'#e9b56f':colors[f.actor])}
+  function tick(now){if(!playing)return;if(last===null)last=now;const dt=Math.min(now-last,200)*Number($('speed').value);last=now;
+    if(!motion){if(cursor>=scenario.frames.length-1){stop();return}const f=scenario.frames[cursor+1];motion={index:cursor+1,elapsed:0,duration:f.duration*Math.max(1,f.routes.length*.55)};showTransit()}
+    motion.elapsed+=dt;drawPacket();if(motion.elapsed>=motion.duration){cursor=motion.index;motion=null;document.body.dataset.moving='false';render();if((current().gate&&$('auto-explain').checked)||cursor===scenario.frames.length-1){stop();return}}
+    raf=requestAnimationFrame(tick)
   }
-  function pause() {
-    playing = false; cancelAnimationFrame(raf); lastTime = null; presentation();
-  }
-  function seek(index) {
-    pause(); motion = null; cursor = Math.max(0, Math.min(frames.length - 1, index));
-    if (frames[cursor].checkpoint) byId("resource-detail").open = true;
-    snapshot(); presentation();
-  }
-  function restart() {
-    checkpointVisited = false; byId("resource-detail").open = false; seek(0);
-  }
-  function play() {
-    if (playing) return;
-    if (cursor === frames.length - 1) restart();
-    if (frames[cursor].checkpoint) checkpointVisited = true;
-    playing = true; lastTime = null;
-    if (!motion) motion = { target: cursor + 1, elapsed: 0 };
-    presentation(); raf = requestAnimationFrame(tick);
-  }
-  function tick(time) {
-    if (!playing) return;
-    // Do not catch up a backgrounded tab or a long renderer stall.
-    const delta = lastTime === null ? 0 : Math.min(100, time - lastTime);
-    lastTime = time; motion.elapsed += delta * Number(byId("speed").value);
-    if (motion.elapsed >= frames[motion.target].duration) {
-      cursor = motion.target; motion = null; snapshot();
-      if (frames[cursor].checkpoint && !checkpointVisited && byId("auto-pause").checked) {
-        checkpointVisited = true; byId("resource-detail").open = true; pause(); return;
-      }
-      if (cursor === frames.length - 1) { pause(); return; }
-      motion = { target: cursor + 1, elapsed: 0 }; presentation();
-    }
-    drawPacket(); raf = requestAnimationFrame(tick);
-  }
-  byId("play").addEventListener("click", () => playing ? pause() : play());
-  byId("continue").addEventListener("click", play);
-  byId("restart").addEventListener("click", restart);
-  byId("next-step").addEventListener("click", () => seek(cursor + 1));
-  byId("back-step").addEventListener("click", () => seek(motion ? cursor : cursor - 1));
-  byId("timeline").addEventListener("input", e => seek(Number(e.target.value)));
-  byId("fit-diagram").addEventListener("click", () => {
-    const fit = byId("canvas-scroll").classList.toggle("fitted");
-    put("fit-diagram", fit ? "放大阅读" : "适应全图");
-  });
-  byId("canvas-scroll").classList.add("fitted"); put("fit-diagram", "放大阅读");
-  nodes.forEach(node => {
-    function select() {
-      selected = node.dataset.node;
-      put("component-name", details[selected][0]); put("component-explain", details[selected][1]);
-      byId("component-detail").open = true; presentation();
-    }
-    node.addEventListener("click", select);
-    node.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); select(); } });
-  });
-  document.addEventListener("keydown", e => {
-    if (e.ctrlKey || e.metaKey || e.altKey || (e.target instanceof Element && e.target.closest("button,input,select,summary,a,[data-node]"))) return;
-    if (e.key === " ") { e.preventDefault(); if (playing) pause(); else play(); }
-    if (e.key === "ArrowRight") { e.preventDefault(); seek(cursor + 1); }
-    if (e.key === "ArrowLeft") { e.preventDefault(); seek(motion ? cursor : cursor - 1); }
-  });
-  document.addEventListener("visibilitychange", () => { if (document.hidden && playing) pause(); });
-  reduced.addEventListener("change", drawPacket);
-  // Read-only inspection for reproducible browser verification, never a runtime API.
-  globalThis.TaskCenterDemo = Object.freeze({ inspect: () => ({
-    cursor, playing, motion: motion ? { ...motion } : null,
-    frame: frames[cursor].id, state: frames[cursor].state
-  }) });
-  snapshot(); presentation();
+  function play(){if(!document.body.classList.contains('focused')){document.body.classList.add('focused');$('focus-mode').textContent='完整页面';$('focus-mode').setAttribute('aria-pressed','true')}if(playing){stop();return}if(cursor===scenario.frames.length-1)seek(0);playing=true;last=null;render();if(motion)showTransit();raf=requestAnimationFrame(tick)}
+  function choose(id){stop();scenario=scenarios.find(s=>s.id===id);cursor=0;motion=null;selected=null;document.body.dataset.moving='false';const index=groups.findIndex(g=>id===g[0]||(g[0]==='yield'&&id==='yield-return'));$('scenario-number').textContent=String(index+1).padStart(2,'0');$('scenario-title').textContent=scenario.name;$('scenario-description').textContent=scenario.subtitle;$('mode-control').hidden=!id.startsWith('yield');$('pause-mode').value=id==='yield-return'?'return':'retain';[...$('scenarios').children].forEach((b,i)=>b.setAttribute('aria-current',String(i===index)));$('timeline').max=scenario.frames.length-1;$('chapters').replaceChildren();scenario.frames.forEach((f,i)=>{if(f.chapter){const b=el('button',f.chapter);b.dataset.frame=i;b.onclick=()=>seek(i);$('chapters').append(b)}});render()}
+  groups.forEach(([id,name],i)=>{const b=el('button');b.append(el('small',String(i+1).padStart(2,'0')),el('span',name));b.onclick=()=>choose(id==='yield'&&$('pause-mode').value==='return'?'yield-return':id);$('scenarios').append(b)});
+  nodes.forEach(n=>{const select=()=>{selected=n.dataset.node;const [title,body]=details[selected];$('component-name').textContent=title;$('component-description').textContent=body;$('component-detail').open=true;graph(motion?scenario.frames[motion.index]:current())};n.addEventListener('click',select);n.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();select()}})});
+  $('focus-mode').onclick=()=>{const focused=document.body.classList.toggle('focused');$('focus-mode').textContent=focused?'完整页面':'专注运行';$('focus-mode').setAttribute('aria-pressed',String(focused))};$('play').onclick=play;$('continue').onclick=play;$('restart').onclick=()=>seek(0);$('back-step').onclick=()=>seek(cursor-1);$('next-step').onclick=()=>seek(cursor+1);$('timeline').addEventListener('input',e=>seek(+e.target.value));$('pause-mode').onchange=()=>choose($('pause-mode').value==='return'?'yield-return':'yield');$('fit-diagram').onclick=()=>{zoom=!zoom;$('canvas-scroll').classList.toggle('zoomed',zoom);$('fit-diagram').textContent=zoom?'适应图宽':'放大阅读'};
+  document.addEventListener('keydown',e=>{if(e.target.closest?.('button,input,select,summary,[role=button],a'))return;if(e.code==='Space'){e.preventDefault();play()}if(e.key==='ArrowRight'){e.preventDefault();seek(cursor+1)}if(e.key==='ArrowLeft'){e.preventDefault();seek(cursor-1)}});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden&&playing)stop()});
+  reduced.addEventListener('change',()=>{if(motion)drawPacket()});
+  rootExpose();function rootExpose(){globalThis.RuntimeLab={choose,seek,inspect:()=>({scenario:scenario.id,cursor,frame:current().id,state:clone(current().state),playing,motion:motion?{index:motion.index,elapsed:motion.elapsed,duration:motion.duration}:null})}}
+  function clone(x){return JSON.parse(JSON.stringify(x))}choose('normal');
 })();
