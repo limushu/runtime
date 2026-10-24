@@ -13,12 +13,12 @@ const scenarios=context.RuntimeScenarios;
 const scene=id=>scenarios.find(s=>s.id===id);
 const frame=(id,name)=>{const f=scene(id).frames.find(f=>f.id===name);assert.ok(f,id+': '+name);return f.state};
 const html=fs.readFileSync(path.join(base,'index.html'),'utf8');
-assert.equal(scenarios.length,7);
+assert.equal(scenarios.length,8);
 let total=0;
 for(const s of scenarios){
   assert.equal(new Set(s.frames.map(f=>f.id)).size,s.frames.length,'unique frame IDs: '+s.id);
   const identities=new Map();
-  for(const f of s.frames){total++;assert.ok(Object.isFrozen(f.state));for(const n of f.nodes)assert.ok(html.includes('id="node-'+n+'"'),n);for(const r of f.routes)assert.ok(html.includes('id="route-'+r+'"'),r);
+  for(const f of s.frames){total++;assert.ok(Object.isFrozen(f.state));assert.ok(['events','running','notify','waker','outside'].includes(f.tick.branch));for(const n of f.nodes)assert.ok(html.includes('id="node-'+n+'"'),n);for(const r of f.routes)assert.ok(html.includes('id="route-'+r+'"'),r);
     for(const [id,t]of Object.entries(f.state.tasks)){
       if(t.id){if(identities.has(id))assert.equal(t.id,identities.get(id),'same Task identity');else identities.set(id,t.id)}
       if(t.ack)assert.ok(t.reasons.length>0,'ACK requires an active pause');
@@ -43,7 +43,7 @@ for(const id of ['yield','yield-return']){
   assert.equal(frame(id,'start-B').tasks.A.ack,true);
   assert.equal(frame(id,'policy-clear').tasks.A.reasons.join(','),'user');
   assert.equal(frame(id,'resume-user').tasks.A.status,'WaitingConditions');
-  assert.equal(frame(id,'resume-user').guard,'Wait · placement 不满足');
+  assert.equal(frame(id,'resume-user').guard,'Blocked · placement 不满足');
   assert.equal(frame(id,'fresh-ack').tasks.A.reasons.join(','),'policy:B,user');
   assert.equal(scene(id).frames.at(-1).state.tasks.A.activity,id==='yield'?1:2);
 }
@@ -57,6 +57,24 @@ assert.equal(frame('uncertain','reject-fenced').fences.length,1);
 assert.equal(frame('recovery','restore').tasks.A.id,frame('recovery','old-checkpoint').tasks.A.id);
 assert.equal(frame('recovery','restore').epoch,43);
 assert.equal(frame('recovery','restore').owners.length,0);
+assert.equal(frame('cycle','old-cycle').tasks.B.blockers.join(','),'A,C');
+assert.equal(frame('cycle','priority').tasks.B.blockers.join(','),'A');
+assert.equal(frame('cycle','priority').tasks.A.ack,false,'priority cannot substitute for a stop ACK');
+assert.equal(frame('cycle','start-B').tasks.A.ack,true);
+assert.equal(frame('cycle','start-B').tasks.C.status,'Queued');
+assert.equal(frame('cycle','start-B').pending.A,0);
+assert.equal(frame('cycle','start-C').tasks.A.status,'Completed');
+assert.equal(frame('cycle','start-C').tasks.B.status,'Completed');
+assert.equal(scene('cycle').frames.at(-1).state.tasks.A.activity,8);
+assert.equal(scene('cycle').frames.at(-1).state.disk,'Removed');
+for(const s of scenarios)for(const f of s.frames){
+  if(f.tick.result.includes('Some(TaskId)'))assert.ok(f.id.startsWith('tick-complete-'));
+  if(f.routes.includes('lock'))assert.equal(f.tick.branch,'events');
+}
+assert.equal(scene('normal').frames.find(f=>f.id==='A-1-acquire').tick.branch,'running');
+assert.equal(scene('normal').frames.find(f=>f.id==='A-1-wake').tick.branch,'waker');
+assert.equal(scene('normal').frames.find(f=>f.id==='A-1-reply').tick.branch,'waker');
+assert.equal(scene('yield-return').frames.find(f=>f.id==='notify-ack').tick.branch,'notify');
 console.log('PASS: '+scenarios.length+' trace variants / '+total+' immutable events; task identity, FIFO, independent progress, ACK before handoff, both pause modes, user pause, readiness, cancellation, fencing, checkpoint recovery.');
 if(process.argv.includes('--browser'))await browserCheck();
 async function browserCheck(){
@@ -78,7 +96,7 @@ async function browserCheck(){
   await call('Runtime.enable');await call('Log.enable');await call('Network.enable');await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
   await call('Page.navigate',{url:pathToFileURL(path.join(base,'index.html')).href});await until('document.readyState === "complete" && !!window.RuntimeLab');
   const ids=await evaluate('[...document.querySelectorAll("[id]")].map(n=>n.id)');assert.equal(new Set(ids).size,ids.length);
-  for(const s of scenarios){await evaluate('RuntimeLab.choose('+JSON.stringify(s.id)+')');for(let i=1;i<s.frames.length;i++){await click('next-step');const actual=await inspect();assert.equal(actual.cursor,i);assert.equal(JSON.stringify(actual.state),JSON.stringify(s.frames[i].state));assert.equal(actual.playing,false)}}
+  for(const s of scenarios){await evaluate('RuntimeLab.choose('+JSON.stringify(s.id)+')');for(let i=1;i<s.frames.length;i++){await click('next-step');const actual=await inspect();assert.equal(actual.cursor,i);assert.equal(JSON.stringify(actual.state),JSON.stringify(s.frames[i].state));assert.equal(actual.playing,false);assert.equal(await evaluate('document.getElementById("tick-result").textContent'),s.frames[i].tick.result)}}
   await evaluate('RuntimeLab.choose("yield");document.getElementById("pause-mode").value="return";document.getElementById("pause-mode").dispatchEvent(new Event("change"))');assert.equal((await inspect()).scenario,'yield-return');
   await evaluate('RuntimeLab.choose("yield");document.getElementById("speed").value="4"');await click('play');
   await until('RuntimeLab.inspect().frame === "inject" && !RuntimeLab.inspect().playing',30000);
@@ -87,6 +105,18 @@ async function browserCheck(){
   await click('play');await until('RuntimeLab.inspect().frame === "pause-request" && !RuntimeLab.inspect().playing',20000);
   assert.equal(await evaluate('document.getElementById("business-queue").textContent.includes("B")'),true);
   assert.equal(await evaluate('document.getElementById("tasks").textContent.includes("尚未确认停稳")'),true);
+  await evaluate('RuntimeLab.choose("cycle"); RuntimeLab.seek(RuntimeScenarios.find(s=>s.id==="cycle").frames.findIndex(f=>f.id==="old-cycle"))');
+  assert.equal(await evaluate('document.getElementById("wait-graph").dataset.kind'),'cycle');
+  await click('next-step');
+  assert.equal(await evaluate('document.getElementById("wait-graph").dataset.kind'),'fixed');
+  const cycleShot=process.argv.indexOf('--screenshot-cycle');
+  if(cycleShot!==-1){const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});fs.writeFileSync(process.argv[cycleShot+1],Buffer.from(shot.data,'base64'))}
+  await evaluate('RuntimeLab.choose("normal"); RuntimeLab.seek(RuntimeScenarios.find(s=>s.id==="normal").frames.findIndex(f=>f.id==="A-1-lock"))');
+  assert.equal(await evaluate('document.querySelector("[data-tick=events]").classList.contains("current")'),true);
+  const branchShot=process.argv.indexOf('--screenshot-branches');
+  if(branchShot!==-1){const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});fs.writeFileSync(process.argv[branchShot+1],Buffer.from(shot.data,'base64'))}
+
+  await evaluate('RuntimeLab.choose("yield"); RuntimeLab.seek(RuntimeScenarios.find(s=>s.id==="yield").frames.findIndex(f=>f.id==="pause-request"))');
   const shotIndex=process.argv.indexOf('--screenshot');if(shotIndex!==-1){const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});fs.writeFileSync(process.argv[shotIndex+1],Buffer.from(shot.data,'base64'))}
   await evaluate('document.getElementById("node-locks").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}))');assert.equal(await evaluate('document.getElementById("component-detail").open'),true);
   assert.equal(await evaluate('document.getElementById("component-name").textContent'),'LockTable');
@@ -95,8 +125,12 @@ async function browserCheck(){
   await evaluate('const slider=document.getElementById("timeline");slider.value=2;slider.dispatchEvent(new Event("input"))');assert.equal((await inspect()).cursor,2);
   await evaluate('document.querySelector("#chapters button:last-child").click()');assert.equal((await inspect()).frame,'resume-user');
   await evaluate('RuntimeLab.choose("uncertain");document.getElementById("auto-explain").checked=false');await click('play');await until('RuntimeLab.inspect().frame === "reject-fenced" && !RuntimeLab.inspect().playing',35000);await click('play');assert.equal((await inspect()).cursor,0);await click('play');
-  const overflow=await evaluate(`(()=>{const bad=[];document.querySelectorAll('#architecture text').forEach(t=>{if(t.closest('#packet-label'))return;const b=t.getBBox();if(b.x<0||b.y<0||b.x+b.width>1280||b.y+b.height>880)bad.push(t.textContent);const r=t.closest('.component')?.querySelector('.node-card');if(r&&b.x+b.width>+r.getAttribute('x')+ +r.getAttribute('width')-8)bad.push(t.textContent+' [card]')});return bad})()`);assert.deepEqual(overflow,[],'SVG text fits');
+  const overflow=await evaluate(`(()=>{const bad=[];document.querySelectorAll('#architecture text').forEach(t=>{if(t.closest('#packet-label'))return;const b=t.getBBox();if(b.x<0||b.y<0||b.x+b.width>1280||b.y+b.height>980)bad.push(t.textContent);const r=t.closest('.component')?.querySelector('.node-card');if(r&&b.x+b.width>+r.getAttribute('x')+ +r.getAttribute('width')-8)bad.push(t.textContent+' [card]')});return bad})()`);assert.deepEqual(overflow,[],'SVG text fits');
   await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});await click('play');await delay(70);assert.equal(await evaluate('getComputedStyle(document.getElementById("packet")).display'),'none');await click('play');
+  const beforeZoom=await evaluate('document.getElementById("node-futures").getBoundingClientRect().width');
+  await click('fit-diagram');
+  assert.ok(await evaluate('document.getElementById("node-futures").getBoundingClientRect().width')>beforeZoom*1.2,'zoom enlarges actual SVG nodes');
+  await click('fit-diagram');
   await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true,'mobile page contains graph scroll');await click('fit-diagram');assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true,'zoom remains inside canvas');
   assert.deepEqual(errors,[],'no script/CSP errors');assert.deepEqual(external,[],'no external requests');
   console.log('PASS: Chrome file:// all-event playback states; animation, pause/resume, gates, complete autoplay, replay, pause mode, seek, keyboard, component inspection, SVG bounds, mobile, reduced motion, offline.');await call('Browser.close').catch(()=>{});

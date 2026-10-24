@@ -4,7 +4,7 @@
 
 [打开交互导读](diagrams/unified-task-guide/index.html)：六图翻页、运行步骤高亮、组件职责查询、缩放与打印，离线可用。
 
-本组图按实现提交 `53b5ea6` 重绘。Task 是业务管理身份；Tokio task 是执行宿主。
+本组图按实现提交 `53fae88` 重绘。Task 是业务管理身份；Tokio task 是执行宿主。
 逻辑分层不等于部署拆分；TaskCenter 与各服务宿主的实际执行边界见第二图。
 
 ## 1. 逻辑分层：各组件负责什么
@@ -31,7 +31,15 @@ ActivityClient 将请求、Context、Guard 发送到服务邮箱。服务宿主�
 
 服务的 oneshot 回复唤醒原等待链；是 Tokio 再次调度 TaskCenter 后继续 poll Workflow，
 不是服务宿主直接执行 Workflow。Workflow 整体完成后，State 才回收对象或保留 Uncertain 隔离。
-图中资源框合并展示 Broker、事件队列和 LockTable；Acquire/Permit 与 Release 均由这条资源路径处理。
+第二图将 tick 中的两个工作分支并排展示：
+
+- ① `events.recv()`：消费一条资源事件，调用 `table.event`，发布快照后返回 `None`。
+- ② `running.next()`：轮询就绪 Workflow；等待 Activity 时仍为 Pending，整体结束才执行 `finish(id)` 并返回 `Some(TaskId)`。
+- 独立通知支路 `wake.notified()`：控制或 ACK 变化让 tick 返回 `None`，外层重新 `reap / pump`。
+
+代码采用 biased select，检查顺序是通知、资源、工作流。它们在同一个宿主内被轮询，
+不是三个独立 worker，也不是每个 tick 都依次执行各分支体。普通 Permit / 服务回复的 Waker
+只唤醒等待链，不能与上述通知支路的返回混为一谈。
 
 [可编辑 SVG](diagrams/unified-task-guide/02-runtime.svg)
 
@@ -46,7 +54,13 @@ ActivityClient 将请求、Context、Guard 发送到服务邮箱。服务宿主�
 
 topo 完成只清除它自己的暂停原因；其他 topo 或用户暂停仍有效。全部原因清除后，Workflow
 重新检查继续执行的业务条件。用户 resume 不能绕过仍在运行的 topo。
-此图采用保留调用的方式，另一种方式见第四图。策略不能构成 YieldTo 环。
+此图采用当前 ShrinkWorkflow 的停稳返回方式：BalanceHost 等待 C completion，
+返回 `ActivityExit::Suspended(checkpoint)`；Workflow 保存续作数据后进入 `wait_until_runnable()` 确认暂停。
+
+旧 FIFO 会形成“缩容等 topo、topo 等早到的卷任务、卷任务等缩容”的等待环。
+默认策略现在使用 `topo(2) > 其他(1) > shrink(0)`，同级 FIFO；
+topo 可越过尚未启动的卷任务，但仍须等缩容真实停稳。运行中的 Exclusive 占用不会被优先级抢走。
+动画的「三任务等待环」对照展示旧环与新计划；自定义 priority 与 YieldTo 仍须保持一致。
 
 [可编辑 SVG](diagrams/unified-task-guide/03-scheduling.svg)
 
@@ -57,9 +71,9 @@ topo 完成只清除它自己的暂停原因；其他 topo 或用户暂停仍有
 两种方式都使用原有 ctx.activity(...).await，TaskId 不变。
 
 - 保留调用：ActivityControl 发送领域 suspend 命令并等待停稳。原 await 继续等待；
-  暂停原因清除后，Workflow guard 先检查，满足才执行所选 resume 命令。
-- 停稳返回：服务观察控制 token，自行停稳后返回业务部分结果。Workflow 保存 checkpoint，
-  再进入 wait_until_runnable 确认 Task 暂停；恢复并通过 guard 后发起下一次普通 Activity。
+  暂停原因清除后，Workflow RunCondition 先检查，满足才执行所选 resume 命令。
+- 停稳返回：服务观察控制 token，自行停稳后返回 ActivityExit::Suspended(checkpoint)。Workflow 保存 checkpoint，
+  再进入 wait_until_runnable 确认 Task 暂停；恢复并通过 RunCondition 后发起下一次普通 Activity。
 
 Workflow 可覆盖下一次调用的控制适配器，因此缩容和扩容可以选择不同领域命令。
 完全不支持暂停的服务需等自然完成。保留调用仍持有 Activity 资源锁，topo 若需要同一资源，
@@ -107,6 +121,6 @@ PoolTaskSnapshot 只是既有多池路由信封；不生成另一个任务 ID、
 - [服务宿主](../crates/workflow-foundation/src/service.rs)、[资源机制](../crates/workflow-foundation/src/locks.rs)
 - [恢复](../crates/workflow-foundation/src/driver/recovery.rs)、[存储](../crates/workflow-foundation/src/persistence.rs)
 - [统一观察](../crates/workflow-foundation/src/tasks.rs)、[缩容接入示例](../crates/storage-pool/examples/managed_shrink.rs)
-- [图示规格与验证记录](changes/2026-10-24-runtime-guide.md)
+- [图示规格与验证记录](changes/2026-10-24-runtime-guide.md)、[tick 分支与死锁回归图示](changes/2026-10-24-driver-tick-views.md)
 
 旧版五图与单张协作图保留作历史资料，不代表新架构的全部控制和持久化能力。

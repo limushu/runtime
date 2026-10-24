@@ -5,3 +5,22 @@
 @media(min-width:1001px){#architecture{height:min(67vh,700px)}.task-list{grid-template-columns:repeat(2,minmax(0,1fr))}.stage-top>span{margin-right:auto}.focused header,.focused .hero{display:none}.focused #scenarios{padding-top:8px}.focused #scenarios button{padding:10px 14px}.focused .scenario-bar{padding:12px 24px}.focused #architecture{height:min(60vh,650px)}.focused aside{max-height:calc(100vh - 210px);overflow:auto;scrollbar-width:thin}.focused .player{margin-top:13px}.focused footer{padding:10px 24px}}
 @media(max-width:1000px){.focused .hero{display:none}.stage-top{flex-wrap:wrap}.stage-top>span{margin-right:auto}}
 .route{opacity:.16}
+
+/* tick branches are competing poll sources, never a sequential pipeline. */
+#tick-strip{padding:10px 16px;border-bottom:1px solid #414359;background:#202231}
+.tick-options{display:grid;grid-template-columns:1fr 1.3fr 1fr;gap:8px}
+.tick-options>span{padding:8px;border:1px solid #49465a;border-radius:6px;opacity:.65}
+.tick-options b,.tick-options code,.tick-options small{display:block}
+.tick-options b{font-size:12px;color:#eee8ff}.tick-options code{font-size:11px;margin:5px 0}.tick-options small{font-size:10px;line-height:1.5}
+.tick-options .current{opacity:1;border-color:#d7ff83;background:#343b32}
+.tick-options [data-tick=events].current{border-color:#e9b56f;background:#3d352d}
+.tick-options [data-tick=running].current{border-color:#b59aff;background:#3b3354}
+#tick-result{margin:8px 0 0;font-size:12px;color:#d7ff83;min-height:18px}
+#wait-graph{padding:16px;border:1px solid #c8dfb5;background:#f1f7ec;border-radius:8px;margin-bottom:13px}
+#wait-graph[data-kind=cycle]{border-color:#e0a2a0;background:#fff0ee}
+#wait-graph strong{font-size:12px}#wait-chain{font-size:14px;line-height:1.9;font-weight:650}
+#wait-note{font-size:11px;line-height:1.8}
+#canvas-scroll.zoomed{max-height:min(65vh,750px)}
+#canvas-scroll.zoomed #architecture,.focused #canvas-scroll.zoomed #architecture{height:auto;min-width:1400px}
+@media(min-width:1001px){.focused #architecture{height:min(46vh,540px)}.focused .task-list{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}}
+@media(max-width:760px){#tick-strip{padding:8px}.tick-options{grid-template-columns:1fr}.tick-options>span{display:flex;align-items:center;gap:10px}.tick-options b{font-size:10px}.tick-options small{font-size:9px}#tick-result{font-size:10px;line-height:1.7}}

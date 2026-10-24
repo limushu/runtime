@@ -40,3 +40,14 @@ node scripts/verify-unified-task-guide.mjs --render
 需要 Python、Node 22 和 Chrome（可用 CHROME_PATH 指定）。生成 SVG、离线 HTML 与 PNG，
 并检查文字边界、导航、高亮、组件交互、移动端、打印与离线运行。
 不传 --render 可仅执行检查。图示对应实现提交固定于导读页，改变执行机制时应同步更新。
+
+
+动态运行图与 tick 分支检查：
+
+```sh
+python scripts/render-runtime-lab-graph.py
+node scripts/verify-task-center-simulation.mjs --browser
+```
+
+支持可选 --screenshot、--screenshot-cycle、--screenshot-branches 输出 PNG；
+每个选项后传输出路径。覆盖事件状态、分支说明、三任务等待环和播放交互。

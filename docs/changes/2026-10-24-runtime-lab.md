@@ -9,7 +9,7 @@
 
 ![topo 到达后，缩容进入 Suspending，后继等待真实停稳 ACK](../diagrams/task-center-simulation/preview.png)
 
-基于实现 `53b5ea6`，视觉参考 [Temporal 官网](https://temporal.io/) 的技术产品展示方向，
+基于实现 `53fae88`，视觉参考 [Temporal 官网](https://temporal.io/) 的技术产品展示方向，
 使用浅色页面、紫色强调、深色运行画布和高对比消息。未复制商标、图片或业务能力声明。
 
 | 验收标准 | 表现 |
@@ -24,6 +24,12 @@
 | 可操作且可读 | 播放、暂停、前后单步、跳转、倍速、关键点讲解、组件查询、专注模式 |
 | 离线可打开 | 原生 HTML/CSS/JS/SVG，无外部依赖或网络请求，不执行真实存储 |
 
+## tick 分支
+
+画布上方随事件标出正在推进的分支，图内分开显示 ① events.recv 与 ② running.next；
+另列控制通知 wake.notified。Pending、普通 Waker 唤醒、None 和 Some(TaskId) 分别标注。
+详见 [本次更新与验证](2026-10-24-driver-tick-views.md)。
+
 ## 场景
 
 1. **完整请求**：当前 OnlineDisk 的五次 Activity：Tier Inspect → Node Inspect → Add → Open → SetIo。
@@ -37,6 +43,11 @@
 5. **不确定隔离**：外部效果无法确认，步骤与逻辑对象保留隔离；后继 StartPermit 被拒绝，没有 Activity。
 6. **切主续跑**：在旧执行已停稳、checkpoint 已保存的前提下，新主完成外部 fencing 与领域恢复，
    再 claim / 预检 / CAS 接管 / 安装全部任务 / guard / 续跑。新 owner=43，原 TaskId 不变。
+
+7. **三任务等待环**：运行缩容 A、先到卷任务 C、后到 topo B。先展示旧 FIFO 反例，
+   再展示当前 priority 移除 B → C 的等待边；B 仍等待 A 停稳 ACK。
+   A 恢复后完成排空检查、关 IO、移除成员，最后 C 获得执行权。
+   该轨迹含 8 次缩容 Activity（迁移停稳返回后重入一次），对齐 Rust 三任务回归用例的执行次序。
 
 ## 动画与状态的契约
 
@@ -53,12 +64,16 @@ TaskId 使用可读缩写（轮次 / P1 / 业务 / 字母流水），不是实�
 不代表系统只有一个 Future 或所有领域共享一个服务宿主。
 
 未展示的能力不据此推断：没有自动重试、自动解隔离或确定性重放。
-保留 await 的暂停仍持有步骤资源；topo 示例使用不同资源，不能据此绕过同资源读写锁。
+双任务暂停页是框架契约对比，只展开迁移片段；原调用保留模式不是当前 ShrinkWorkflow 的实现。
+当前缩容使用 ActivityExit::Suspended 和 RunCondition。三任务页演示它的完整业务阶段。
+其中 B/C 沿用回归测试的可控 Workflow 来展示调度，不冒充完整下线/建卷业务。
+磁盘资源集合用 disk:D1+D2 简写；BalanceHost::resources 返回空集合，逻辑磁盘冲突归 TaskCenter。
+保留 await 的对比示例仍持有自定义步骤资源；不能据此绕过同资源读写锁。
 切主场景不模拟任意崩溃点；远端效果不确定时必须对账，TaskStore fencing 不替代数据面 fencing。
 
 ## 文件与验证
 
-- scenario.js：6 个场景入口、7 组轨迹、236 个不可变事件快照。
+- scenario.js：7 个场景入口、8 组轨迹、346 个不可变事件快照。
 - app.js：requestAnimationFrame 播放、沿 SVG 路径移动、状态差异、任务/队列渲染。
 - index.html / styles.css：固定组件拓扑、Temporal 风格参考、响应式与减少动态效果支持。
 - scripts/verify-task-center-simulation.mjs：语义断言和 Chrome 实际交互测试。
@@ -73,7 +88,7 @@ Node 22+，浏览器测试使用本机 Chrome；CHROME_PATH 可覆盖位置。�
 
 ## 验证记录
 
-- 全部 236 个事件的对象/资源、等待、身份、ACK 和恢复约束断言通过。
+- 全部 346 个事件的对象/资源、等待、身份、ACK 和恢复约束断言通过。
 - Chrome：逐事件状态对照、实际自动播放、关键点自动停留、消息暂停/继续、完整播放与重播、
   模式切换、时间线、章节、键盘、组件说明、SVG 文字边界、移动端、减少动态效果与离线检查通过。
 - 实际查看冲突场景截图，调整专注播放布局，确保消息路径与阻塞信息可辨认。

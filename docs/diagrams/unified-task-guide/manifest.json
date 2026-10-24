@@ -18,11 +18,11 @@
       },
       "wf": {
         "title": "业务 Workflow",
-        "detail": "组织步骤与 checkpoint；定义恢复前业务条件 guard"
+        "detail": "组织步骤与 checkpoint；RunCondition 定义继续条件"
       },
       "policy": {
         "title": "SchedulingPolicy",
-        "detail": "准入决策 + 有方向的运行关系；默认 topo → 缩容；可替换策略"
+        "detail": "准入决策 + 有方向的运行关系；优先级 + 让位关系；可替换策略"
       },
       "center": {
         "title": "TaskCenter / State",
@@ -34,7 +34,7 @@
       },
       "context": {
         "title": "WorkflowContext",
-        "detail": "Activity / safe_point / 控制；资源申请、停稳跟踪、续跑记录"
+        "detail": "Activity / wait_until_runnable / 控制；资源申请、停稳跟踪、续跑记录"
       },
       "index": {
         "title": "TaskRegistry / ExecutionView",
@@ -112,83 +112,95 @@
   },
   {
     "slug": "02-runtime",
-    "title": "运行闭环：谁在 poll，谁在等待，谁唤醒谁？",
-    "subtitle": "每池一个 TaskCenter Tokio task；每个领域服务另有自己的宿主。其余框是对象或 Future。",
+    "title": "Driver tick：两个工作分支，分别何时返回？",
+    "subtitle": "同一个宿主内的 select，不是两个 worker，也不是每轮先资源、再工作流各执行一次。",
     "components": {
       "state": {
-        "title": "State.reap / pump + select",
-        "detail": "处理提交、关闭、driver.tick() 和提交确认回执；准入已确认后才激活调度；持有 StartPermit，按策略放行"
+        "title": "外层循环：reap → pump → select",
+        "detail": "处理提交 / shutdown / 提交确认回执 / driver.tick()；tick 返回 Some 或 None 都回到外层重新规划；外层其他分支也可就绪"
       },
-      "future": {
-        "title": "running.next()",
-        "detail": "FuturesUnordered<Workflow Future>；轮询就绪流程；整体完成才返回 ID"
+      "notify": {
+        "title": "通知支路：wake.notified() → None",
+        "detail": "控制 / ACK 变化通知外层重算；与 Permit / 服务回复的 Waker 不同"
       },
       "resource": {
+        "title": "① events.recv()",
+        "detail": "table.event(event, &broker)；消费一条事件 → publish → None"
+      },
+      "future": {
+        "title": "② running.next()",
+        "detail": "poll 就绪的 Workflow Futures；整体完成 → finish(id) → Some(id)"
+      },
+      "locks": {
         "title": "Broker / 队列 / LockTable",
-        "detail": "Broker 发送 Acquire / Release；LockTable 决定等待或返回 Permit；状态仅在 Driver 循环中修改"
+        "detail": "Acquire / Release / Withdraw；许可、等待、释放、隔离"
       },
       "context": {
-        "title": "WorkflowContext",
-        "detail": "safe_point → ctx.activity()；等待 Permit / 业务结果时 Pending；Tracker 等待真实 Activity 停稳"
+        "title": "WorkflowContext / ActivityClient",
+        "detail": "await Pending：② 尚未就绪；许可或回复唤醒后才再次 poll"
       },
-      "client": {
-        "title": "ActivityClient",
-        "detail": "发送 Execute + Context + Guard；通过 oneshot 等待类型化结果"
+      "mail": {
+        "title": "服务邮箱 / ServiceHost",
+        "detail": "Execute + Context + Guard；登记并轮询 Activity Futures"
       },
       "domain": {
         "title": "Handler → Service → Ports",
-        "detail": "领域校验、命令、外部效果；停稳结果决定资源释放 / 隔离"
+        "detail": "领域校验、IO 与真实停稳；Guard → Release；oneshot 回复"
       },
-      "host": {
-        "title": "ServiceHost 循环",
-        "detail": "轮询 Activity Futures；接收命令和 Query；处理停止"
-      },
-      "mail": {
-        "title": "有界服务邮箱",
-        "detail": "收到 Execute 后登记执行 Future；服务结果通过 oneshot 返回"
+      "pending": {
+        "title": "② poll 到 Pending 时",
+        "detail": "① / 通知 / 外层仍可就绪；没有任何分支就绪则等待；Activity 完成 ≠ Workflow 完成"
       }
     },
     "steps": [
       {
-        "title": "准入与放行",
-        "body": "State 依据策略持有或发放 StartPermit，TaskCenter 一直同时处理提交与执行推进。",
+        "title": "外层是谁",
+        "body": "每池一个 TaskCenter Tokio task。State 是应用协调；Driver 嵌在外层 select 中。",
         "keys": [
           "state"
         ]
       },
       {
-        "title": "轮询 Workflow",
-        "body": "Driver 的 running.next() poll 就绪 Future；await 等待不阻塞整个循环。",
-        "keys": [
-          "future",
-          "context"
-        ]
-      },
-      {
-        "title": "取得资源许可",
-        "body": "Context 通过 Broker 发 Acquire；LockTable 处理事件，Permit 回复唤醒原等待链。",
+        "title": "① 资源分支",
+        "body": "events.recv 就绪后修改 LockTable，publish 并返回 None。Broker 的消息不是直接修改锁表。",
         "keys": [
           "resource",
-          "context"
+          "locks"
         ]
       },
       {
-        "title": "派发并执行 Activity",
-        "body": "普通客户端发送 Execute；服务宿主单独轮询执行，调用领域能力。",
+        "title": "② Future 分支",
+        "body": "running.next 轮询就绪 Future。Pending 不进入完成分支体；只有整个流程返回 TaskId 才 finish 并返回 Some。",
         "keys": [
-          "client",
-          "mail",
-          "host",
-          "domain"
-        ]
-      },
-      {
-        "title": "结果返回与收尾",
-        "body": "服务真实停稳后 Guard 通知 Tracker 并发送 Release；oneshot 返回结果，Workflow 再次被 poll。",
-        "keys": [
+          "future",
           "context",
-          "future",
+          "pending"
+        ]
+      },
+      {
+        "title": "Pending 时切换分支",
+        "body": "Workflow 投递 Acquire 后等 Permit；① 消费事件并返回 None；再次 poll ② 后才继续派发 Execute。",
+        "keys": [
           "resource",
+          "future",
+          "context",
+          "locks"
+        ]
+      },
+      {
+        "title": "服务独立执行",
+        "body": "服务在另一个 Tokio task 中推进。回复仅唤醒原等待链；Release 仍由①消费。",
+        "keys": [
+          "mail",
+          "domain",
+          "context"
+        ]
+      },
+      {
+        "title": "通知返回外层",
+        "body": "Controls 的 wake.notified 使 tick 返回 None，ACK 后外层及时 pump；不能把这条通知等同于普通 Waker。",
+        "keys": [
+          "notify",
           "state"
         ]
       }
@@ -197,7 +209,7 @@
   {
     "slug": "03-scheduling",
     "title": "调度交接：topo 到来，缩容何时真的让出？",
-    "subtitle": "以保留 Activity 调用的暂停方式展开。默认业务规则在 Policy，通用交接机制在 TaskCenter。",
+    "subtitle": "当前 ShrinkWorkflow 采用停稳返回；priority 与 YieldTo 共同避免三任务等待环。",
     "components": {
       "lane180": {
         "title": "调用方",
@@ -239,7 +251,7 @@
       },
       {
         "title": "领域确认停稳",
-        "body": "Driver 调用所选 suspend 适配器。仅发送命令不构成 ACK；此时 topo 仍不能启动。",
+        "body": "BalanceHost 读取控制 token，调用 C suspend 后继续等待 completion。仅发送命令不构成停稳。",
         "keys": [
           "lane1110",
           "lane1420"
@@ -277,7 +289,7 @@
         "detail": "适配器等待真实停稳 ACK；原 Activity Future 继续存在"
       },
       "a3": {
-        "title": "3  Task = Paused",
+        "title": "3  Task = Suspended",
         "detail": "原调用与资源锁保留；TaskCenter 此时才可安全交接"
       },
       "a4": {
@@ -290,10 +302,10 @@
       },
       "b2": {
         "title": "2  返回类型化部分结果",
-        "detail": "原 await 返回 cursor / 业务结果；没有新增统一的 Suspended Activity"
+        "detail": "原调用结束，只留下续作数据；ActivityExit::Suspended(checkpoint)"
       },
       "b3": {
-        "title": "3  保存 checkpoint → safe_point",
+        "title": "3  保存 checkpoint，再确认暂停",
         "detail": "Workflow 保存进度，再确认 Task 暂停；已结束 Activity 释放其资源"
       },
       "b4": {
@@ -320,7 +332,7 @@
       },
       {
         "title": "何时确认 Task 暂停",
-        "body": "A 是停稳适配器 ACK；B 是 Workflow 消费结果、保存 checkpoint 后进入 safe_point。",
+        "body": "A 是停稳适配器 ACK；B 是 Workflow 消费结果、保存 checkpoint 后进入 wait_until_runnable。",
         "keys": [
           "a3",
           "b3"
@@ -422,11 +434,11 @@
     "components": {
       "caller": {
         "title": "用户 / 调度策略 / 业务事件",
-        "detail": "用户：pause / resume / cancel；策略：维护各自的暂停原因；业务：条件变化后 recheck"
+        "detail": "用户：suspend / resume / cancel；策略：维护各自的暂停原因；业务：条件变化后 recheck"
       },
       "control": {
         "title": "RunControl / ControlToken",
-        "detail": "请求 ≠ 确认；控制代次使旧 ACK 失效；用户原因与 policy 原因独立；wait_paused 等实际停稳"
+        "detail": "请求 ≠ 确认；控制代次使旧 ACK 失效；用户原因与 policy 原因独立；wait_suspended 等实际停稳"
       },
       "actor": {
         "title": "Workflow / Activity",
@@ -438,7 +450,7 @@
       },
       "pauses": {
         "title": "调度与暂停",
-        "detail": "conflicts：准入时解释；blockers / pause_reasons / ACK"
+        "detail": "conflicts：准入时解释；blockers / suspend_reasons / ACK"
       },
       "details": {
         "title": "业务与步骤观察",

@@ -21,7 +21,7 @@ class Diagram:
         self.text(48, 93, title, 36, C['ink'], bold=True)
         self.text(48, 133, subtitle, 21, '#52657c')
         self.parts.append('<path d="M48 970H1552" stroke="#d8e0eb"/>')
-        self.text(48, 1008, '实现基线 53b5ea6  ·  Task = 业务管理身份；Tokio task = 执行宿主  ·  箭头表示调用 / 消息 / 唤醒，见标注', 17, '#63758c')
+        self.text(48, 1008, '实现基线 53fae88  ·  Task = 业务管理身份；Tokio task = 执行宿主  ·  箭头表示调用 / 消息 / 唤醒，见标注', 17, '#63758c')
 
     def text(self,x,y,t,size=21,color='#263b55',bold=False,anchor='start'):
         self.parts.append(f'<text x="{x}" y="{y}" font-size="{size}" fill="{color}" font-weight="{650 if bold else 400}" text-anchor="{anchor}">{escape(t)}</text>')
@@ -55,7 +55,7 @@ class Diagram:
 d=Diagram('01-layers','逻辑分层：谁决定业务，谁负责推进？','先认清职责。层是代码职责边界，不代表进程、线程或独立服务部署。')
 rows=[
  ('01  应用入口 / 装配','ink', [('root','Pool / 组合根',['装配 TaskCenter、客户端、依赖','新主轮次由外部选主系统提供']),('entry','PoolHandle / 业务调用方',['提交 Workflow；按 TaskId 管理','一个主的各池共享 TaskIds']),('defs','Workflow 类型定义',['声明 input、details、persistence','需要恢复的类型绑定 dependencies'])]),
- ('02  应用编排 / 决策','blue',[('wf','业务 Workflow',['组织步骤与 checkpoint','定义恢复前业务条件 guard']),('policy','SchedulingPolicy',['准入决策 + 有方向的运行关系','默认 topo → 缩容；可替换策略']),('center','TaskCenter / State',['队列、占用、隔离、启动许可','计算暂停原因；等待真实 ACK'])]),
+ ('02  应用编排 / 决策','blue',[('wf','业务 Workflow',['组织步骤与 checkpoint','RunCondition 定义继续条件']),('policy','SchedulingPolicy',['准入决策 + 有方向的运行关系','优先级 + 让位关系；可替换策略']),('center','TaskCenter / State',['队列、占用、隔离、启动许可','计算暂停原因；等待真实 ACK'])]),
  ('03  通用执行机制','purple',[('driver','WorkflowDriver',['由 TaskCenter 轮询 Future 集合','不是额外的 Tokio task']),('context','WorkflowContext',['Activity / wait_until_runnable / 控制','资源申请、停稳跟踪、续跑记录']),('index','TaskRegistry / ExecutionView',['同一个 Task 的观察与控制入口','Snapshot / Observer / RunControl'])]),
  ('04  领域能力 / 适配','green',[('host','ServiceHost / ServiceHandler',['邮箱 + Activity Futures','每个服务有独立 Tokio 宿主']),('domain','Disk / Node / VD / Migration',['命令校验、状态和实际业务动作','迁移示例也通过普通 client 接入']),('ports','Ports / Adapters',['元数据、数据面等外部接口','领域停稳确认来自真实执行'])]),
  ('05  持久化 / 外部效果','amber',[('store','TaskStore',['同一个 Task 的存储表示','epoch fencing + revision CAS']),('io','数据面 / 元数据后端',['执行真实 IO 与领域状态提交','TaskStore 不能替代数据面 fencing']),('scope','当前实现范围',['领域侧仍为模拟；无确定性重放','完整跨主接入需领域恢复与对账'])])]
@@ -73,58 +73,66 @@ d.step('服务执行实际动作','各服务宿主独立接收命令，领域校
 d.step('观察和存储属于同一任务','所有 Workflow 都有 Task；持久化只改变该 Task 是否保存恢复记录。','index','store','scope')
 d.done()
 
-d=Diagram('02-runtime','运行闭环：谁在 poll，谁在等待，谁唤醒谁？','每池一个 TaskCenter Tokio task；每个领域服务另有自己的宿主。其余框是对象或 Future。')
-d.panel(48,170,990,690,'执行宿主 A   ·   TaskCenter 的事件循环','blue')
-d.panel(1090,170,462,690,'执行宿主 B…N   ·   每个领域服务','green')
-d.card('state',80,230,926,110,'State.reap / pump + select',['处理提交、关闭、driver.tick() 和提交确认回执','准入已确认后才激活调度；持有 StartPermit，按策略放行'])
-d.panel(80,380,926,445,'WorkflowDriver.tick()   ·   同一条执行链','purple')
-d.card('future',110,450,405,112,'running.next()',['FuturesUnordered<Workflow Future>','轮询就绪流程；整体完成才返回 ID'],'purple')
-d.card('resource',550,450,420,136,'Broker / 队列 / LockTable',['Broker 发送 Acquire / Release','LockTable 决定等待或返回 Permit','状态仅在 Driver 循环中修改'],'amber')
-d.card('context',110,650,405,135,'WorkflowContext',['wait_until_runnable → ctx.activity()','等待 Permit / 业务结果时 Pending','Tracker 等待真实 Activity 停稳'],'purple')
-d.card('client',550,650,420,108,'ActivityClient',['发送 Execute + Context + Guard','通过 oneshot 等待类型化结果'],'purple')
-d.card('domain',1122,240,398,125,'Handler → Service → Ports',['领域校验、命令、外部效果','停稳结果决定资源释放 / 隔离'],'green')
-d.card('host',1122,440,398,125,'ServiceHost 循环',['轮询 Activity Futures','接收命令和 Query；处理停止'],'green')
-d.card('mail',1122,650,398,108,'有界服务邮箱',['收到 Execute 后登记执行 Future','服务结果通过 oneshot 返回'],'green')
-d.arrow([(520,340),(520,380)],'poll tick()',lx=540,ly=368)
-d.arrow([(312,562),(312,650)],'poll / await',color='purple',lx=330,ly=611)
-d.arrow([(515,688),(550,688)],color='purple')
-d.arrow([(515,715),(530,715),(530,535),(550,535)],color='amber')
-d.text(545,615,'Acquire → Permit；Pending → 唤醒 → 再次 poll',18,C['amber'])
-d.arrow([(970,690),(1122,690)],'Execute',color='green',lx=994,ly=673)
-d.arrow([(1320,650),(1320,565)],'接收',color='green',lx=1336,ly=610)
-d.arrow([(1320,440),(1320,365)],'poll',color='green',lx=1336,ly=405)
-d.arrow([(1520,330),(1535,330),(1535,810),(312,810),(312,785)],'oneshot 结果 → 唤醒原等待链',color='green',dash=True,lx=1100,ly=798)
-d.note(82,904,'① 许可 / 服务回复唤醒等待链，由 Tokio 再次调度 TaskCenter；唤醒方不会直接执行 Workflow。')
-d.note(82,940,'② 结束先等 Tracker 停稳，再保存终态；State 随后 reap，释放逻辑占用或保留 Uncertain 隔离。')
-d.step('准入与放行','State 依据策略持有或发放 StartPermit，TaskCenter 一直同时处理提交与执行推进。','state')
-d.step('轮询 Workflow','Driver 的 running.next() poll 就绪 Future；await 等待不阻塞整个循环。','future','context')
-d.step('取得资源许可','Context 通过 Broker 发 Acquire；LockTable 处理事件，Permit 回复唤醒原等待链。','resource','context')
-d.step('派发并执行 Activity','普通客户端发送 Execute；服务宿主单独轮询执行，调用领域能力。','client','mail','host','domain')
-d.step('结果返回与收尾','服务真实停稳后 Guard 通知 Tracker 并发送 Release；oneshot 返回结果，Workflow 再次被 poll。','context','future','resource','state')
+d=Diagram('02-runtime','Driver tick：两个工作分支，分别何时返回？','同一个宿主内的 select，不是两个 worker，也不是每轮先资源、再工作流各执行一次。')
+d.panel(48,170,1042,700,'TaskCenter   ·   一个 Tokio task','blue')
+d.card('state',78,225,982,110,'外层循环：reap → pump → select',['处理提交 / shutdown / 提交确认回执 / driver.tick()','tick 返回 Some 或 None 都回到外层重新规划；外层其他分支也可就绪'])
+d.panel(78,352,982,490,'WorkflowDriver.tick()   ·   tokio::select! { biased; … }','purple')
+d.card('notify',108,410,922,78,'通知支路：wake.notified() → None',['控制 / ACK 变化通知外层重算；与 Permit / 服务回复的 Waker 不同'],'ink')
+d.card('resource',108,535,425,110,'① events.recv()',['table.event(event, &broker)','消费一条事件 → publish → None'],'amber')
+d.card('future',585,535,445,110,'② running.next()',['poll 就绪的 Workflow Futures','整体完成 → finish(id) → Some(id)'],'purple')
+d.card('locks',108,695,425,115,'Broker / 队列 / LockTable',['Acquire / Release / Withdraw','许可、等待、释放、隔离'],'amber')
+d.card('context',585,695,445,115,'WorkflowContext / ActivityClient',['await Pending：② 尚未就绪','许可或回复唤醒后才再次 poll'],'purple')
+d.panel(1120,170,432,700,'领域服务   ·   独立 Tokio task','green')
+d.card('mail',1150,235,372,125,'服务邮箱 / ServiceHost',['Execute + Context + Guard','登记并轮询 Activity Futures'],'green')
+d.card('domain',1150,450,372,125,'Handler → Service → Ports',['领域校验、IO 与真实停稳','Guard → Release；oneshot 回复'],'green')
+d.card('pending',1150,675,372,135,'② poll 到 Pending 时',['① / 通知 / 外层仍可就绪','没有任何分支就绪则等待','Activity 完成 ≠ Workflow 完成'],'ink')
+d.arrow([(570,335),(570,352)],'poll',lx=588,ly=345)
+d.arrow([(95,397),(95,514),(310,514),(310,535)],color='amber')
+d.arrow([(1045,397),(1045,514),(805,514),(805,535)],color='purple')
+d.arrow([(570,397),(570,410)],color='ink')
+d.text(340,517,'biased 检查顺序：通知 → ① → ②',18,C['purple'])
+d.arrow([(320,645),(320,695)],'处理事件',color='amber',lx=335,ly=675)
+d.arrow([(805,645),(805,695)],'poll',color='purple',lx=820,ly=675)
+d.arrow([(585,735),(533,735)],color='amber')
+d.text(535,719,'Acquire',13,C['amber'])
+d.arrow([(533,780),(585,780)],color='amber')
+d.text(535,803,'Permit',13,C['amber'])
+d.arrow([(1030,735),(1105,735),(1105,300),(1150,300)],'Execute',color='green',lx=1045,ly=670)
+d.arrow([(1335,360),(1335,450)],'独立执行',color='green',lx=1350,ly=409)
+d.arrow([(1150,530),(1100,530),(1100,825),(805,825),(805,810)],color='green',dash=True)
+d.text(1128,615,'回复 / Release → 唤醒等待链',18,C['green'])
+d.note(70,905,'① 返回 None；② 仅 Workflow 整体完成返回 Some(TaskId)。两者返回后 publish，外层下一轮 reap / pump。')
+d.note(70,942,'通知支路也返回 None：暂停 ACK 后，即使 Workflow 仍 Pending，TaskCenter 也能重算并放行 topo。','purple')
+d.step('外层是谁','每池一个 TaskCenter Tokio task。State 是应用协调；Driver 嵌在外层 select 中。','state')
+d.step('① 资源分支','events.recv 就绪后修改 LockTable，publish 并返回 None。Broker 的消息不是直接修改锁表。','resource','locks')
+d.step('② Future 分支','running.next 轮询就绪 Future。Pending 不进入完成分支体；只有整个流程返回 TaskId 才 finish 并返回 Some。','future','context','pending')
+d.step('Pending 时切换分支','Workflow 投递 Acquire 后等 Permit；① 消费事件并返回 None；再次 poll ② 后才继续派发 Execute。','resource','future','context','locks')
+d.step('服务独立执行','服务在另一个 Tokio task 中推进。回复仅唤醒原等待链；Release 仍由①消费。','mail','domain','context')
+d.step('通知返回外层','Controls 的 wake.notified 使 tick 返回 None，ACK 后外层及时 pump；不能把这条通知等同于普通 Waker。','notify','state')
 d.done()
 
-d=Diagram('03-scheduling','调度交接：topo 到来，缩容何时真的让出？','以保留 Activity 调用的暂停方式展开。默认业务规则在 Policy，通用交接机制在 TaskCenter。')
+d=Diagram('03-scheduling','调度交接：topo 到来，缩容何时真的让出？','当前 ShrinkWorkflow 采用停稳返回；priority 与 YieldTo 共同避免三任务等待环。')
 xs=[180,490,800,1110,1420]
 for x,title,color in zip(xs,['调用方','TaskCenter','topo Workflow','缩容 Workflow','迁移服务'],['ink','blue','blue','purple','green']):
     d.card('lane'+str(x),x-125,177,250,82,title,[],color)
     d.parts.append(f'<path d="M{x} 264V865" stroke="#cbd6e4" stroke-dasharray="4 7"/>')
-events=[(0,1,300,'1 提交 topo；等待准入确认','blue'),(1,3,370,'2 Policy → YieldTo：加入 policy 暂停原因','blue'),(3,4,440,'3 suspend：等待实际停稳','purple'),(4,3,510,'4 ACK；原 await 保留','green'),(3,1,580,'5 当前控制代次的停稳 ACK 有效','purple'),(1,2,650,'6 发放 StartPermit','blue'),(2,1,720,'7 topo 实际完成 / reap','blue'),(1,3,790,'8 移除该 topo 的暂停原因','blue')]
+events=[(0,1,300,'1 提交 topo；等待准入确认','blue'),(1,3,370,'2 Policy → YieldTo：加入 policy 暂停原因','blue'),(3,4,440,'3 suspend：等待实际停稳','purple'),(4,3,510,'4 completion → Suspended(checkpoint)','green'),(3,1,580,'5 保存 checkpoint → wait_until_runnable → ACK','purple'),(1,2,650,'6 发放 StartPermit','blue'),(2,1,720,'7 topo 实际完成 / reap','blue'),(1,3,790,'8 移除该 topo 的暂停原因','blue')]
 for a,b,y,label,color in events:
     d.arrow([(xs[a],y),(xs[b],y)],label,color,lx=min(xs[a],xs[b])+18,ly=y-15)
 d.note(70,903,'topo 尚未确认写入：不能抢占旧任务。暂停请求送达：不能当成缩容已停稳。','amber')
-d.note(70,941,'最后一个 topo 结束 → 无用户暂停 → guard 重新检查 → 条件满足后才恢复迁移。','purple')
+d.note(70,941,'priority：topo > 其他 > shrink；同级 FIFO。ACK 后 topo 可越过等待中的卷任务，运行占用仍须停稳。','purple')
 d.step('topo 准入','检查全部冲突与容量；Durable 的初始记录成功后，任务才激活调度。','lane180','lane490')
 d.step('策略产生暂停原因','默认策略将缩容对 topo 的关系定义为 YieldTo。多个 topo 各自形成原因。','lane490','lane1110')
-d.step('领域确认停稳','Driver 调用所选 suspend 适配器。仅发送命令不构成 ACK；此时 topo 仍不能启动。','lane1110','lane1420')
+d.step('领域确认停稳','BalanceHost 读取控制 token，调用 C suspend 后继续等待 completion。仅发送命令不构成停稳。','lane1110','lane1420')
 d.step('确认后交接','TaskCenter 使用当前控制代次的有效 ACK 重新规划，才发放 topo 的启动许可。','lane490','lane1110')
 d.step('恢复仍要检查','topo 完成只清除自身原因。用户暂停还在就继续等；条件未满足则 WaitingConditions。','lane1110','lane1420')
 d.done()
 
 d=Diagram('04-pause','同一个 Activity 接口，两种暂停契约','上游 Workflow 选择语义；迁移服务仍通过普通 client / command 接口提供能力。')
 d.panel(48,175,730,682,'A   保留调用   ·   await 暂不返回','purple')
-d.panel(822,175,730,682,'B   停稳返回   ·   await 返回部分业务结果','green')
+d.panel(822,175,730,682,'B   当前 ShrinkWorkflow   ·   停稳后返回','green')
 left=[('a1','1  普通 ctx.activity(...).await',['服务注册默认 ActivityControl','Workflow 也可覆盖下一次调用']),('a2','2  收到暂停 → suspend 命令',['适配器等待真实停稳 ACK','原 Activity Future 继续存在']),('a3','3  Task = Suspended',['原调用与资源锁保留','TaskCenter 此时才可安全交接']),('a4','4  暂停原因清除 → guard 检查',['不满足：WaitingConditions','满足：调用所选 resume，原 await 继续'])]
-right=[('b1','1  普通 ctx.activity(...).await',['服务读取控制 token','暂停时自行停止并结算已完成进度']),('b2','2  返回类型化部分结果',['原 await 返回 cursor / 业务结果','没有新增统一的 Suspended Activity']),('b3','3  保存 checkpoint → wait_until_runnable',['Workflow 保存进度，再确认 Task 暂停','已结束 Activity 释放其资源']),('b4','4  暂停原因清除 → guard 检查',['满足后 Workflow 发起下一次 Activity','仍然使用同一个 TaskId'])]
+right=[('b1','1  普通 ctx.activity(...).await',['服务读取控制 token','暂停时自行停止并结算已完成进度']),('b2','2  返回类型化部分结果',['原调用结束，只留下续作数据','ActivityExit::Suspended(checkpoint)']),('b3','3  保存 checkpoint，再确认暂停',['Workflow 保存进度，再确认 Task 暂停','已结束 Activity 释放其资源']),('b4','4  暂停原因清除 → guard 检查',['满足后 Workflow 发起下一次 Activity','仍然使用同一个 TaskId'])]
 for x,items,color in [(78,left,'purple'),(852,right,'green')]:
     for i,(key,title,lines) in enumerate(items):
         y=230+i*151
@@ -158,7 +166,7 @@ d.step('恢复原任务','TaskCenter 安装所有占用再启动。Workflow 从 
 d.done()
 
 d=Diagram('06-observation','观察与控制：所有入口指向同一个 Task','Run 是类型化结果句柄；Snapshot 是观察快照；SavedTask 是存储表示。它们不会生成新的 TaskId。')
-d.card('caller',48,200,400,155,'用户 / 调度策略 / 业务事件',['用户：pause / resume / cancel','策略：维护各自的暂停原因','业务：条件变化后 recheck'],'blue')
+d.card('caller',48,200,400,155,'用户 / 调度策略 / 业务事件',['用户：suspend / resume / cancel','策略：维护各自的暂停原因','业务：条件变化后 recheck'],'blue')
 d.card('control',545,200,510,155,'RunControl / ControlToken',['请求 ≠ 确认；控制代次使旧 ACK 失效','用户原因与 policy 原因独立','wait_suspended 等实际停稳'],'purple')
 d.card('actor',1150,200,402,155,'Workflow / Activity',['Driver 处理控制与条件检查','领域执行者确认停稳 / 返回结果','取消也必须等待实际动作结束'],'green')
 d.arrow([(448,270),(545,270)],'请求',lx=468,ly=253)
@@ -185,7 +193,7 @@ nav=''.join(f'<button data-page="{i}" aria-current="{str(i==0).lower()}">{i+1:02
 sections=''.join(f'<section data-page="{i}" {"hidden" if i else ""}>{p["svg"]}</section>' for i,p in enumerate(pages))
 html='''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>统一 Task · 最新架构运行导读</title><style>
 *{box-sizing:border-box}body{margin:0;color:#172b45;background:#edf1f6;font-family:"Microsoft YaHei","Segoe UI",sans-serif}header{padding:18px 28px;background:white;border-bottom:1px solid #dae2ee;display:flex;align-items:center;gap:20px}h1{font-size:22px;margin:0}header span{font-size:13px;color:#61728a}nav{padding:10px 28px;display:flex;gap:8px;flex-wrap:wrap;background:white}button,a{font:inherit}button{cursor:pointer;border:1px solid #cbd6e4;border-radius:7px;background:white;color:#23466f;padding:8px 12px}button:hover{background:#eaf1fc}button:focus-visible,a:focus-visible{outline:3px solid #dc8a31;outline-offset:2px}button[aria-current=true]{background:#2459aa;color:white;border-color:#2459aa}button:disabled{opacity:.4;cursor:default}.toolbar{padding:10px 28px;display:flex;align-items:center;gap:8px;font-size:14px}.toolbar a{margin-left:auto;color:#2459aa}.layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:16px;padding:0 20px 20px}#viewport{overflow:auto;height:calc(100vh - 190px);min-height:400px;border:1px solid #dae2ee;border-radius:12px;background:#fafbfd}section{width:100%;margin:0 auto}section[hidden]{display:none}svg{width:100%;height:auto;display:block}aside{background:white;border:1px solid #dae2ee;border-radius:12px;padding:20px;overflow:auto;max-height:calc(100vh - 190px)}aside h2{font-size:18px;line-height:1.5;margin:0 0 12px}aside p{font-size:14px;line-height:1.9;color:#465d77}.eyebrow{color:#61728a;font-size:12px;letter-spacing:1px}#steps{display:flex;gap:6px;flex-wrap:wrap;margin:15px 0}#detail{border-top:1px solid #e1e7ef;margin-top:24px;padding-top:18px}#detail h3{font-size:16px}footer{font-size:12px;color:#61728a;margin:20px 0}#zoom{min-width:40px}.hint{color:#61728a;margin-left:8px}@media(max-width:900px){header{padding:15px;display:block}header span{display:block;margin-top:8px}nav{padding:8px}.layout{grid-template-columns:minmax(0,1fr);padding:0 8px 12px}#viewport{height:60vh;min-height:320px}aside{max-height:none}.toolbar{padding:8px;flex-wrap:wrap}.hint{display:none}}@media print{header,nav,.toolbar,aside{display:none}.layout{display:block;padding:0}#viewport{height:auto;overflow:visible;border:0}section,section[hidden]{display:block!important;width:100%!important;break-after:page}svg .dim{opacity:1}svg .active .card{stroke-width:1.5}section:last-child{break-after:auto}@page{size:A3 landscape;margin:8mm}}
-</style></head><body><header><h1>统一 Task · 架构运行导读</h1><span>基于 53b5ea6 · 六张图逐层展开 · 无外部依赖 · 可离线打开</span></header><nav aria-label="图示章节">NAV</nav><div class="toolbar"><button id="prev">← 上一图</button><button id="next">下一图 →</button><button id="minus">−</button><span id="zoom">100%</span><button id="plus">+</button><button id="fit">适应宽度</button><button id="print">打印全部</button><a href="../task-center-simulation/index.html">▶ 打开请求运行动画</a><span class="hint">点击组件查看职责 · 点击右侧步骤高亮运行路径</span><a id="source" href="01-layers.svg">下载 SVG</a></div><div class="layout"><main id="viewport">SECTIONS</main><aside><div class="eyebrow">READING PATH / 阅读路径</div><h2 id="heading"></h2><div id="steps" aria-label="阅读步骤"></div><p id="description" aria-live="polite"></p><button id="reset">显示全部组件</button><div id="detail"><div class="eyebrow">COMPONENT / 组件职责</div><h3 id="component-title">点击图中组件</h3><p id="component-body">选中一个组件，查看它的职责以及与执行机制的关系。</p></div><footer>教学图示，不执行真实任务。迁移仍为模拟接入；Task checkpoint 恢复不等于完整生产容灾。</footer></aside></div><script>
+</style></head><body><header><h1>统一 Task · 架构运行导读</h1><span>基于 53fae88 · 六张图逐层展开 · 无外部依赖 · 可离线打开</span></header><nav aria-label="图示章节">NAV</nav><div class="toolbar"><button id="prev">← 上一图</button><button id="next">下一图 →</button><button id="minus">−</button><span id="zoom">100%</span><button id="plus">+</button><button id="fit">适应宽度</button><button id="print">打印全部</button><a href="../task-center-simulation/index.html">▶ 打开请求运行动画</a><span class="hint">点击组件查看职责 · 点击右侧步骤高亮运行路径</span><a id="source" href="01-layers.svg">下载 SVG</a></div><div class="layout"><main id="viewport">SECTIONS</main><aside><div class="eyebrow">READING PATH / 阅读路径</div><h2 id="heading"></h2><div id="steps" aria-label="阅读步骤"></div><p id="description" aria-live="polite"></p><button id="reset">显示全部组件</button><div id="detail"><div class="eyebrow">COMPONENT / 组件职责</div><h3 id="component-title">点击图中组件</h3><p id="component-body">选中一个组件，查看它的职责以及与执行机制的关系。</p></div><footer>教学图示，不执行真实任务。迁移仍为模拟接入；Task checkpoint 恢复不等于完整生产容灾。</footer></aside></div><script>
 const pages=DATA;let current=0,scale=1,step=-1;
 const $=id=>document.getElementById(id);
 function highlight(keys){const groups=document.querySelectorAll('section:not([hidden]) .component');groups.forEach(g=>{g.classList.toggle('active',keys.includes(g.dataset.key));g.classList.toggle('dim',keys.length>0&&!keys.includes(g.dataset.key))})}
