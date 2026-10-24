@@ -1,24 +1,7 @@
-//! The single business-conflict entry point. No selectors, priorities or plugin policies.
-//! Add a concrete match arm here and a scenario test alongside it.
+//! Default storage policy: admission conflicts and directional scheduling relations.
+//! Applications can inject another policy without changing the TaskCenter event loop.
 use super::*;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictDecision {
-    Independent,
-    Wait,
-    CancelThenWait,
-    Reject(&'static str),
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Conflict {
-    pub decision: ConflictDecision,
-    pub reason: &'static str,
-}
-impl Conflict {
-    fn new(decision: ConflictDecision, reason: &'static str) -> Self {
-        Self { decision, reason }
-    }
-}
 impl PoolOperation {
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
         matches!(
@@ -47,22 +30,22 @@ impl TaskCenter {
         use ConflictDecision::*;
         use OperationKind::*;
         if !incoming.overlaps(existing) {
-            return Conflict::new(Independent, "disjoint");
+            return conflict_result(Independent, "disjoint");
         }
         if let Some(((next_node, next), (old_node, old))) =
             incoming.kind.node_change().zip(existing.kind.node_change())
             && next_node == old_node
         {
             if next <= old {
-                return Conflict::new(
+                return conflict_result(
                     Reject("stale or conflicting node transition already in flight"),
                     "stale-node-guard",
                 );
             }
-            return Conflict::new(CancelThenWait, "newer-node-replaces-old");
+            return conflict_result(CancelThenWait, "newer-node-replaces-old");
         }
         if incoming.kind == existing.kind {
-            return Conflict::new(
+            return conflict_result(
                 Reject("equivalent operation already in flight; observe its original Run"),
                 "duplicate",
             );
@@ -86,8 +69,56 @@ impl TaskCenter {
                 LoadNode(_),
             ) => "disconnected-cancels-load",
             (OfflineDisk(a), OnlineDisk(b)) if a == b => "disk-down-cancels-disk-up",
-            _ => return Conflict::new(Wait, "overlapping-objects"),
+            _ => return conflict_result(Wait, "overlapping-objects"),
         };
-        Conflict::new(CancelThenWait, reason)
+        conflict_result(CancelThenWait, reason)
+    }
+}
+
+fn conflict_result(decision: ConflictDecision, reason: &'static str) -> Conflict {
+    Conflict { decision, reason }
+}
+
+/// Default storage policy. Applications can replace it without changing the event loop.
+pub struct PoolSchedulingPolicy;
+impl OperationKind {
+    fn topology(&self) -> bool {
+        !matches!(
+            self,
+            Self::Shrink(_)
+                | Self::Custom(_)
+                | Self::CreateVolume(_)
+                | Self::DeleteVolume(_)
+                | Self::RenamePool
+        )
+    }
+}
+impl SchedulingPolicy<PoolOperation> for PoolSchedulingPolicy {
+    fn admission(&self, incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
+        if matches!(incoming.kind, OperationKind::Shrink(_))
+            || matches!(existing.kind, OperationKind::Shrink(_))
+        {
+            return Conflict {
+                decision: ConflictDecision::Wait,
+                reason: "shrink-coordination",
+            };
+        }
+        TaskCenter::conflict(incoming, existing)
+    }
+    fn relation(&self, task: &PoolOperation, other: &PoolOperation) -> Relation {
+        if matches!(task.kind, OperationKind::Shrink(_)) && other.kind.topology() {
+            return Relation::YieldTo("topology");
+        }
+        if matches!(other.kind, OperationKind::Shrink(_)) && task.kind.topology() {
+            return Relation::Independent;
+        }
+        if (matches!(task.kind, OperationKind::Shrink(_))
+            && matches!(other.kind, OperationKind::Shrink(_)))
+            || task.overlaps(other)
+        {
+            Relation::Exclusive
+        } else {
+            Relation::Independent
+        }
     }
 }

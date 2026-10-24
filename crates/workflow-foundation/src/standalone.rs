@@ -33,7 +33,9 @@ impl RuntimeHandle {
             }))
             .await
             .map_err(|_| Failure::Unavailable)?;
-        rx.await.unwrap_or(Err(Failure::Unavailable))
+        let mut run = rx.await.unwrap_or(Err(Failure::Unavailable))?;
+        run.accepted().await?;
+        Ok(run)
     }
     pub async fn defer<W: Workflow>(&self, workflow: W) -> Outcome<(Run<W::Output>, StartPermit)> {
         let (tx, rx) = oneshot::channel();

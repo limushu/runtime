@@ -1,77 +1,88 @@
-# 如何阅读与扩展 TaskCenter
+# TaskCenter：策略、执行和停稳交接
 
-## 先看三个入口
+一个 Pool 一个 TaskCenter，在同一个事件循环中推进 WorkflowDriver。Task 是统一管理与观察
+对象，Workflow 是执行体，Activity 是领域步骤；持久与非持久流程走同一套路径。
 
-1. [conflicts.rs](../crates/storage-pool/src/task_center/conflicts.rs)：业务冲突判断。
-2. [mod.rs](../crates/storage-pool/src/task_center/mod.rs)：队列、占用、停稳交接。
-3. [tests.rs](../crates/storage-pool/src/task_center/tests.rs)：不需要运行真实领域服务的协调测试。
+## 能力边界
 
-没有策略 trait、OperationSelector、RuleRelation 或规则优先级。规则在同一个具体
-TaskCenter 的 conflict 方法中，是普通 Rust 业务代码。
+| 组件 | 负责 | 不负责 |
+| --- | --- | --- |
+| Workflow | 步骤、续跑 checkpoint、业务条件、自定义 details、是否持久化 | 跨任务队列 |
+| SchedulingPolicy | 两个任务的准入决策与运行关系 | 执行领域命令、修改队列 |
+| TaskCenter | 准入、排队、暂停原因、等待真实 ACK、启动许可、隔离 | 判断 topo/shrink 等具体业务 |
+| WorkflowDriver | Future 推进、Activity、Task 观察、控制、存储 | 定义业务冲突与准入条件 |
+| 领域服务及适配器 | 命令、合法性、实际停稳与恢复 | 判断哪个工作流应优先 |
 
-## 四个明确结果
+## 策略接口
+
+基础库的 `SchedulingPolicy<D>` 有两个纯判断入口，存储应用使用 `D = PoolOperation`。
+组合根通过 `TaskCenter::with_policy(driver, config, policy)` 注入；默认 start 使用
+PoolSchedulingPolicy。规则位于 [conflicts.rs](../crates/storage-pool/src/task_center/conflicts.rs)，
+通用规划位于 [scheduling.rs](../crates/workflow-foundation/src/scheduling.rs)。
+
+admission(incoming, existing) 决定是否接受新任务，以及是否请求旧任务取消：
 
 | 结果 | 意义 |
 | --- | --- |
-| Independent | 对象集合无交集，可并行；不再用 Queue 表示无冲突 |
-| Wait | 有冲突，按接受顺序等待；后来的重叠任务不能插队 |
-| CancelThenWait | 请求旧任务取消，但等其实际终态后才放行 |
-| Reject(reason) | 拒绝本次提交，不取消任何已有任务 |
+| Independent | 准入时没有冲突 |
+| Wait | 允许排队，具体运行关系由 relation 决定 |
+| CancelThenWait | 请求旧任务取消，实际停稳后才交接 |
+| Reject(reason) | 拒绝本次提交，不取消其他任务 |
 
-判断顺序是：对象关系 → 节点变更序号 → 重复请求 → 具名业务情况 → 默认等待。
-同一节点的新序号替换旧序号；旧序号/相同序号的在途节点变更拒绝。
-相同操作的重复任务拒绝，调用者应观察原 Run；本轮没有合并结果功能。
+relation(task, other) 决定已接受任务如何同时运行：
 
-业务关系来自 Workflow 声明的完整对象集合：节点与磁盘通过共同 node 键建立冲突，
-不是靠 namespace 字符串自动推断父子关系。新增操作必须声明其全部影响范围。
+| 关系 | 意义 |
+| --- | --- |
+| Independent | 可并行 |
+| Exclusive | 串行，等待已运行任务或更早的排队任务 |
+| YieldTo(reason) | task 应让出执行权，other 等待 task 实际暂停后才启动 |
 
-## 新增一条规则
+YieldTo 有方向，策略不能形成让出环。规划器不猜测资源、业务优先级或拓扑关系。
+准入与运行关系应一致；Reject/CancelThenWait 在完成全部准入检查之后才应用。
 
-假设新增一种流程，需要改变它与已有流程的交接方式：
+默认存储策略保留节点序号、重复请求与对象交接规则，并声明缩容让出给 topo：
+先到的 topo 阻止缩容启动；缩容运行期间到达 topo，先暂停缩容，再运行 topo。
+多个 topo 分别形成暂停原因，最后一个结束才清除全部策略原因；用户暂停不会被一并清除。
+默认策略将节点、磁盘、tier、池生命周期操作归入 topology；Volume 创建/删除和 RenamePool
+不归入其中。应用如果需要不同分类，替换策略，不能在事件循环中补业务判断。
 
-1. 在 OperationKind 增加业务操作，Workflow 的 operation() 返回该操作与 objects()。
-2. 明确所有受影响的 Disk/Node/Volume 对象。若涉及新增对象关系，先修正声明，不靠规则猜拓扑。
-3. 在 conflict() 的 match 增加带方向的业务分支，返回四种结果之一和可读 reason。
-4. 给正向、反向、不同对象、重复/陈旧请求补表格测试。
-5. 对 CancelThenWait 补实际交接测试：旧 Activity 未停稳时新流程绝不能产生副作用。
-   同时测试新任务被其他冲突拒绝、容量不足或对象被隔离时，不会误取消旧任务。
+## 暂停不是通知送达
 
-例如当前已有分支（不是配置语言）：
+暂停请求带代次。TaskCenter 先更新原因，再用新代次的停稳 ACK 重新规划，才打开启动许可。
+暂停期间收到新的控制请求使旧 ACK 失效；正在恢复的领域动作必须再次停稳才能重新交接。
+用户 resume 只移除用户原因，不会越过仍在运行的 topo。
 
-```rust,ignore
-(OfflineDisk(a), OnlineDisk(b)) if a == b => "disk-down-cancels-disk-up",
-```
+长 Activity 有两种接入方式，接口仍为 ctx.activity(...).await：
 
-该分支返回 CancelThenWait；反向 OnlineDisk/OfflineDisk 默认 Wait。
-修改冲突处理通常只改这一处和测试，不需要新增 trait、选择器或修改执行驱动。
+1. 调用保持等待，ActivityControl::suspend 返回真实停稳确认；Workflow 的 continuation_guard
+   重新判断条件后，框架调用这个 Workflow 选择的 resume 适配器。
+2. 服务停稳并返回业务部分结果；Workflow 保存 checkpoint 后到达 safe_point，Task 才确认暂停。
+   恢复检查满足后继续下一次 Activity。没有假造统一的“Activity 暂停结果”。
 
-## 安全交接
+如果服务不能暂停，框架只能等它自然完成。暂停保留 Activity 资源锁：让出关系不允许另一个
+动作绕过读写保护；需要交接同一资源时，业务应选停稳后返回的方式，或调整真实的资源边界。
+控制命令须能通过服务的并发命令/客户端路径到达，不能把 resume 排在自己占用的资源锁之后。
+不确定结果继续隔离对象；新任务不得通过 YieldTo 越过隔离。没有自动解除隔离或自动修复策略环。
 
-TaskCenter 先看完整冲突集合，再通过嵌入的执行驱动同步登记一个未启动的执行。登记失败不发取消；
-成功后才取消被替代者，并把新任务放入队列。开始许可由 TaskCenter 持有，调用者不能强行放行。
+## 观察与恢复
 
-同一个循环轮询 Workflow Future，确认完成后才清理占用并推进队列。取消请求不等于完成。任何 Uncertain 会保留原对象隔离，
-相交等待者得到 Rejected，不扩大隔离到其额外对象。被隔离的新任务不会取消其他活动任务。
-正常排队任务可以按 ID 取消；互不相关的对象不受队头阻塞。
+task(id)、observe_task(id) 都返回 foundation 的同一个 TaskSnapshot/TaskObserver：
 
-## 可观察性
+- conflicts：准入时的解释；blockers：当前阻塞者。
+- pause_reasons、pause_acknowledged：暂停来源与真实确认。
+- details：业务附加信息；details_as::<T>() 类型化读取。
+- activities：当前宿主的调用历史，默认最多 1024 条，total/omitted 明确累计和淘汰数量。
 
-`pool.task(id)`：执行状态、进度、对象、逐 Activity 历史及 conflicts（已有任务 ID、决定、原因）。
-`pool.observe_task(id)`：状态/进度/Activity 更新订阅；不会保证保留每个中间事件。
-`pool.scheduling()`：TaskCenter 排队、运行、逻辑隔离计数。
-`pool.execution()`：Runtime 的底层资源/生命周期计数，不能代替业务队列计数。
+观察通知可能合并，不能充当可靠事件日志。普通终态历史有界；Uncertain 保留。
+Workflow 自声明 Durable 时，Driver 存储 Task input/checkpoint/details/控制意图/终态。
+恢复先 driver.restore()，再 TaskCenter::from_restored(...)，一次装回全部占用再开始推进；
+恢复保留原 TaskId，重新建立 policy 暂停原因，用户暂停从记录恢复。
+Activity 历史和 Rust Future 不持久化。完整约束见
+[统一 Task 规格](changes/2026-10-24-unified-task-controls.md)。
 
-conflicts 是准入时的解释，不是实时阻塞列表。普通执行历史有界，已有 observer 可在记录淘汰后
-继续观察；不确定记录与隔离保留。本轮没有自动解除隔离或跨进程恢复。
+## 扩展及验证
 
-`snapshot.activities.entries` 按调用序号列出每个步骤的名称、服务、资源、状态和时间戳。
-例如 OnlineDisk 执行期间可以看到 `node.inspect`、`disk.add` 已完成，`disk.open` 正在执行；
-执行完成后，同一 task ID 仍可查到这三步及后续 `disk.set-io` 的结果。
-Activity 记录由框架自动产生，TaskCenter 直接透传，不依赖业务 `report_progress()`。
-取消请求不等于 Activity 已结束；其终态由实际执行停稳后的结果决定。
-
-`Config::activity_history` 限制每个 task 保留的步骤数（默认 1024），
-`activities.total` / `activities.omitted` 表示累计调用与已淘汰数量。
-这与 task 级历史上限独立；两者都是当前进程内的历史，不支持重启恢复。
-未走到的动态分支不会被列为“未完成步骤”。具体语义见
-[Workflow Foundation 逐 Activity 观测](../crates/workflow-foundation/README.md#逐-activity-观测)。
+新增业务实现 Workflow 与 PoolWorkflow，声明完整 objects；策略对这些描述作纯判断。
+为新的关系补双向、重复/陈旧、多个阻塞者和停稳 ACK 的测试。
+[scheduling_policy.rs](../crates/storage-pool/tests/scheduling_policy.rs) 用非存储业务策略验证可替换性。
+[managed_shrink.rs](../crates/storage-pool/examples/managed_shrink.rs) 演示 topo 抢占与两种迁移暂停方式。

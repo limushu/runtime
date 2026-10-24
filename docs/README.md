@@ -11,6 +11,7 @@
 - [动态演示范围、使用与验证](changes/2026-10-22-task-center-simulation.md)
 - [TaskCenter 关键组件协作图（含缩放版）](runtime-collaboration.md)
 - [TaskCenter 冲突规则开发说明](task-center.md)
+- [统一 Task 与暂停/恢复契约、验收记录](changes/2026-10-24-unified-task-controls.md)
 - [TaskCenter 重构规格与证据](changes/2026-10-15-task-center.md)
 - [构建与验证](verification.md)
 - [本次目录迁移规格与证据](changes/2026-10-15-workspace-layout.md)

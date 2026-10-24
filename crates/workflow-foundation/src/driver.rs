@@ -1,5 +1,6 @@
 //! Execution mechanics. WorkflowDriver is polled by its owner; it never spawns itself.
 //! WorkflowRuntime is a standalone convenience host, not used inside storage Pool.
+mod recovery;
 use crate::{
     locks::{Broker, Event, LockTable},
     model::Scope,
@@ -49,6 +50,10 @@ impl ExecutionView {
     pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
         self.control(id)?.resume()
     }
+    pub fn recheck(&self, id: TaskId) -> Outcome<()> {
+        self.control(id)?.recheck();
+        Ok(())
+    }
     pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
         self.control(id)?.cancel();
         Ok(())
@@ -80,7 +85,11 @@ pub struct WorkflowDriver {
     pool: String,
     config: Config,
     stop: CancellationToken,
-    next: u64,
+    ids: TaskIds,
+    pool_uuid: u128,
+    store: Option<Arc<dyn crate::persistence::TaskStore>>,
+    definitions: std::collections::BTreeMap<String, crate::persistence::Restore>,
+    recovery_ready: bool,
     broker: Broker,
     events: mpsc::UnboundedReceiver<Event>,
     table: LockTable,
@@ -89,6 +98,7 @@ pub struct WorkflowDriver {
     names: BTreeSet<String>,
     failure: Option<Failure>,
     lifecycle: Lifecycle,
+    wake: Arc<tokio::sync::Notify>,
 }
 impl WorkflowDriver {
     pub fn new(pool: impl Into<String>, config: Config) -> Outcome<Self> {
@@ -118,7 +128,11 @@ impl WorkflowDriver {
             pool,
             config,
             stop: CancellationToken::new(),
-            next: 1,
+            store: None,
+            definitions: Default::default(),
+            recovery_ready: true,
+            ids: TaskIds::local(),
+            pool_uuid: uuid::Uuid::new_v4().as_u128(),
             broker,
             events,
             table: LockTable::default(),
@@ -127,7 +141,21 @@ impl WorkflowDriver {
             names: BTreeSet::new(),
             failure: None,
             lifecycle: Lifecycle::Running,
+            wake: Arc::default(),
         })
+    }
+    /// Bind the immutable pool UUID and the allocator supplied by the election authority.
+    /// Configure before registering work; ownership/fencing remains the host's responsibility.
+    pub fn with_task_ids(mut self, pool_uuid: u128, ids: TaskIds) -> Outcome<Self> {
+        if pool_uuid == 0 || !self.running.is_empty() {
+            return Err(Failure::Rejected(
+                "invalid task identity configuration".into(),
+            ));
+        }
+        self.pool_uuid = pool_uuid;
+        self.stop = ids.cancellation();
+        self.ids = ids;
+        Ok(self)
     }
     pub fn view(&self) -> ExecutionView {
         self.view.clone()
@@ -168,10 +196,30 @@ impl WorkflowDriver {
         let (tx, rx) = oneshot::channel();
         Ok((self.enqueue(workflow, Some(rx))?, StartPermit(tx)))
     }
+    pub fn defer_with_metadata<W: Workflow>(
+        &mut self,
+        workflow: W,
+        metadata: serde_json::Value,
+    ) -> Outcome<(Run<W::Output>, StartPermit)> {
+        let (tx, rx) = oneshot::channel();
+        Ok((
+            self.enqueue_with(workflow, Some(rx), metadata, None)?,
+            StartPermit(tx),
+        ))
+    }
     fn enqueue<W: Workflow>(
         &mut self,
         workflow: W,
         start: Option<oneshot::Receiver<Outcome<()>>>,
+    ) -> Outcome<Run<W::Output>> {
+        self.enqueue_with(workflow, start, serde_json::Value::Null, None)
+    }
+    fn enqueue_with<W: Workflow>(
+        &mut self,
+        workflow: W,
+        start: Option<oneshot::Receiver<Outcome<()>>>,
+        metadata: serde_json::Value,
+        restored: Option<crate::persistence::SavedTask>,
     ) -> Outcome<Run<W::Output>> {
         if self.view.scope.is_closed() {
             return Err(Failure::Unavailable);
@@ -182,18 +230,71 @@ impl WorkflowDriver {
         if self.running.len() >= self.config.max_workflows {
             return Err(Failure::Busy);
         }
-        let id = WorkflowId(self.next);
-        self.next += 1;
+        if !self.ids.active() {
+            return Err(Failure::Unavailable);
+        }
+        if !self.recovery_ready && restored.is_none() {
+            return Err(Failure::Rejected(
+                "recover stored tasks before admitting work".into(),
+            ));
+        }
+        let id = match &restored {
+            Some(record) => record.id,
+            None => self.ids.allocate(self.pool_uuid, W::NAME)?,
+        };
+        let journal = match workflow.persistence()? {
+            Persistence::Memory => {
+                if restored.is_some() {
+                    return Err(Failure::Rejected(
+                        "restored workflow lost persistence declaration".into(),
+                    ));
+                }
+                None
+            }
+            Persistence::Durable { version, input } => {
+                if version == 0 {
+                    return Err(Failure::Rejected("invalid workflow schema version".into()));
+                }
+                let store = self.store.clone().ok_or_else(|| {
+                    Failure::Rejected(
+                        "persistent workflow requires configured store and leader epoch".into(),
+                    )
+                })?;
+                let record = restored
+                    .clone()
+                    .unwrap_or_else(|| crate::persistence::SavedTask {
+                        id,
+                        version,
+                        input,
+                        checkpoint: serde_json::Value::Null,
+                        objects: workflow.objects(),
+                        metadata,
+                        details: serde_json::Value::Null,
+                        revision: 0,
+                        owner_epoch: self.ids.epoch(),
+                        user_paused: false,
+                        cancel_requested: false,
+                        outcome: crate::persistence::StoredOutcome::Pending,
+                    });
+                Some(crate::persistence::Journal {
+                    record: Arc::new(tokio::sync::Mutex::new(record)),
+                    store,
+                })
+            }
+        };
         let (run, future) = execution(
             workflow,
             ExecutionEnv {
                 id,
+                wake: self.wake.clone(),
                 scope: self.view.scope.clone(),
                 pool: self.pool.clone(),
                 broker: self.broker.clone(),
                 cancel: self.stop.child_token(),
                 config: self.config.clone(),
                 start,
+                journal,
+                restored,
             },
         );
         self.view
@@ -221,6 +322,7 @@ impl WorkflowDriver {
     pub async fn tick(&mut self) -> Option<WorkflowId> {
         let completed = tokio::select! {
             biased;
+            _ = self.wake.notified() => None,
             Some(event) = self.events.recv() => { self.table.event(event, &self.broker); None }
             Some(id) = self.running.next(), if !self.running.is_empty() => {
                 self.view.tasks.lock().unwrap().finish(id);

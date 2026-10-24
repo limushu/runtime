@@ -1,10 +1,10 @@
 //! One concrete application service per Pool: admission, queue, ownership and handoff.
 //! Read conflict() in conflicts.rs for business rules; State below implements their lifecycle.
 use crate::*;
+use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Deref,
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 use tokio::{
@@ -18,8 +18,12 @@ use workflow_foundation::{
 };
 
 mod conflicts;
-pub use conflicts::{Conflict, ConflictDecision};
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub use conflicts::PoolSchedulingPolicy;
+use workflow_foundation::scheduling::{self, Candidate, Relation, SchedulingPolicy};
+pub use workflow_foundation::{
+    Conflict, ConflictDecision, ConflictMatch, TaskObserver, TaskSnapshot,
+};
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OperationKind {
     ObserveNode {
         id: NodeId,
@@ -48,52 +52,19 @@ pub enum OperationKind {
     RenamePool,
     UnloadPool,
     LoadPool,
+    Shrink(DiskId),
+    Custom(String),
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PoolOperation {
     pub kind: OperationKind,
     pub objects: Vec<ObjectKey>,
 }
 
-pub(crate) trait PoolWorkflow: Workflow {
+pub trait PoolWorkflow: Workflow {
     fn operation(&self) -> PoolOperation;
 }
 
-#[derive(Debug, Clone)]
-pub struct ConflictMatch {
-    pub existing: WorkflowId,
-    pub conflict: Conflict,
-}
-/// Runtime observation plus admission-time business explanations (not live blockers).
-#[derive(Debug, Clone)]
-pub struct TaskSnapshot {
-    pub execution: workflow_foundation::TaskSnapshot,
-    pub conflicts: Vec<ConflictMatch>,
-}
-impl Deref for TaskSnapshot {
-    type Target = workflow_foundation::TaskSnapshot;
-    fn deref(&self) -> &Self::Target {
-        &self.execution
-    }
-}
-pub struct TaskObserver {
-    execution: workflow_foundation::TaskObserver,
-    conflicts: Vec<ConflictMatch>,
-}
-impl TaskObserver {
-    pub fn snapshot(&self) -> TaskSnapshot {
-        TaskSnapshot {
-            execution: self.execution.snapshot(),
-            conflicts: self.conflicts.clone(),
-        }
-    }
-    pub async fn changed(&mut self) -> Outcome<TaskSnapshot> {
-        Ok(TaskSnapshot {
-            execution: self.execution.changed().await?,
-            conflicts: self.conflicts.clone(),
-        })
-    }
-}
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingSnapshot {
     pub queued: usize,
@@ -102,11 +73,10 @@ pub struct SchedulingSnapshot {
     pub fenced: usize,
 }
 
-type Explanations = Arc<Mutex<BTreeMap<WorkflowId, Vec<ConflictMatch>>>>;
 struct Accepted {
     control: RunControl,
     start: StartPermit,
-    publish: Box<dyn FnOnce() + Send>,
+    publish: Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>,
 }
 // Heterogeneous workflow submissions preserve their typed result channel in this closure.
 type Accept = Box<dyn FnOnce(Outcome<&mut WorkflowDriver>) -> Option<Accepted> + Send>;
@@ -119,11 +89,13 @@ struct Entry {
     operation: PoolOperation,
     control: RunControl,
     start: Option<StartPermit>,
+    activated: bool,
+    replacements: Vec<TaskId>,
 }
-#[derive(Default)]
 struct State {
     entries: BTreeMap<WorkflowId, Entry>,
-    fences: Vec<PoolOperation>,
+    fences: Vec<(TaskId, PoolOperation)>,
+    policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
 }
 impl State {
     // Reap before every admission too: a terminal notification may still be in the mailbox.
@@ -142,14 +114,14 @@ impl State {
                 entry.control.state(),
                 RunState::Failed(Failure::Uncertain(_))
             ) {
-                self.fences.push(entry.operation);
+                self.fences.push((id, entry.operation));
             }
         }
     }
     fn inspect(&self, operation: &PoolOperation) -> Outcome<Vec<ConflictMatch>> {
         let mut matches = Vec::new();
         for (id, entry) in &self.entries {
-            let conflict = TaskCenter::conflict(operation, &entry.operation);
+            let conflict = self.policy.admission(operation, &entry.operation);
             if let ConflictDecision::Reject(reason) = conflict.decision {
                 return Err(crate::support::reject(reason));
             }
@@ -169,32 +141,88 @@ impl State {
             fenced: self.fences.len(),
         }
     }
-    fn pump(&mut self) {
-        // Started owners always block. Earlier queued requests also block later overlapping
-        // requests, preventing overtaking, while unrelated objects can run concurrently.
-        let mut blocked: Vec<PoolOperation> = self
+    fn plan(&self) -> scheduling::Plan {
+        let tasks: Vec<_> = self
             .entries
-            .values()
-            .filter(|e| e.start.is_none())
-            .map(|e| e.operation.clone())
+            .iter()
+            .filter(|(_, e)| e.activated)
+            .map(|(id, e)| Candidate {
+                id: *id,
+                descriptor: &e.operation,
+                started: e.start.is_none(),
+                paused: e.control.pause_acknowledged(),
+            })
+            .chain(self.fences.iter().map(|(id, op)| Candidate {
+                id: *id,
+                descriptor: op,
+                started: true,
+                paused: false,
+            }))
             .collect();
-        for entry in self.entries.values_mut() {
-            if entry.start.is_none() {
-                continue;
+        scheduling::plan(self.policy.as_ref(), &tasks)
+    }
+    fn fenced(&self, op: &PoolOperation) -> bool {
+        self.fences.iter().any(|(_, fence)| {
+            self.policy.relation(op, fence) != Relation::Independent
+                || self.policy.relation(fence, op) != Relation::Independent
+        })
+    }
+    fn pump(&mut self) {
+        // A failed durable registration must not pause/cancel already accepted work.
+        let accepted: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.activated && matches!(e.control.acceptance_status(), Some(Ok(()))))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in accepted {
+            let fenced = self.fenced(&self.entries[&id].operation);
+            let entry = self.entries.get_mut(&id).unwrap();
+            entry.activated = true;
+            let replacements = std::mem::take(&mut entry.replacements);
+            if !fenced {
+                for old in replacements {
+                    if let Some(old) = self.entries.get(&old) {
+                        old.control.cancel();
+                    }
+                }
             }
-            if self.fences.iter().any(|f| f.overlaps(&entry.operation)) {
-                entry
-                    .start
-                    .take()
-                    .unwrap()
-                    .reject(crate::support::reject("object requires reconciliation"));
-            } else if !blocked.iter().any(|b| b.overlaps(&entry.operation)) {
-                entry.start.take().unwrap().start();
+        }
+        let plan = self.plan();
+        for (id, reasons) in plan.pauses {
+            if let Some(e) = self.entries.get(&id) {
+                e.control.set_policy_pauses(&reasons);
             }
-            blocked.push(entry.operation.clone());
+        }
+        let plan = self.plan();
+        for (id, blockers) in plan.blockers {
+            if let Some(e) = self.entries.get(&id) {
+                e.control.set_blockers(blockers);
+            }
+        }
+        let rejected: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.start.is_some() && self.fenced(&e.operation))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in rejected {
+            self.entries
+                .get_mut(&id)
+                .unwrap()
+                .start
+                .take()
+                .unwrap()
+                .reject(crate::support::reject("object requires reconciliation"));
+        }
+        for id in plan.ready {
+            if let Some(start) = self.entries.get_mut(&id).and_then(|e| e.start.take()) {
+                start.start();
+            }
         }
     }
 }
+
 struct Host(JoinHandle<()>);
 impl Drop for Host {
     fn drop(&mut self) {
@@ -202,14 +230,13 @@ impl Drop for Host {
     }
 }
 
-/// Concrete Pool coordinator. There is deliberately no TaskCenter trait or policy injection.
+/// Pool coordinator: generic task lifecycle and an injected business scheduling policy.
 #[derive(Clone)]
 pub struct TaskCenter {
     execution: ExecutionView,
     failure: Arc<Mutex<Option<Failure>>>,
     tx: mpsc::Sender<Submission>,
     routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
-    explanations: Explanations,
     scheduling: Arc<Mutex<SchedulingSnapshot>>,
     stop: CancellationToken,
     lifecycle: watch::Receiver<Lifecycle>,
@@ -217,13 +244,50 @@ pub struct TaskCenter {
     admission_closed: Arc<AtomicBool>,
 }
 impl TaskCenter {
-    pub(crate) fn start(mut driver: WorkflowDriver, config: &Config) -> Self {
+    pub(crate) fn start(driver: WorkflowDriver, config: &Config) -> Self {
+        Self::with_policy(driver, config, Arc::new(PoolSchedulingPolicy))
+    }
+    pub fn with_policy(
+        driver: WorkflowDriver,
+        config: &Config,
+        policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
+    ) -> Self {
+        Self::build(driver, config, policy, vec![])
+    }
+    /// Called after domain restoration and Driver::restore. All claims are installed together.
+    pub fn from_restored(
+        driver: WorkflowDriver,
+        config: &Config,
+        policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
+        restored: Vec<workflow_foundation::persistence::Restored>,
+    ) -> Outcome<Self> {
+        let mut entries = vec![];
+        for restored in restored {
+            let operation: PoolOperation = serde_json::from_value(restored.record.metadata)
+                .map_err(|e| crate::support::reject(e.to_string()))?;
+            if operation.objects != restored.record.objects {
+                return Err(crate::support::reject("restored scheduling claims differ"));
+            }
+            entries.push(Entry {
+                operation,
+                control: restored.control,
+                start: Some(restored.start),
+                activated: true,
+                replacements: vec![],
+            });
+        }
+        Ok(Self::build(driver, config, policy, entries))
+    }
+    fn build(
+        mut driver: WorkflowDriver,
+        config: &Config,
+        policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
+        restored: Vec<Entry>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Submission>(config.capacity);
         let stop = CancellationToken::new();
         let stopping = stop.clone();
         let (life, lifecycle) = watch::channel(Lifecycle::Running);
-        let explanations: Explanations = Arc::default();
-        let notes = explanations.clone();
         let scheduling = Arc::new(Mutex::new(SchedulingSnapshot::default()));
         let schedule = scheduling.clone();
         let execution = driver.view();
@@ -233,16 +297,18 @@ impl TaskCenter {
         let admission_closed = Arc::new(AtomicBool::new(false));
         let closed = admission_closed.clone();
         let task = tokio::spawn(async move {
-            let mut state = State::default();
+            let mut state = State {
+                entries: restored.into_iter().map(|e| (e.control.id, e)).collect(),
+                fences: vec![],
+                policy,
+            };
             let mut closing = false;
+            let mut deliveries = FuturesUnordered::new();
             loop {
                 state.reap();
                 state.pump();
                 *schedule.lock().unwrap() = state.snapshot();
-                // Keep only records still retained by runtime history.
-                let retained: BTreeSet<_> = driver.view().task_ids().into_iter().collect();
-                notes.lock().unwrap().retain(|id, _| retained.contains(id));
-                if closing && driver.is_idle() {
+                if closing && driver.is_idle() && deliveries.is_empty() {
                     break;
                 }
                 tokio::select! {
@@ -256,6 +322,7 @@ impl TaskCenter {
                         }
                     }
                     _ = driver.tick() => {}
+                    Some(()) = deliveries.next(), if !deliveries.is_empty() => {}
                     submission = rx.recv(), if !closing => {
                         let Some(submission) = submission else { stopping.cancel(); continue; };
                         state.reap();
@@ -270,24 +337,21 @@ impl TaskCenter {
                         // the replacement has actually been accepted and registered.
                         if let Some(accepted) = (submission.accept)(Ok(&mut driver)) {
                             state.reap();
-                            let fenced = state.fences.iter().any(|f| f.overlaps(&submission.operation));
                             let id = accepted.control.id;
-                            notes.lock().unwrap().insert(id, matches.clone());
+                            accepted.control.explain(matches.clone(), vec![]);
                             state.entries.insert(id, Entry {
                                 operation: submission.operation,
                                 control: accepted.control,
                                 start: Some(accepted.start),
+                                activated: false,
+                                replacements: matches.iter()
+                                    .filter(|m| m.conflict.decision == ConflictDecision::CancelThenWait)
+                                    .map(|m| m.existing).collect(),
                             });
-                            for found in matches {
-                                if !fenced && found.conflict.decision == ConflictDecision::CancelThenWait
-                                    && let Some(entry) = state.entries.get(&found.existing) {
-                                    entry.control.cancel();
-                                }
-                            }
                             state.reap();
                             state.pump();
                             *schedule.lock().unwrap() = state.snapshot();
-                            (accepted.publish)();
+                            deliveries.push((accepted.publish)());
                         }
                     }
                 }
@@ -302,7 +366,6 @@ impl TaskCenter {
             failure,
             tx,
             routing: Arc::default(),
-            explanations,
             scheduling,
             stop,
             lifecycle,
@@ -337,7 +400,7 @@ impl TaskCenter {
     pub(crate) fn stop(&self) {
         self.stop.cancel();
     }
-    pub(crate) async fn shutdown(&self) -> Outcome<()> {
+    pub async fn shutdown(&self) -> Outcome<()> {
         self.stop();
         let mut lifecycle = self.lifecycle.clone();
         while *lifecycle.borrow_and_update() != Lifecycle::Stopped {
@@ -370,44 +433,22 @@ impl TaskCenter {
             .collect()
     }
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
-        self.execution
-            .tasks()
-            .into_iter()
-            .map(|execution| {
-                let conflicts = self
-                    .explanations
-                    .lock()
-                    .unwrap()
-                    .get(&execution.id)
-                    .cloned()
-                    .unwrap_or_default();
-                TaskSnapshot {
-                    execution,
-                    conflicts,
-                }
-            })
-            .collect()
+        self.execution.tasks()
     }
     pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
-        Ok(self.observe_task(id)?.snapshot())
+        self.execution.task(id)
     }
     pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
-        Ok(TaskObserver {
-            execution: self.execution.observe_task(id)?,
-            conflicts: self
-                .explanations
-                .lock()
-                .unwrap()
-                .get(&id)
-                .cloned()
-                .unwrap_or_default(),
-        })
+        self.execution.observe_task(id)
     }
     pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
         self.execution.suspend(id)
     }
     pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
         self.execution.resume(id)
+    }
+    pub fn recheck(&self, id: TaskId) -> Outcome<()> {
+        self.execution.recheck(id)
     }
     pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
         self.execution.cancel(id)
@@ -422,7 +463,7 @@ impl TaskCenter {
         self.execution.snapshot()
     }
 
-    pub(crate) async fn submit<W: PoolWorkflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
+    pub async fn submit<W: PoolWorkflow>(&self, workflow: W) -> Outcome<Run<W::Output>> {
         self.submit_with_access(workflow, false).await
     }
     pub(crate) async fn submit_admin<W: PoolWorkflow>(
@@ -440,13 +481,16 @@ impl TaskCenter {
             return Err(Failure::Unavailable);
         }
         let operation = workflow.operation();
+        let metadata =
+            serde_json::to_value(&operation).map_err(|e| crate::support::reject(e.to_string()))?;
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Submission {
                 operation,
                 administrative,
                 accept: Box::new(move |driver| {
-                    let result = driver.and_then(|driver| driver.defer(workflow));
+                    let result =
+                        driver.and_then(|driver| driver.defer_with_metadata(workflow, metadata));
                     match result {
                         Err(error) => {
                             let _ = reply.send(Err(error));
@@ -456,7 +500,14 @@ impl TaskCenter {
                             control: run.control.clone(),
                             start,
                             publish: Box::new(move || {
-                                let _ = reply.send(Ok(run));
+                                Box::pin(async move {
+                                    let mut run = run;
+                                    let result = match run.accepted().await {
+                                        Ok(()) => Ok(run),
+                                        Err(e) => Err(e),
+                                    };
+                                    let _ = reply.send(result);
+                                })
                             }),
                         }),
                     }
@@ -464,7 +515,9 @@ impl TaskCenter {
             })
             .await
             .map_err(|_| Failure::Unavailable)?;
-        response.await.unwrap_or(Err(Failure::Unavailable))
+        let mut run = response.await.unwrap_or(Err(Failure::Unavailable))?;
+        run.accepted().await?;
+        Ok(run)
     }
     pub(crate) fn try_submit<W: PoolWorkflow>(
         &self,
@@ -475,12 +528,14 @@ impl TaskCenter {
             return Err(Failure::Unavailable);
         }
         let operation = workflow.operation();
+        let metadata =
+            serde_json::to_value(&operation).map_err(|e| crate::support::reject(e.to_string()))?;
         self.tx
             .try_send(Submission {
                 operation,
                 administrative: false,
                 accept: Box::new(move |driver| {
-                    match driver.and_then(|driver| driver.defer(workflow)) {
+                    match driver.and_then(|driver| driver.defer_with_metadata(workflow, metadata)) {
                         Err(error) => {
                             callback(Err(error));
                             None
@@ -488,7 +543,15 @@ impl TaskCenter {
                         Ok((run, start)) => Some(Accepted {
                             control: run.control.clone(),
                             start,
-                            publish: Box::new(move || callback(Ok(run))),
+                            publish: Box::new(move || {
+                                Box::pin(async move {
+                                    let mut run = run;
+                                    callback(match run.accepted().await {
+                                        Ok(()) => Ok(run),
+                                        Err(e) => Err(e),
+                                    });
+                                })
+                            }),
                         }),
                     }
                 }),

@@ -30,8 +30,35 @@ pub trait ServiceHandler: Send + Sync + 'static {
 pub struct ActivityContext {
     pub id: ActivityId,
     pub(crate) cancel: CancellationToken,
+    pub(crate) control: ControlToken,
+    pub(crate) hooks: watch::Sender<Option<Arc<dyn ActivityControl>>>,
 }
 impl ActivityContext {
+    /// A stopping-return service can watch this token and return its normal typed partial result.
+    pub fn control(&self) -> ControlToken {
+        self.control.clone()
+    }
+    /// Optional support for retaining this same ordinary activity during a pause.
+    pub fn register_control(&self, adapter: Arc<dyn ActivityControl>) -> Outcome<()> {
+        let mut duplicate = false;
+        self.hooks.send_if_modified(|slot| {
+            if slot.is_some() {
+                duplicate = true;
+                false
+            } else {
+                *slot = Some(adapter);
+                true
+            }
+        });
+        if duplicate {
+            Err(Failure::Rejected(
+                "activity control already registered".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancel
     }
@@ -47,8 +74,8 @@ pub type ServiceClient<S> = ActivityClient<
 enum Message<R, P, Q, V> {
     Execute {
         request: R,
-        context: ActivityContext,
-        guard: ActivityGuard,
+        context: Box<ActivityContext>,
+        guard: Box<ActivityGuard>,
         reply: oneshot::Sender<Outcome<P>>,
     },
     Query {
@@ -114,8 +141,8 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
             .tx
             .send(Message::Execute {
                 request,
-                context,
-                guard,
+                context: Box::new(context),
+                guard: Box::new(guard),
                 reply,
             })
             .await
@@ -228,7 +255,7 @@ pub(crate) fn spawn<S: ServiceHandler>(
                             let result = if context.cancel.is_cancelled() || stop.is_cancelled() { Err(Failure::Cancelled) } else {
                                 guard.started();
                                 let cancel = context.cancel.clone();
-                                let operation = AssertUnwindSafe(async move { service.execute(request, context).await }).catch_unwind();
+                                let operation = AssertUnwindSafe(async move { service.execute(request, *context).await }).catch_unwind();
                                 tokio::pin!(operation);
                                 let result = tokio::select! {
                                     biased;

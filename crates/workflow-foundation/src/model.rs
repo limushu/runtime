@@ -29,15 +29,13 @@ impl Failure {
 }
 pub type Outcome<T> = Result<T, Failure>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WorkflowId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivityId {
-    pub workflow: WorkflowId,
+    pub workflow: crate::TaskId,
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ObjectKey {
     pub namespace: String,
     pub id: String,
@@ -101,8 +99,10 @@ impl Signal {
 pub enum RunState {
     WaitingObjects,
     Running,
-    /// Acknowledged cooperative pause; no Activity is executing for this workflow.
+    /// Acknowledged safe pause, including an in-flight operation that has stopped.
     Paused,
+    Pausing,
+    WaitingConditions(String),
     WaitingResources,
     WaitingSignal,
     WaitingTimer,

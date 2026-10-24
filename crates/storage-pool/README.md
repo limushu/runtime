@@ -58,12 +58,14 @@ Task 是完整 Workflow 执行，不是 Activity。重复业务目标在途时�
 取消是请求，最终状态要观察；不可中断提交成功可以胜过并发取消。
 
 conflicts 字段提供准入时的已有任务 ID、决定、原因；scheduling() 提供业务队列计数，
-execution() 提供 Runtime 执行计数。ID 只在当前 Pool 实例内唯一。
+execution() 提供 Runtime 执行计数。TaskId 包含创建轮次、池 UUID、业务名与流水号。
+PoolManager::with_task_ids 注入同一主共享的分配器；默认本地模式不承诺跨重启有序。
 普通历史按 Config::task_history 有界保留，Uncertain 保留；observer 不因历史淘汰失效。
-暂停只在当前进程安全边界生效，仍保留对象占用，不支持崩溃恢复。
+用户暂停与策略暂停分别记录，blockers 表示实时等待者；details 由 Workflow 自定义。
+基础库支持可选 checkpoint 恢复，现有存储业务默认仍为 Memory。
 
-规则扩展见 [TaskCenter 开发说明](../../docs/task-center.md)。本轮删除 with_policy/with_rules、
-PoolConflictPolicy、RulePolicy 和选择器引擎，不保留兼容的第二套协调路径。
+规则扩展见 [TaskCenter 开发说明](../../docs/task-center.md)。TaskCenter::with_policy 接受
+SchedulingPolicy<PoolOperation>；默认 PoolSchedulingPolicy 提供 topo 优先于缩容的停稳交接。
 多池接口、生命周期及持久化边界见 [PoolManager 当前实现](../../docs/pool-manager.md)。
 
 ## 验证
@@ -75,6 +77,9 @@ cargo test --locked -p storage-pool
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
 cargo run --locked -p storage-pool --example shrink_commands
+cargo run --locked -p storage-pool --example managed_shrink
 ```
 
 shrink_commands 是执行控制示例，不代表生产缩容已实现。DESIGN.md 仅保留阶段性历史。
+managed_shrink 演示两种暂停契约、恢复前检查、统一 Task 观测与 Workflow 自声明持久化；
+使用内存后端及模拟迁移，不包含真实的数据迁移、成员移除或 PoolManager 持久化装配。

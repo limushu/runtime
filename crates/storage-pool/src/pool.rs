@@ -22,9 +22,18 @@ impl Pool {
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
         registry: Weak<Mutex<crate::manager::Registry>>,
+        task_ids: Option<TaskIds>,
     ) -> Outcome<Self> {
         let id = descriptor.id.clone();
         let mut driver = WorkflowDriver::new(id.as_str(), config.clone())?;
+        if let Some(ids) = task_ids {
+            let uuid = descriptor
+                .uuid
+                .to_string()
+                .parse::<uuid::Uuid>()
+                .map_err(|e| reject(e.to_string()))?;
+            driver = driver.with_task_ids(uuid.as_u128(), ids)?;
+        }
         let tier = driver.register(
             "tier",
             TierHost(TierService::new(id.clone(), metadata.clone())),
@@ -105,6 +114,9 @@ impl PoolHandle {
     }
     pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
         self.task_center.resume(id)
+    }
+    pub fn recheck_task(&self, id: TaskId) -> Outcome<()> {
+        self.task_center.recheck(id)
     }
     pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
         self.task_center.cancel(id)

@@ -36,6 +36,7 @@ pub(crate) struct Registry {
 #[derive(Clone)]
 pub struct PoolManager {
     pub(crate) registry: Arc<Mutex<Registry>>,
+    task_ids: Option<TaskIds>,
     config: Config,
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
@@ -52,11 +53,16 @@ impl PoolManager {
                 history_limit: config.task_history,
                 ..Registry::default()
             })),
+            task_ids: None,
             config,
             metadata,
             data_plane,
             next_fanout: Arc::new(AtomicUsize::new(0)),
         }
+    }
+    pub fn with_task_ids(mut self, ids: TaskIds) -> Self {
+        self.task_ids = Some(ids);
+        self
     }
     pub fn create(&self, request: CreatePool) -> Outcome<PoolHandle> {
         // Construction is synchronous and does no external IO. Publish all indexes together.
@@ -78,6 +84,7 @@ impl PoolManager {
             self.metadata.clone(),
             self.data_plane.clone(),
             Arc::downgrade(&self.registry),
+            self.task_ids.clone(),
         )?;
         let handle = pool.handle();
         registry

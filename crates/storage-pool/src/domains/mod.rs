@@ -12,8 +12,11 @@ pub type DomainResult<T> = Result<T, DomainError>;
 
 macro_rules! identity {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+        #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
+        impl TryFrom<String> for $name { type Error = $crate::domains::DomainError; fn try_from(v: String) -> Result<Self, Self::Error> { Self::new(v) } }
+        impl From<$name> for String { fn from(v: $name) -> Self { v.0 } }
         impl $name {
             pub fn new(value: impl Into<String>) -> $crate::domains::DomainResult<Self> {
                 let value = value.into();

@@ -28,13 +28,17 @@ scripts/verify.ps1           # workspace 验证入口
 - [通用执行基础](crates/workflow-foundation/README.md)
 - [构建与验证](docs/verification.md)
 - [TaskCenter 重构规格与证据](docs/changes/2026-10-15-task-center.md)
+- [统一 Task、持久化与可暂停 Activity](docs/changes/2026-10-24-unified-task-controls.md)
 
 ```sh
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
+cargo run --locked -p storage-pool --example managed_shrink
 ```
 
-本轮移除策略注入/规则引擎和旧分层目录，不保留第二套业务协调实现。旧代码可从 Git 历史恢复。
-当前仍是内存模型与模拟适配器，不是生产存储系统；没有持久历史、崩溃恢复或真实磁盘 IO。
+TaskCenter 通过 SchedulingPolicy 接受应用定义的协调策略，Workflow 自己声明是否持久化。
+所有 Workflow 使用同一种 Task 身份、观察和控制；现有业务 Workflow 默认仍在内存中运行。
+当前存储领域仍使用模拟适配器。基础库提供 checkpoint 恢复与文件 TaskStore，
+不包含生产选主、领域状态恢复、真实迁移或 Temporal 式确定性重放。

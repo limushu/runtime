@@ -552,7 +552,7 @@ async fn task_references_are_scoped_by_uuid_and_instance() {
     let b = manager.create_pool(id("b")).unwrap();
     let first = a.create_tier(tier()).await.unwrap();
     let second = b.create_tier(tier()).await.unwrap();
-    assert_eq!(first.id(), second.id());
+    assert_ne!(first.id(), second.id());
     let task = a.task_ref(first.id());
     done(first).await.unwrap();
     done(second).await.unwrap();

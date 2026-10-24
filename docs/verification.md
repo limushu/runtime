@@ -11,6 +11,7 @@ cargo run --locked -p workflow-foundation --example two_services
 cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example shrink_commands
 cargo run --locked -p storage-pool --example task_center
+cargo run --locked -p storage-pool --example managed_shrink
 ```
 
 PowerShell 可执行 `./scripts/verify.ps1`，依次检查格式、测试、文档测试和 Clippy。
@@ -21,8 +22,8 @@ PowerShell 可执行 `./scripts/verify.ps1`，依次检查格式、测试、文�
 本机没有 MSVC 链接环境时，使用已安装的 GNU 环境：
 
 ```powershell
-$env:CARGO_HOME = 'D:\Temp\workflow-cargo-5d1cb8373f47436d8471ae7f408614d2'
 $env:RUSTFLAGS = '--sysroot C:\rustup-ascii\toolchains\stable-x86_64-pc-windows-gnu'
+$env:Path = (Join-Path $env:TEMP 'workflow-binutils\mingw64\bin') + ';C:\rustup-ascii\toolchains\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained;' + $env:Path
 ./scripts/verify.ps1 -Toolchain stable-x86_64-pc-windows-gnu -Offline
 ```
 

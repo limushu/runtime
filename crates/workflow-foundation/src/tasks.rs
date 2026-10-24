@@ -10,6 +10,7 @@ pub enum ActivityState {
     /// Includes waiting for space in the service mailbox.
     Queued,
     Running,
+    Paused,
     Completed,
     Failed(Failure),
 }
@@ -138,7 +139,17 @@ pub struct TaskSnapshot {
     pub progress: TaskProgress,
     pub activities: ActivityHistory,
     pub pause_requested: bool,
+    pub pause_acknowledged: bool,
+    pub pause_reasons: std::collections::BTreeSet<String>,
     pub cancellation_requested: bool,
+    pub details: serde_json::Value,
+    pub conflicts: Vec<ConflictMatch>,
+    pub blockers: Vec<TaskId>,
+}
+impl TaskSnapshot {
+    pub fn details_as<T: serde::de::DeserializeOwned>(&self) -> Outcome<T> {
+        serde_json::from_value(self.details.clone()).map_err(|e| Failure::Rejected(e.to_string()))
+    }
 }
 #[derive(Clone)]
 pub(crate) struct TaskRecord {
@@ -147,6 +158,7 @@ pub(crate) struct TaskRecord {
 }
 impl TaskRecord {
     fn snapshot(&self) -> TaskSnapshot {
+        let info = self.control.info.borrow().clone();
         TaskSnapshot {
             pool: self.pool.clone(),
             id: self.control.id,
@@ -156,7 +168,12 @@ impl TaskRecord {
             progress: self.control.progress(),
             activities: self.control.activities(),
             pause_requested: self.control.pause_requested(),
+            pause_acknowledged: self.control.pause_acknowledged(),
+            pause_reasons: self.control.pause_reasons(),
             cancellation_requested: self.control.cancellation_requested(),
+            details: info.details,
+            conflicts: info.conflicts,
+            blockers: info.blockers,
         }
     }
 }
@@ -166,6 +183,7 @@ pub struct TaskObserver {
     record: TaskRecord,
     progress: tokio::sync::watch::Receiver<TaskProgress>,
     activities: watch::Receiver<ActivityHistory>,
+    info: watch::Receiver<TaskInfo>,
     ended: bool,
 }
 impl TaskObserver {
@@ -179,6 +197,7 @@ impl TaskObserver {
         let changed = tokio::select! {
             changed = self.record.control.changed() => changed.map(|_| ()),
             changed = self.progress.changed() => changed.map_err(|_| Failure::Unavailable),
+            changed = self.info.changed() => changed.map_err(|_| Failure::Unavailable),
             changed = self.activities.changed() => changed.map_err(|_| Failure::Unavailable),
         };
         let snapshot = self.snapshot();
@@ -233,8 +252,9 @@ impl TaskRegistry {
         Ok(TaskObserver {
             progress: record.control.progress.clone(),
             activities: record.control.activities.clone(),
-            record,
+            record: record.clone(),
             ended: false,
+            info: record.control.info.subscribe(),
         })
     }
     pub fn snapshots(&self) -> Vec<TaskSnapshot> {
@@ -250,4 +270,29 @@ impl TaskRegistry {
         }
         Ok(control)
     }
+}
+
+/// Business-neutral scheduling explanation, shared by every observation entry point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictDecision {
+    Independent,
+    Wait,
+    CancelThenWait,
+    Reject(&'static str),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub decision: ConflictDecision,
+    pub reason: &'static str,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictMatch {
+    pub existing: TaskId,
+    pub conflict: Conflict,
+}
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TaskInfo {
+    pub details: serde_json::Value,
+    pub conflicts: Vec<ConflictMatch>,
+    pub blockers: Vec<TaskId>,
 }

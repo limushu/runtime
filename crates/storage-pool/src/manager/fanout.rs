@@ -57,7 +57,7 @@ pub(crate) enum EventDecision {
     Pending,
     NotRelevant,
     Applied,
-    Accepted(RunControl),
+    Accepted(Box<RunControl>),
     Rejected(Failure),
 }
 #[derive(Clone)]

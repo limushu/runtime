@@ -445,7 +445,7 @@ impl PoolHandle {
         let reply = decision.clone();
         let callback = move |result: Outcome<Run<PoolNode>>| {
             reply.send_replace(match result {
-                Ok(run) => EventDecision::Accepted(run.control),
+                Ok(run) => EventDecision::Accepted(Box::new(run.control)),
                 Err(error) => EventDecision::Rejected(error),
             });
         };
@@ -518,7 +518,7 @@ fn reply_disk(
     result: Outcome<workflow_foundation::RunControl>,
 ) {
     sender.send_replace(match result {
-        Ok(control) => EventDecision::Accepted(control),
+        Ok(control) => EventDecision::Accepted(Box::new(control)),
         Err(error) => EventDecision::Rejected(error),
     });
 }
