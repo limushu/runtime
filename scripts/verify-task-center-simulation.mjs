@@ -13,12 +13,12 @@ const scenarios=context.RuntimeScenarios;
 const scene=id=>scenarios.find(s=>s.id===id);
 const frame=(id,name)=>{const f=scene(id).frames.find(f=>f.id===name);assert.ok(f,id+': '+name);return f.state};
 const html=fs.readFileSync(path.join(base,'index.html'),'utf8');
-assert.equal(scenarios.length,8);
+assert.equal(scenarios.length,9);
 let total=0;
 for(const s of scenarios){
   assert.equal(new Set(s.frames.map(f=>f.id)).size,s.frames.length,'unique frame IDs: '+s.id);
   const identities=new Map();
-  for(const f of s.frames){total++;assert.ok(Object.isFrozen(f.state));assert.ok(['events','running','notify','waker','outside'].includes(f.tick.branch));for(const n of f.nodes)assert.ok(html.includes('id="node-'+n+'"'),n);for(const r of f.routes)assert.ok(html.includes('id="route-'+r+'"'),r);
+  for(const f of s.frames){total++;assert.ok(Object.isFrozen(f.state));for(const w of f.state.awaits){assert.ok(f.state.tasks[w.task].registered);assert.ok(!['Completed','Cancelled','Rejected','Uncertain'].includes(f.state.tasks[w.task].status));}assert.ok(['events','running','notify','waker','outside'].includes(f.tick.branch));for(const n of f.nodes)assert.ok(html.includes('id="node-'+n+'"'),n);for(const r of f.routes)assert.ok(html.includes('id="route-'+r+'"'),r);
     for(const [id,t]of Object.entries(f.state.tasks)){
       if(t.id){if(identities.has(id))assert.equal(t.id,identities.get(id),'same Task identity');else identities.set(id,t.id)}
       if(t.ack)assert.ok(t.reasons.length>0,'ACK requires an active pause');
@@ -75,6 +75,26 @@ assert.equal(scene('normal').frames.find(f=>f.id==='A-1-acquire').tick.branch,'r
 assert.equal(scene('normal').frames.find(f=>f.id==='A-1-wake').tick.branch,'waker');
 assert.equal(scene('normal').frames.find(f=>f.id==='A-1-reply').tick.branch,'waker');
 assert.equal(scene('yield-return').frames.find(f=>f.id==='notify-ack').tick.branch,'notify');
+assert.equal(frame('normal','A-1-lock').received.type,'Acquire');
+assert.equal(frame('normal','A-1-lock').received.mode,'Read');
+assert.equal(frame('normal','A-1-execute').calls.A.service,'tier');
+assert.equal(frame('normal','A-2-execute').calls.A.service,'node');
+assert.ok(frame('fifo','request-B').awaits.some(w=>w.task==='A'&&w.node==='context'),'A keeps waiting when B arrives');
+assert.ok(frame('fifo','request-B').awaits.some(w=>w.task==='A'&&w.node==='service-disk'),'service wait has its own host');
+assert.equal(frame('resources','B-1-lock').received.decision,'wait');
+assert.equal(frame('resources','resource-wait').tasks.B.activity,0);
+assert.equal(frame('resources','resource-wait').queue.length,0,'business admission is not resource contention');
+assert.equal(frame('resources','resource-wait').resourceWaiters.length,1);
+assert.ok(frame('resources','resource-wait').awaits.some(w=>w.task==='B'&&w.at.includes('Broker.acquire')));
+assert.ok(frame('resources','resource-wait').awaits.some(w=>w.task==='A'&&w.node==='service-disk'));
+assert.equal(frame('resources','withdraw-received').received.type,'Withdraw');
+assert.equal(frame('resources','withdraw-received').resourceWaiters.length,0);
+assert.equal(frame('resources','withdraw-received').resources[0].task,'A');
+assert.equal(frame('resources','A-1-release').received.granted,'C-1');
+assert.equal(frame('resources','A-1-release').resourceWaiters.length,0);
+assert.ok(frame('resources','A-1-release').resources.some(r=>r.task==='C'));
+assert.equal(frame('resources','fenced-reject').received.decision,'reject');
+assert.equal(frame('resources','fenced-reject').tasks.D.activity,0);
 console.log('PASS: '+scenarios.length+' trace variants / '+total+' immutable events; task identity, FIFO, independent progress, ACK before handoff, both pause modes, user pause, readiness, cancellation, fencing, checkpoint recovery.');
 if(process.argv.includes('--browser'))await browserCheck();
 async function browserCheck(){
@@ -125,8 +145,23 @@ async function browserCheck(){
   await evaluate('const slider=document.getElementById("timeline");slider.value=2;slider.dispatchEvent(new Event("input"))');assert.equal((await inspect()).cursor,2);
   await evaluate('document.querySelector("#chapters button:last-child").click()');assert.equal((await inspect()).frame,'resume-user');
   await evaluate('RuntimeLab.choose("uncertain");document.getElementById("auto-explain").checked=false');await click('play');await until('RuntimeLab.inspect().frame === "reject-fenced" && !RuntimeLab.inspect().playing',35000);await click('play');assert.equal((await inspect()).cursor,0);await click('play');
-  const overflow=await evaluate(`(()=>{const bad=[];document.querySelectorAll('#architecture text').forEach(t=>{if(t.closest('#packet-label'))return;const b=t.getBBox();if(b.x<0||b.y<0||b.x+b.width>1280||b.y+b.height>980)bad.push(t.textContent);const r=t.closest('.component')?.querySelector('.node-card');if(r&&b.x+b.width>+r.getAttribute('x')+ +r.getAttribute('width')-8)bad.push(t.textContent+' [card]')});return bad})()`);assert.deepEqual(overflow,[],'SVG text fits');
+  const overflow=await evaluate(`(()=>{const bad=[];document.querySelectorAll('#architecture text').forEach(t=>{if(t.closest('#packet-label'))return;const b=t.getBBox();if(b.x<0||b.y<0||b.x+b.width>1500||b.y+b.height>940)bad.push(t.textContent);const r=t.closest('.component')?.querySelector('.node-card');if(r&&b.x+b.width>+r.getAttribute('x')+ +r.getAttribute('width')-8)bad.push(t.textContent+' [card]')});return bad})()`);assert.deepEqual(overflow,[],'SVG text fits');
   await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});await click('play');await delay(70);assert.equal(await evaluate('getComputedStyle(document.getElementById("packet")).display'),'none');await click('play');
+  await evaluate('RuntimeLab.choose("resources"); RuntimeLab.seek(RuntimeScenarios.find(s=>s.id==="resources").frames.findIndex(f=>f.id==="resource-wait"))');
+  assert.equal(await evaluate('document.getElementById("node-context").classList.contains("awaiting")'),true);
+  assert.equal(await evaluate('document.getElementById("node-service-disk").classList.contains("awaiting")'),true);
+  assert.ok((await evaluate('document.getElementById("await-list").textContent')).includes('Broker.acquire'));
+  assert.ok((await evaluate('document.getElementById("received-payload").textContent')).includes('Acquire'));
+  assert.equal(await evaluate('document.getElementById("receiver-event").textContent'),'Acquire · req B-1');
+  await click('next-step');
+  assert.equal(await evaluate('document.getElementById("node-service-disk").classList.contains("awaiting")'),true,'A still waits while B withdraws');
+  assert.ok(await evaluate('document.getElementById("node-futures").getBBox().y < document.getElementById("node-event-branch").getBBox().y'),'branches are vertically stacked');
+  const sceneShot=process.argv.indexOf('--screenshot-waits');
+  if(sceneShot!==-1){
+    await evaluate('RuntimeLab.seek(RuntimeScenarios.find(s=>s.id==="resources").frames.findIndex(f=>f.id==="resource-wait"))');
+    const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
+    fs.writeFileSync(process.argv[sceneShot+1],Buffer.from(shot.data,'base64'));
+  }
   const beforeZoom=await evaluate('document.getElementById("node-futures").getBoundingClientRect().width');
   await click('fit-diagram');
   assert.ok(await evaluate('document.getElementById("node-futures").getBoundingClientRect().width')>beforeZoom*1.2,'zoom enlarges actual SVG nodes');

@@ -49,5 +49,5 @@ python scripts/render-runtime-lab-graph.py
 node scripts/verify-task-center-simulation.mjs --browser
 ```
 
-支持可选 --screenshot、--screenshot-cycle、--screenshot-branches 输出 PNG；
+支持可选 --screenshot、--screenshot-cycle、--screenshot-branches、--screenshot-waits 输出 PNG；
 每个选项后传输出路径。覆盖事件状态、分支说明、三任务等待环和播放交互。

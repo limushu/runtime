@@ -10,6 +10,7 @@
 - [Runtime Lab 动态演示：请求流转、冲突排队与交接](diagrams/task-center-simulation/index.html)（离线教学模拟）
 - [动态演示范围、使用与验证](changes/2026-10-24-runtime-lab.md)
 - [Driver tick 分支与三任务死锁回归图示](changes/2026-10-24-driver-tick-views.md)
+- [持续等待、执行宿主与资源事件分派](changes/2026-10-24-runtime-awaits.md)
 - [旧版 TaskCenter 协作图（历史实现）](runtime-collaboration.md)
 - [TaskCenter 冲突规则开发说明](task-center.md)
 - [统一 Task 与暂停/恢复契约、验收记录](changes/2026-10-24-unified-task-controls.md)

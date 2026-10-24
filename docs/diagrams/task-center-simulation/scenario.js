@@ -3,28 +3,66 @@
   "use strict";
   const clone=x=>JSON.parse(JSON.stringify(x));
   function freeze(x){if(x&&typeof x==='object'){Object.values(x).forEach(freeze);Object.freeze(x)}return x}
-  const initial=()=>({tasks:{},queue:[],owners:[],resources:[],events:[],fences:[],service:'空闲',mailbox:[],pending:{},future:'未创建',futureTask:'—',decision:'尚未准入',store:'未写入',epoch:42,guard:'未检查',disk:'Down'});
+  const initial=()=>({calls:{},awaits:[],resourceWaiters:[],received:null,tasks:{},queue:[],owners:[],resources:[],events:[],fences:[],service:'空闲',mailbox:[],pending:{},future:'未创建',futureTask:'—',decision:'尚未准入',store:'未写入',epoch:42,guard:'未检查',disk:'Down'});
+  const serviceFor=command=>/tier/i.test(command)?'tier':/node/i.test(command)?'node':/vd\.|volume/i.test(command)?'vd':/balance|migration/i.test(command)?'balance':'disk';
+  function waitingPoints(s){
+    const list=[];
+    for(const [task,t] of Object.entries(s.tasks)){
+      if(!t.registered)continue;
+      const call=s.calls[task];
+      const put=(node,at,reason)=>list.push({task,node,host:'TaskCenter Tokio task',at,reason});
+      if(t.status==='等待持久化确认')put('futures','execution → TaskStore save.await','等待初始记录确认');
+      else if(t.status==='Queued')put('futures','execution → StartPermit receiver.await',t.blockers.length?'被 '+t.blockers.join(' / ')+' 阻塞':'等待启动许可');
+      else if(t.status==='WaitingResources')put('context','activity → Broker.acquire → response.await','等待 '+(call?.key||'资源集合')+' 的 Permit');
+      else if(t.status==='WaitingConditions')put('context','wait_for_readiness → recheck / control','业务条件未满足');
+      else if(t.status==='Suspended')put('context','wait_for_readiness / drive_activity → control.changed','暂停原因尚未清除');
+      else if(['Activity','Suspending','取消请求中'].includes(t.status))put('context','drive_activity → ActivityClient.dispatch → response.await',t.status==='Activity'?'等待领域结果':'等待领域停稳 / 控制确认');
+      if(call?.phase==='executing'&&s.pending[task]){
+        list.push({task,node:'service-'+call.service,host:call.service+' ServiceHost Tokio task',at:call.service==='balance'?'BalanceHost → completion / control':'ServiceHandler.execute → 领域异步操作',reason:t.ack?'原调用保留，等待继续 / 最终结果':'等待 IO / 回调；宿主仍可接收消息'});
+      }
+    }
+    return list;
+  }
   class Trace{
     constructor(id,name,subtitle){this.id=id;this.name=name;this.subtitle=subtitle;this.state=initial();this.frames=[];this.add('intro','准备发送请求',subtitle,[],[],()=>{}, {chapter:'开始'})}
-    add(id,title,why,nodes,routes,change=()=>{},opts={}){const previousFuture=this.state.future;this.state=clone(this.state);change(this.state);if(this.state.future!==previousFuture)this.state.futureTask=opts.actor||'A';let tick={branch:'outside',result:'当前事件不代表 tick 返回'};
-      if(routes.includes('lock')){tick={branch:'events',result:'① 就绪 · publish → None → 外层 reap / pump'};nodes=[...new Set([...nodes,'event-branch'])];routes=[...routes,'resource-exit'];}
+    add(id,title,why,nodes,routes,change=()=>{},opts={}){const previousFuture=this.state.future,before=this.state;this.state=clone(this.state);change(this.state);if(this.state.future!==previousFuture)this.state.futureTask=opts.actor||'A';let tick={branch:'outside',result:'当前事件不代表 tick 返回'};
+      if(routes.includes('lock')){tick={branch:'events',result:'① 就绪 · publish → None → 外层 reap / pump'};nodes=[...new Set([...nodes,'event-branch'])];routes=[...routes,'arbitrate','resource-exit'];}
       else if(routes.includes('workflow-exit'))tick={branch:'running',result:'② 就绪 · finish(id) → publish → Some(TaskId)'};
       else if(routes.includes('notify'))tick={branch:'notify',result:'通知就绪 · publish → None → 外层 reap / pump'};
       else if(routes.some(r=>['poll','run','acquire','checkpoint','control-ack'].includes(r)))tick={branch:'running',result:'② 正在被 poll；Workflow 未结束，仍 Pending'};
       else if(routes.some(r=>['wake','reply'].includes(r)))tick={branch:'waker',result:'只唤醒等待链；不是 tick 返回'};
+      const actor=opts.actor||'A',call=this.state.calls[actor];
+      if(routes.includes('lock')){
+        const type=before.events[0]?.split(' ')[0]||'Acquire';
+        this.state.received=opts.received||{type,request:call?.request||actor,kind:'Activity',access:call?.key||'[]',mode:call?.mode||'Write',decision:type==='Acquire'?'permit':this.state.resources.some(r=>r.task===actor&&r.state==='Fenced')?'fence':'release'};
+        if(opts.granted)this.state.received.granted=this.state.calls[opts.granted].request;
+        nodes=[...new Set([...nodes,'event-types','outcomes'])];
+        if(this.state.received.decision==='wait')routes.push('wait');
+        if(this.state.received.decision==='reject')routes.push('reject');
+      }
+      this.state.awaits=waitingPoints(this.state);
+      if(call){
+        nodes=nodes.map(n=>['service','mail'].includes(n)?'service-'+call.service:n);
+        routes=routes.map(r=>['send','execute','reply','release','settle','stop','stop-ack'].includes(r)?r+'-'+call.service:r);
+      }
       this.frames.push({id,title,why,nodes,routes,tick,actor:'A',duration:1400,chapter:null,gate:false,...opts,state:clone(this.state)});return this}
     request(id,label,kind,objects=['disk:D1'],durable=false){this.add('request-'+id,'请求 '+id+' 进入 TaskCenter',label+' 是完整 Workflow 请求。调用方不执行领域动作，也不持有启动许可。',['caller','state'],['submit'],s=>{s.tasks[id]={label,kind,objects,durable,registered:false,status:'待准入',id:null,blockers:[],reasons:[],ack:false,activity:0,checkpoint:null};s.decision='正在检查 '+id},{actor:id,chapter:'提交 '+id});return this}
     admit(id,decision='Independent',blockers=[]){this.add('policy-'+id,'Policy 判断：'+decision,'策略提供业务判断；TaskCenter 先检查完整冲突集合与容量，拒绝时不影响旧任务。',['state','policy'],['policy'],s=>{s.decision=decision;s.tasks[id].blockers=blockers},{actor:id});this.add('register-'+id,'defer 登记同一个 Task','Driver 登记 Future，State 保存 StartPermit。任务有身份，但业务还没有开始。',['state','driver','futures'],['defer'],s=>{let t=s.tasks[id];t.registered=true;t.id='42 / P1 / '+t.kind+' / '+id;t.status=t.durable?'等待持久化确认':'Queued';s.queue.push(id);s.future='Pending · 等启动许可'},{actor:id});if(this.state.tasks[id].durable){this.add('persist-'+id,'初始 Task 记录写入 TaskStore','Workflow 自声明 Durable；写入由 spawn_blocking 执行。此时不得启动业务或抢占旧任务。',['driver','store'],['persist'],s=>{s.store='A revision=0 · Pending';},{actor:id});this.add('accepted-'+id,'写入确认，激活调度','初始存储失败时不会执行业务，也不会取消或暂停旧任务。本场景写入成功。',['store','state'],['accepted'],s=>{s.tasks[id].status='Queued'},{actor:id})}return this}
     start(id){this.add('start-'+id,'给 '+id+' 发放 StartPermit','State.pump() 确认没有未解决的运行阻塞，启动许可交给 Workflow，不能由调用方绕过。',['state','futures'],['start'],s=>{let t=s.tasks[id];t.status='Ready';t.blockers=[];s.queue=s.queue.filter(x=>x!==id);s.owners.push({task:id,objects:t.objects});s.future='Ready · 等待再次 poll'},{actor:id});this.add('poll-'+id,'Driver poll '+id+'，执行流程体','同一个 TaskCenter Tokio task 推进 driver.tick() 和 Workflow Future；没有为每个 Workflow 再 spawn 一个宿主。',['driver','futures','context'],['poll','run'],s=>{s.tasks[id].status='Running';s.future='Polling'},{actor:id});return this}
-    activity(id,command,key='disk:D1'){
-      const n=this.state.tasks[id].activity+1,p=id+'-'+n;
-      this.add(p+'-acquire',command+'：申请资源','Context 经过安全边界，Broker 发 Acquire。当前 Future 进入 Pending，不阻塞 TaskCenter 接收新请求。',['context','broker'],['acquire'],s=>{s.events=['Acquire '+(key??'[]')];s.tasks[id].status='WaitingResources';s.future='Pending · 等 Permit'},{actor:id,chapter:command});
-      this.add(p+'-lock','Driver 消费资源事件','资源队列与 Workflow Futures 共享 driver.tick()。LockTable 判断资源读写，不承担业务准入。',['broker','driver','locks'],['events','lock'],s=>{s.events=[];if(key!==null)s.resources.push({task:id,key,state:'Held'});},{actor:id});
-      this.add(p+'-wake','Permit 返回，只标记 Future 就绪','Permit 的 oneshot 唤醒等待链。Waker 不直接执行 Workflow；还要由 Driver 再次 poll。',['locks','context','futures'],['permit','wake'],s=>{s.future='Ready · 等待 poll';s.tasks[id].status='Ready'},{actor:id});
-      this.add(p+'-dispatch','再次 poll，派发 '+command,'Context 取得 Permit，Tracker 登记 Guard，ActivityClient 把请求送入独立服务邮箱。',['driver','futures','context','client','mail'],['poll','run','dispatch','send'],s=>{s.tasks[id].activity=n;s.tasks[id].status='Activity';s.pending[id]=1;s.mailbox=[command];s.future='Pending · 等结果'},{actor:id});
-      this.add(p+'-execute','服务宿主执行 '+command,'服务自己的 Tokio task 轮询 Activity Future。领域校验和 IO 在此发生，TaskCenter 同时仍可处理其他请求。',['mail','service'],['execute'],s=>{s.mailbox=[];s.service=command+' · 执行中'},{actor:id});return this
+    activity(id,command,key='disk:D1',wait=false){
+      const n=this.state.tasks[id].activity+1,p=id+'-'+n,mode=/^(tier|node)\.inspect/.test(command)?'Read':'Write';
+      this.add(p+'-acquire',command+'：申请资源','Context 经过安全边界，Broker 发 Acquire。当前 Future 进入 Pending，不阻塞 TaskCenter 接收新请求。',['context','broker'],['acquire'],s=>{s.calls[id]={command,key,mode,service:serviceFor(command),phase:'acquiring',request:p};s.events=['Acquire '+p+' Activity '+mode+' '+(key??'[]')];s.tasks[id].status='WaitingResources';s.future='Pending · 等 Permit'},{actor:id,chapter:command});
+      this.add(p+'-lock','Driver 消费资源事件','资源队列与 Workflow Futures 共享 driver.tick()。LockTable 判断资源读写，不承担业务准入。',['broker','driver','locks'],['events','lock'],s=>{s.events=[];if(wait)s.resourceWaiters.push({task:id,key,request:p});else if(key!==null)s.resources.push({task:id,key,state:'Held'});},{actor:id,received:{type:'Acquire',request:p,kind:'Activity',access:key||'[]',mode,decision:wait?'wait':'permit'}});
+      if(wait)return this;
+      return this.dispatchActivity(id);
     }
-    settle(id,uncertain=false){const n=this.state.tasks[id].activity;this.add(id+'-'+n+'-settle',uncertain?'结果不确定：保留资源隔离':'Activity 真正停稳，Guard 结算','Guard 跟随真实执行寿命。它通知 Tracker 并投递 Release；发送 Release 还不等于 LockTable 已经回收资源。',['service','tracker','broker'],['settle','release'],s=>{s.pending[id]=0;s.events=['Release '+id];s.service=uncertain?'Uncertain · 效果需核对':'空闲'},{actor:id});this.add(id+'-'+n+'-release',uncertain?'Driver 将步骤资源标为 Fenced':'Driver 处理 Release','资源表变化在 Driver 消费事件时发生，不能把调用方停止等待当作资源已释放。',['driver','locks'],['lock'],s=>{s.events=[];if(uncertain)s.resources.filter(r=>r.task===id).forEach(r=>r.state='Fenced');else s.resources=s.resources.filter(r=>r.task!==id)},{actor:id});this.add(id+'-'+n+'-reply','oneshot 结果唤醒原 Workflow','服务结果返回等待链；下一次 poll 才由 Workflow 消费结果。调用次序和真实耗时在此作教学简化。',['service','futures','context'],['reply'],s=>{s.future='Ready · 等待 poll';s.tasks[id].status=uncertain?'Settling · Uncertain':'Running'},{actor:id});return this}
+    dispatchActivity(id){
+      const {command,request:p}=this.state.calls[id],n=this.state.tasks[id].activity+1;
+      this.add(p+'-wake','Permit 返回，只标记 Future 就绪','Permit 的 oneshot 唤醒等待链。Waker 不直接执行 Workflow；还要由 Driver 再次 poll。',['locks','context','futures'],['permit','wake'],s=>{s.future='Ready · 等待 poll';s.tasks[id].status='Ready'},{actor:id});
+      this.add(p+'-dispatch','再次 poll，派发 '+command,'Context 取得 Permit，Tracker 登记 Guard，ActivityClient 把请求送入独立服务邮箱。',['driver','futures','context','client','mail'],['poll','run','dispatch','send'],s=>{s.tasks[id].activity=n;s.tasks[id].status='Activity';s.pending[id]=1;s.calls[id].phase='queued';s.mailbox=[command];s.future='Pending · 等结果'},{actor:id});
+      this.add(p+'-execute','服务宿主执行 '+command,'服务自己的 Tokio task 轮询 Activity Future。领域校验和 IO 在此发生，TaskCenter 同时仍可处理其他请求。',['mail','service'],['execute'],s=>{s.mailbox=[];s.calls[id].phase='executing';s.service=command+' · 执行中'},{actor:id});return this
+    }
+    settle(id,uncertain=false,grant=null){const n=this.state.tasks[id].activity;this.add(id+'-'+n+'-settle',uncertain?'结果不确定：保留资源隔离':'Activity 真正停稳，Guard 结算','Guard 跟随真实执行寿命。它通知 Tracker 并投递 Release；发送 Release 还不等于 LockTable 已经回收资源。',['service','tracker','broker'],['settle','release'],s=>{s.pending[id]=0;if(s.calls[id])s.calls[id].phase='settled';s.events=['Release '+s.calls[id]?.request+' uncertain='+uncertain];s.service=uncertain?'Uncertain · 效果需核对':'空闲'},{actor:id});this.add(id+'-'+n+'-release',uncertain?'Driver 将步骤资源标为 Fenced':'Driver 处理 Release','资源表变化在 Driver 消费事件时发生，不能把调用方停止等待当作资源已释放。',['driver','locks'],['lock'],s=>{s.events=[];if(uncertain)s.resources.filter(r=>r.task===id).forEach(r=>r.state='Fenced');else s.resources=s.resources.filter(r=>r.task!==id);if(grant){const w=s.resourceWaiters.find(w=>w.task===grant);s.resources.push({task:grant,key:w.key,state:'Held'});s.resourceWaiters=s.resourceWaiters.filter(w=>w.task!==grant)}},{actor:id,granted:grant});this.add(id+'-'+n+'-reply','oneshot 结果唤醒原 Workflow','服务结果返回等待链；下一次 poll 才由 Workflow 消费结果。调用次序和真实耗时在此作教学简化。',['service','futures','context'],['reply'],s=>{s.future='Ready · 等待 poll';s.tasks[id].status=uncertain?'Settling · Uncertain':'Running'},{actor:id});return this}
     finish(id,kind='Completed'){
       this.add('finish-'+id,kind==='Uncertain'?'Task 结果不确定，逻辑占用隔离':'Task '+id+' 发布 '+kind,'Tracker 已停稳，才发布终态。Durable 任务还要保存终态；取消请求与最终取消结果是两个时刻。',['tracker','observe'],['observe'],s=>{s.tasks[id].status=kind;s.future='已完成';if(s.tasks[id].durable)s.store=id+' · '+(kind==='Uncertain'?'NeedsCheck':kind)},{actor:id});
       this.add('tick-complete-'+id,'② 整个 Workflow 结束，tick 返回 Some(TaskId)','running.next() 到这里才就绪。先 TaskRegistry.finish(id)，再 publish；外层下一轮 reap / pump。Activity 的单次回复不会触发这一分支体。',['futures','driver'],['workflow-exit'],()=>{},{actor:id});
@@ -123,6 +161,27 @@
   cycle.add('remove-index','移除确认后，清理 Pool 成员索引','RemoveMembers 阶段更新路由与磁盘归属；完成元数据删除和索引清理后才能推进到 Complete。',['context'],['poll','run'],s=>s.disk='Removed');
   cycle.finish('A').start('C').finish('C');
   all.push(cycle.export());
+
+
+  const resources=new Trace('resources','资源事件 → 放行 / 等待 / 撤回','两个业务独立的流程共享底层资源 R1。区分 TaskCenter 准入队列与 LockTable 资源等待队列。');
+  resources.request('A','流程 A：持有 R1','independent-a',['job:A']).admit('A').start('A').activity('A','disk.work(A)','resource:R1');
+  resources.request('B','流程 B：也需要 R1','independent-b',['job:B']).admit('B','Independent').start('B').activity('B','disk.work(B)','resource:R1',true);
+  resources.add('resource-wait','Acquire(B-1) 有冲突：B 留在 waiting','B 已通过业务准入，但 Broker.acquire 仍在等 Permit。A 的 Activity 也在等领域 IO；两个等待方都持续高亮。TaskCenter 可以继续处理其他事件。',['event-branch','locks','outcomes'],[],s=>s.decision='资源等待：B → A',{actor:'B',gate:true,chapter:'资源冲突'});
+  resources.add('withdraw-request','取消 B：Pending.drop 投递 Withdraw(B-1)','B 尚未派发 Activity，没有领域副作用。丢弃 acquire 等待会发 Withdraw；锁表只能在收到事件后移除该等待项。',['context','broker'],['withdraw'],s=>{s.tasks.B.status='Settling';s.events=['Withdraw B-1'];},{actor:'B'});
+  resources.add('withdraw-received','events.recv 收到 Withdraw(B-1)','只从 waiting 删除 B-1，A 的 held 不能被撤回释放。处理后 pump，再 publish / 返回 None。',['event-branch','locks'],['events','lock'],s=>{s.events=[];s.resourceWaiters=[];s.tasks.B.status='Settling';},{actor:'B',received:{type:'Withdraw',request:'B-1',kind:'Activity',access:'resource:R1',mode:'Write',decision:'withdraw'},gate:true,chapter:'Withdraw'});
+  resources.finish('B','Cancelled');
+  resources.request('C','流程 C：继续等 R1','independent-c',['job:C']).admit('C','Independent').start('C').activity('C','disk.work(C)','resource:R1',true);
+  resources.add('resource-wait-C','C 等待资源，A 仍等待 IO','业务队列为空并不意味着所有 Future 都在运行；此时 A/C 的 await 都还存在。',['context','locks'],[],()=>{},{actor:'C',gate:true});
+  resources.settle('A',false,'C');
+  resources.add('release-grant','Release(A-1) 的 pump 放行 C-1','LockTable.event 消费 Release 后同步 pump，向 C-1 的 oneshot 发 Permit。为教学拆开同一调用内的释放与授权；此处没有第二次 recv。',['locks','outcomes'],['permit'],s=>{s.received.decision='permit';},{actor:'C',gate:true,chapter:'Release → Permit'});
+  resources.dispatchActivity('C');
+  resources.finish('A');
+  resources.settle('C',true).finish('C','Uncertain');
+  // A new independent logical task is admitted, but its step touches the fenced resource.
+  resources.request('D','流程 D：触碰已隔离 R1','independent-d',['job:D']).admit('D','Independent').start('D');
+  resources.add('fenced-acquire','D 投递 Acquire(D-1)','逻辑对象 job:D 独立，但 Activity 的资源 R1 已隔离。业务准入不会绕过 LockTable。',['context','broker'],['acquire'],s=>{s.calls.D={command:'disk.work(D)',key:'resource:R1',service:'disk',phase:'acquiring',request:'D-1'};s.tasks.D.status='WaitingResources';s.events=['Acquire D-1 Activity Write resource:R1'];},{actor:'D'});
+  resources.add('fenced-reject','Acquire(D-1) 命中隔离：Rejected','返回错误，不发 Permit，不派发 Activity，也不扩大隔离范围。',['event-branch','locks'],['events','lock'],s=>{s.events=[];s.tasks.D.status='Settling';},{actor:'D',received:{type:'Acquire',request:'D-1',kind:'Activity',access:'resource:R1',mode:'Write',decision:'reject'},gate:true,chapter:'隔离拒绝'});
+  resources.finish('D','Rejected');all.push(resources.export());
 
   root.RuntimeScenarios=freeze(all);
 })(globalThis);

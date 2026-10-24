@@ -2,7 +2,7 @@
 (function(){
   "use strict";
   const scenarios=globalThis.RuntimeScenarios,$=id=>document.getElementById(id);
-  const colors={A:'#b59aff',B:'#71d9df',C:'#f5a6cb'};
+  const colors={A:'#2866b1',B:'#287c78',C:'#8054a1',D:'#a26628'};
   const routeNames={'select-events':'① 资源分支','resource-exit':'① None','workflow-exit':'② Some(id)',notify:'通知 None',submit:'提交',policy:'策略判断',defer:'登记 Task',poll:'poll',persist:'写入',accepted:'确认',start:'StartPermit',run:'推进',acquire:'Acquire',events:'消费事件',lock:'仲裁资源',permit:'Permit',wake:'Wake',dispatch:'派发',send:'Execute',execute:'执行',settle:'Guard 停稳',release:'Release',reply:'结果',observe:'终态',reap:'reap / pump',control:'控制请求',stop:'领域控制',checkpoint:'checkpoint','control-ack':'暂停确认','stop-ack':'停稳 ACK','user-control':'用户控制',restore:'恢复'};
   const details={
     caller:['业务调用方','PoolHandle 提交完整业务 Workflow。用户按同一个 TaskId 观察、暂停、恢复或取消；不能直接取得 StartPermit。'],
@@ -13,7 +13,9 @@
     notify:['wake.notified()','Controls 在请求或 ACK 改变时通知 Driver，使 tick 返回 None，让外层及时 pump。不同于 Permit / 服务回复的 Waker；普通 Waker 只让宿主再次 poll。'],
     futures:['Workflow Futures','FuturesUnordered 保存多个执行 Future。Waker 只标记就绪；再次 poll 才继续业务。整个 Workflow 完成时 running.next() 才返回任务 ID。'],
     context:['WorkflowContext','提供普通 Activity、wait_until_runnable、checkpoint 和控制机制。Workflow 定义 RunCondition；条件不满足保持 WaitingConditions，recheck 唤醒后重新检查。'],
-    broker:['Broker / 资源事件队列','图中合并展示发送端与 mpsc 队列：Broker 发 Acquire 并等待 Permit；Guard/Permit 的释放投递 Release。队列被 Driver 消费后才修改资源表。'],
+    broker:['Broker / mpsc<Event> 管道','Broker 封装发送端、请求编号和 Permit 的 oneshot 等待。Acquire/Release/Withdraw 经 mpsc 到 Driver 的 receiver，再交给 LockTable；Permit 经另一条 oneshot 回给 acquire。它不是执行宿主，也不直接改表。'],
+    'event-types':['事件分派','Event 只有 Acquire(Request)、Release { id, uncertain }、Withdraw(id)。Acquire 的 Kind 可以是 Workflow 或 Activity；Pool 的业务逻辑占用由 TaskCenter 管，图中资源事件使用 Kind::Activity。'],
+    outcomes:['LockTable.pump','Acquire 先入 waiting，再 pump。与 held 或更早请求冲突则保留等待；命中 fence 则返回 Rejected；可用则移入 held 并发送 Permit。Release/Withdraw 后也会 pump。'],
     locks:['LockTable','只由 Driver 修改的步骤资源表，负责读写许可、等待和隔离。与 TaskCenter 的完整 Workflow 逻辑占用分开；释放一个 Activity 不等于流程可以交接。'],
     client:['ActivityClient','普通类型化命令通道。请求携带 ActivityContext、取消 token 和 Guard。迁移与其他领域服务一样接入；调用通过 oneshot 等结果。'],
     mail:['服务邮箱','有界邮箱承载 Execute / Query。收到 Execute 后服务宿主登记执行 Future，不在邮箱读取分支阻塞等待整个领域动作。'],
@@ -22,10 +24,15 @@
     observe:['唯一 Task 观察模型','TaskSnapshot 合并状态、details、Activity 历史、conflicts 与 blockers。Run、Observer、SavedTask 是同一身份的句柄或表示；watch 可合并通知。'],
     store:['TaskStore / Journal','Workflow 决定是否 Durable。初始记录确认后才启动或抢占。TaskStore 以 owner_epoch 和 revision 防旧主写入；不替代数据面 fencing，也不提供确定性重放。']
   };
+  for(const domain of ['tier','node','disk','vd','balance']){
+    details['service-'+domain]=[domain+' ServiceHost · 独立 Tokio task','该宿主接收邮箱消息并轮询自己的 Activity Futures。领域操作 Pending 时，Future 保留在宿主中；宿主可继续处理其他就绪消息。结果 oneshot 唤醒 TaskCenter 内的原 Workflow。'];
+    for(const base of ['send','execute','reply','release','settle','stop','stop-ack'])routeNames[base+'-'+domain]=routeNames[base];
+  }
+  routeNames.arbitrate='table.pump';routeNames.wait='保留 waiting';routeNames.reject='Rejected';routeNames.withdraw='Withdraw';
   let scenario=scenarios[0],cursor=0,playing=false,motion=null,raf=0,last=null,selected=null,zoom=false;
   const reduced=matchMedia('(prefers-reduced-motion: reduce)');
   const nodes=[...document.querySelectorAll('[data-node]')],routes=[...document.querySelectorAll('[data-route]')];
-  const groups=[['normal','完整请求'],['fifo','互斥排队'],['yield','topo 抢占'],['cancel','取消交接'],['uncertain','不确定隔离'],['recovery','切主续跑'],['cycle','三任务等待环']];
+  const groups=[['normal','完整请求'],['fifo','互斥排队'],['yield','topo 抢占'],['cancel','取消交接'],['uncertain','不确定隔离'],['recovery','切主续跑'],['cycle','三任务等待环'],['resources','资源事件与等待']];
   const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
   const current=()=>scenario.frames[cursor];
   function chips(id,items,cls=''){const box=$(id);box.replaceChildren();if(!items.length){box.append(el('span','无','empty'));return}for(const item of items){const token=el('span',undefined,'token '+cls);token.append(el('b',item[0]),el('span',item[1]));box.append(token)}}
@@ -39,14 +46,53 @@
     if(!changes.length)changes.push(['执行事件','',frame.title]);
     for(const [name,old,next]of changes.slice(0,4)){const n=el('div',undefined,'delta-row');n.append(el('span',name+'  '+(old?old+' → ':'')),el('strong',next));$('delta').append(n)}
   }
+  function showWaits(state){
+    const waits=state.awaits||[];
+    $('await-list').replaceChildren();
+    if(!waits.length)$('await-list').append(el('p','当前没有已登记的异步等待点。','empty'));
+    for(const wait of waits){
+      const row=el('div',undefined,'await-row');
+      row.dataset.task=wait.task;row.dataset.node=wait.node;
+      row.append(el('b',wait.task+' · '+wait.host),el('code',wait.at),el('small',wait.reason));
+      $('await-list').append(row);
+    }
+    nodes.forEach(n=>{
+      const matches=waits.filter(w=>w.node===n.dataset.node||(n.dataset.node==='futures'&&w.host==='TaskCenter Tokio task'));
+      n.classList.toggle('awaiting',matches.length>0);
+      const label=$('await-'+n.dataset.node);
+      if(label)label.textContent=matches.length?'⏸ '+[...new Set(matches.map(w=>w.task))].join(' / ')+' · Pending':'';
+    });
+    const taskIds=[...new Set(waits.filter(w=>w.host==='TaskCenter Tokio task').map(w=>w.task))];
+    $('host-taskcenter').textContent=taskIds.length?'保留 '+taskIds.join(' / ')+' 的 Pending Future':'当前无 Pending Workflow';
+    document.querySelector('[data-host=taskcenter]').classList.toggle('has-awaits',taskIds.length>0);
+    $('host-summary').textContent=taskIds.length?'等待者 '+taskIds.join(' / ')+' 仍由 TaskCenter 推进；宿主可处理其他就绪分支':'没有 Pending Workflow；TaskCenter 仍可接收请求';
+    const cap=value=>value.length>29?value.slice(0,28)+'…':value;
+    $('table-held').textContent=cap('held: '+(state.resources.filter(r=>r.state==='Held').map(r=>r.task+' '+r.key).join(' / ')||'—'));
+    $('table-waiting').textContent=cap('waiting: '+(state.resourceWaiters.map(r=>r.request).join(' / ')||'—'));
+    $('table-fences').textContent=cap('fences: '+(state.resources.filter(r=>r.state==='Fenced').map(r=>r.key).join(' / ')||'—'));
+  }
+  function showReceived(frame){
+    const event=frame.state.received;
+    $('received-title').textContent=frame.tick.branch==='events'?'本帧 events.recv() 收到':'最近收到的资源事件';
+    $('received-payload').textContent=event?'Event::'+event.type+' · req '+event.request:'尚未收到 Event';
+    $('received-detail').textContent=event?event.kind+' · '+event.mode+' '+event.access+(event.type==='Release'?' · uncertain='+(event.decision==='fence'):''):'业务 Submission 走上方 TaskCenter 入口，不经过这里';
+    $('receiver-event').textContent=event?event.type+' · req '+event.request:'尚未收到 Event';
+    $('receiver-payload').textContent=event?(event.type==='Release'?'uncertain='+String(event.decision==='fence'):event.type==='Withdraw'?'移除 waiting；不释放 held':(event.kind+' / '+event.mode+' '+event.access).slice(0,32)):'等待资源消息';
+    const decisions={permit:'无冲突 → held + Permit',wait:'冲突 → 保留 waiting，不发 Permit',reject:'命中隔离 → 返回 Rejected',release:'回收 held，再 pump',withdraw:'移除 waiting，再 pump',fence:'不确定结果 → 保留 fence'};
+    $('received-result').textContent=event?(decisions[event.decision]||event.decision)+(event.granted?'；本次放行 '+event.granted:''):'';
+    document.querySelectorAll('[data-event-type]').forEach(n=>n.classList.toggle('chosen',n.dataset.eventType===event?.type));
+    document.querySelectorAll('[data-outcome]').forEach(n=>n.classList.toggle('chosen',n.dataset.outcome===event?.decision||(n.dataset.outcome==='permit'&&!!event?.granted)));
+  }
   function graph(frame){
+    showWaits(current().state);showReceived(frame);
+
     document.querySelectorAll('[data-tick]').forEach(n=>n.classList.toggle('current',n.dataset.tick===frame.tick.branch));
     $('tick-result').textContent=frame.tick.result;
     $('tick-strip').dataset.branch=frame.tick.branch;
     const waitGraph=current().state.waitGraph;
     $('wait-graph').hidden=!waitGraph;
     if(waitGraph){$('wait-graph').dataset.kind=waitGraph.kind;$('wait-chain').textContent=waitGraph.text;$('wait-note').textContent=waitGraph.note;}
-const actor=colors[frame.actor]||colors.A;document.body.style.setProperty('--actor',actor);nodes.forEach(n=>{n.classList.toggle('active',frame.nodes.includes(n.dataset.node)||selected===n.dataset.node||({events:'event-branch',running:'futures',notify:'notify'}[frame.tick.branch]===n.dataset.node));n.classList.toggle('waiting',n.dataset.node==='state'&&current().state.queue.length>0);n.classList.toggle('fenced',n.dataset.node==='locks'&&current().state.fences.length>0)});routes.forEach(r=>{r.classList.toggle('active',frame.routes.includes(r.dataset.route)||(frame.tick.branch==='events'&&r.dataset.route==='select-events'));r.style.setProperty('--route-color',/permit|ack|wake/.test(r.dataset.route)?'#d7ff83':/stop|control/.test(r.dataset.route)?'#e9b56f':actor)})}
+const actor=colors[frame.actor]||colors.A;document.body.style.setProperty('--actor',actor);nodes.forEach(n=>{n.classList.toggle('active',frame.nodes.includes(n.dataset.node)||selected===n.dataset.node||({events:'event-branch',running:'futures',notify:'notify'}[frame.tick.branch]===n.dataset.node));n.classList.toggle('waiting',n.dataset.node==='state'&&current().state.queue.length>0);n.classList.toggle('fenced',n.dataset.node==='locks'&&current().state.fences.length>0)});routes.forEach(r=>{const domain=r.dataset.route.match(/-(tier|node|disk|vd|balance)$/)?.[1];const known=Object.values(current().state.calls).some(c=>c.service===domain);r.classList.toggle('irrelevant',!frame.routes.includes(r.dataset.route)&&(domain?!known:['send','execute','reply','release','settle','stop','stop-ack'].includes(r.dataset.route)));r.classList.toggle('active',frame.routes.includes(r.dataset.route)||(frame.tick.branch==='events'&&r.dataset.route==='select-events'));r.style.setProperty('--route-color',/permit|ack|wake/.test(r.dataset.route)?'#238077':/stop|control/.test(r.dataset.route)?'#a46b24':actor)})}
   function render(){const f=current(),s=f.state;$('event-counter').textContent=String(cursor).padStart(2,'0')+' / '+String(scenario.frames.length-1).padStart(2,'0');$('event-kind').textContent='已完成事件';$('event-title').textContent=f.title;$('event-why').textContent=f.why;$('motion-state').textContent=playing?'继续推进下一事件':'已停在：'+f.title;$('timeline').value=cursor;$('position').textContent=cursor+' / '+(scenario.frames.length-1);$('back-step').disabled=cursor===0&&!motion;$('next-step').disabled=cursor===scenario.frames.length-1;$('gate').hidden=!(f.gate&&!playing&&!motion);$('gate-text').textContent='下一步：'+(scenario.frames[cursor+1]?.title||'场景结束，可重播或切换场景');$('future').textContent=s.futureTask+' · '+s.future;$('service').textContent=s.service;$('resource-events').textContent=s.events.join(' / ')||'空';$('guard').textContent=s.guard;$('store').textContent=s.store;$('decision-badge').textContent=s.decision;
     tasks(s);chips('business-queue',s.queue.map(id=>[id,'等待 '+(s.tasks[id].blockers.join('、')||'启动许可')]));chips('owners',s.owners.map(o=>[o.task,o.objects.join(' · ')]));chips('resources',s.resources.map(r=>[r.task,r.key+' · '+r.state]),'resource');chips('fences',s.fences.map(f=>[f.task,f.objects.join(' · ')]),'danger');delta(f);graph(f);
     const chapters=[...$('chapters').children];let active=-1;chapters.forEach((b,i)=>{if(+b.dataset.frame<=cursor)active=i});chapters.forEach((b,i)=>b.classList.toggle('active',i===active));$('play').textContent=playing?'Ⅱ 暂停播放':cursor===scenario.frames.length-1?'↺ 重新播放':cursor===0?'▶ 开始演示':'▶ 继续播放';
@@ -54,7 +100,7 @@ const actor=colors[frame.actor]||colors.A;document.body.style.setProperty('--act
   function stop(){playing=false;last=null;cancelAnimationFrame(raf);render();if(motion){showTransit();drawPacket()}}
   function seek(n){playing=false;cancelAnimationFrame(raf);motion=null;last=null;cursor=Math.max(0,Math.min(scenario.frames.length-1,n));document.body.dataset.moving='false';render()}
   function showTransit(){const f=scenario.frames[motion.index];$('event-kind').textContent=playing?'传递中 · 下方仍为上一状态':'动画暂停 · 消息位置保留';$('event-title').textContent=f.title;$('event-why').textContent=f.why;$('motion-state').textContent=(playing?'正在传递：':'已暂停：')+f.title;graph(f);$('gate').hidden=true}
-  function drawPacket(){if(!motion)return;const f=scenario.frames[motion.index],list=f.routes;if(!list.length||reduced.matches){document.body.dataset.moving='false';return}document.body.dataset.moving='true';const progress=Math.min(.9999,motion.elapsed/motion.duration),slot=progress*list.length,key=list[Math.floor(slot)],path=$('route-'+key),p=path.getPointAtLength(path.getTotalLength()*(slot%1));$('packet').setAttribute('transform',`translate(${p.x},${p.y})`);$('packet-label').setAttribute('transform',`translate(${Math.max(5,Math.min(1145,p.x+15))},${Math.max(5,p.y-31)})`);$('packet-text').textContent=f.actor+' · '+routeNames[key];document.body.style.setProperty('--packet-color',/permit|ack|wake/.test(key)?'#d7ff83':/stop|control/.test(key)?'#e9b56f':colors[f.actor])}
+  function drawPacket(){if(!motion)return;const f=scenario.frames[motion.index],list=f.routes;if(!list.length||reduced.matches){document.body.dataset.moving='false';return}document.body.dataset.moving='true';const progress=Math.min(.9999,motion.elapsed/motion.duration),slot=progress*list.length,key=list[Math.floor(slot)],path=$('route-'+key),p=path.getPointAtLength(path.getTotalLength()*(slot%1));$('packet').setAttribute('transform',`translate(${p.x},${p.y})`);$('packet-label').setAttribute('transform',`translate(${Math.max(5,Math.min(1310,p.x+15))},${Math.max(5,p.y-31)})`);$('packet-text').textContent=f.actor+' · '+(key==='events'&&f.state.received?f.state.received.type+' '+f.state.received.request:routeNames[key]);document.body.style.setProperty('--packet-color',/permit|ack|wake/.test(key)?'#238077':/stop|control/.test(key)?'#a46b24':colors[f.actor])}
   function tick(now){if(!playing)return;if(last===null)last=now;const dt=Math.min(now-last,200)*Number($('speed').value);last=now;
     if(!motion){if(cursor>=scenario.frames.length-1){stop();return}const f=scenario.frames[cursor+1];motion={index:cursor+1,elapsed:0,duration:f.duration*Math.max(1,f.routes.length*.55)};showTransit()}
     motion.elapsed+=dt;drawPacket();if(motion.elapsed>=motion.duration){cursor=motion.index;motion=null;document.body.dataset.moving='false';render();if((current().gate&&$('auto-explain').checked)||cursor===scenario.frames.length-1){stop();return}}

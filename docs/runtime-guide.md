@@ -21,6 +21,9 @@
 
 ## 2. 实际执行：一次 Activity 如何推进和返回
 
+动态图已将两个工作分支上下排列，并持续标出 Pending Future 的宿主、具体资源事件和锁表分派；
+见 [等待现场说明](changes/2026-10-24-runtime-awaits.md)。静态图用于概览职责。
+
 ![运行闭环](diagrams/unified-task-guide/02-runtime.png)
 
 TaskCenter 的循环处理提交、关闭、提交确认回执和 driver.tick()。Driver 同时轮询 Workflow

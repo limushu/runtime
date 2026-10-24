@@ -3,145 +3,263 @@
 <section class="hero"><div><div class="eyebrow">FOLLOW THE REQUEST. UNDERSTAND THE SYSTEM.</div><h1>看见请求，<span>如何被推进。</span></h1><p>从提交到准入，从排队到停稳。沿着一条消息，读懂整个运行过程。</p></div><div class="hero-note"><strong>一个 Task，多条协作链。</strong><span>基于实现 53fae88 · 播放速度不代表真实耗时</span><span>不是监控数据，也不执行真实存储动作</span></div></section>
 <nav id="scenarios" aria-label="选择运行场景"></nav>
 <div class="scenario-bar"><div><span id="scenario-number">01</span><strong id="scenario-title"></strong><p id="scenario-description"></p></div><label id="mode-control" hidden>迁移暂停契约<select id="pause-mode"><option value="retain">保留原 await</option><option value="return" selected>停稳后返回部分结果</option></select></label></div>
-<main><div class="stage-column"><section class="stage"><div class="stage-top"><span><i class="legend-dot a"></i>任务 A <i class="legend-dot b"></i>任务 B <i class="legend-dot c"></i>任务 C <i class="legend-dot ack"></i>许可 / ACK</span><button id="focus-mode" class="text-button" aria-pressed="false">专注运行</button><button id="fit-diagram" class="text-button">放大阅读</button></div><section id="tick-strip" aria-label="Driver 分支现场"><div class="tick-options"><span data-tick="events"><b>① 资源事件</b><code>events.recv()</code><small>处理一条事件 → None</small></span><span data-tick="running"><b>② 工作流轮询</b><code>running.next()</code><small>Pending 等待；整体结束 → Some(id)</small></span><span data-tick="notify"><b>通知支路</b><code>wake.notified()</code><small>控制 / ACK 变化 → None</small></span></div><p id="tick-result" aria-live="polite"></p></section><div id="canvas-scroll"><svg id="architecture" viewBox="0 0 1280 980" role="img" aria-labelledby="graph-title graph-desc">
-<title id="graph-title">Driver tick 的资源事件与工作流轮询分支</title>
-<desc id="graph-desc">同一个 TaskCenter 宿主，tick 使用 biased select。资源事件分支返回 None；工作流分支在 Pending 时继续等待，只有整体结束返回 Some(TaskId)。通知分支另行让外层重算。</desc>
-<defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".8" fill="#313447"/></pattern><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker></defs>
-<rect width="1280" height="980" fill="url(#grid)"/>
-<rect class="boundary" x="200" y="82" width="735" height="835" rx="18"/>
-<text class="boundary-label" x="220" y="44">TASKCENTER / 每池一个 Tokio task</text>
-<rect class="driver-boundary" x="230" y="235" width="673" height="545" rx="12"/>
-<text class="boundary-label small" x="245" y="225">WORKFLOW DRIVER / 同一宿主内的两个工作分支</text>
-<rect class="service-boundary" x="975" y="350" width="280" height="365" rx="12"/>
-<text class="boundary-label small" x="990" y="335">领域服务 / 独立 Tokio task</text>
-<text class="boundary-label small" x="995" y="698">Disk / Node / Tier / VD / Balance</text>
+<main><div class="stage-column"><section class="stage"><div class="stage-top"><span><i class="legend-dot a"></i>任务 A <i class="legend-dot b"></i>任务 B <i class="legend-dot c"></i>任务 C <i class="legend-dot ack"></i>许可 / ACK <i class="legend-dot d"></i>任务 D</span><button id="focus-mode" class="text-button" aria-pressed="false">专注运行</button><button id="fit-diagram" class="text-button">放大阅读</button></div><section id="tick-strip" aria-label="Driver 分支现场"><div class="tick-options"><span data-tick="events"><b>① 资源事件</b><code>events.recv()</code><small>处理一条事件 → None</small></span><span data-tick="running"><b>② 工作流轮询</b><code>running.next()</code><small>Pending 等待；整体结束 → Some(id)</small></span><span data-tick="notify"><b>通知支路</b><code>wake.notified()</code><small>控制 / ACK 变化 → None</small></span></div><p id="tick-result" aria-live="polite"></p></section><div id="host-summary" class="host-summary"></div><div id="canvas-scroll"><svg id="architecture" viewBox="0 0 1500 940" role="img" aria-labelledby="graph-title graph-desc">
+<title id="graph-title">异步执行现场：宿主、等待点与资源事件</title>
+<desc id="graph-desc">TaskCenter 宿主内，running.next 在上，events.recv 在下。Broker 和 mpsc 是管道；LockTable 是状态表。各领域服务分别拥有独立 Tokio task。琥珀色虚线持续标出 Pending Future，蓝色表示本帧推进。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker></defs>
+<rect width="1500" height="940" fill="#ffffff"/>
+<rect class="host-boundary" data-host="taskcenter" x="205" y="65" width="1000" height="810" rx="16"/>
+<text class="boundary-label" x="225" y="45">TaskCenter · 一个 Tokio task</text>
+<text class="host-status" id="host-taskcenter" x="1185" y="45" text-anchor="end">等待提交</text>
+<rect class="driver-boundary" x="230" y="230" width="950" height="620" rx="10"/>
+<text class="boundary-label small" x="250" y="220">WorkflowDriver · 嵌入 TaskCenter，无独立宿主</text>
+<text class="boundary-label small" x="1250" y="45">领域服务 · 各自独立 Tokio task</text>
 
 <g id="routes">
-<path id="route-submit" class="route" data-route="submit" d="M180 155H240" marker-end="url(#arrow)"/>
-<path id="route-policy" class="route" data-route="policy" d="M520 155H590" marker-end="url(#arrow)"/>
-<path id="route-defer" class="route" data-route="defer" d="M380 205V255" marker-end="url(#arrow)"/>
-<path id="route-select-events" class="route" data-route="select-events" d="M375 330V365" marker-end="url(#arrow)"/>
-<path id="route-poll" class="route" data-route="poll" d="M740 330V365" marker-end="url(#arrow)"/>
-<path id="route-persist" class="route" data-route="persist" d="M880 400H950V70H1120V105" marker-end="url(#arrow)"/>
-<path id="route-accepted" class="route" data-route="accepted" d="M985 145H940V60H380V105" marker-end="url(#arrow)"/>
-<path id="route-start" class="route" data-route="start" d="M520 180H920V345H820V365" marker-end="url(#arrow)"/>
-<path id="route-run" class="route" data-route="run" d="M715 455V505" marker-end="url(#arrow)"/>
-<path id="route-acquire" class="route" data-route="acquire" d="M600 550H505" marker-end="url(#arrow)"/>
-<path id="route-events" class="route" data-route="events" d="M375 505V455" marker-end="url(#arrow)"/>
-<path id="route-lock" class="route" data-route="lock" d="M245 410H220V695H245" marker-end="url(#arrow)"/>
-<path id="route-permit" class="route" data-route="permit" d="M505 695H560V570H600" marker-end="url(#arrow)"/>
-<path id="route-wake" class="route" data-route="wake" d="M795 505V455" marker-end="url(#arrow)"/>
-<path id="route-dispatch" class="route" data-route="dispatch" d="M740 595V650" marker-end="url(#arrow)"/>
-<path id="route-send" class="route" data-route="send" d="M880 695H950V445H1000" marker-end="url(#arrow)"/>
-<path id="route-execute" class="route" data-route="execute" d="M1118 490V550" marker-end="url(#arrow)"/>
-<path id="route-settle" class="route" data-route="settle" d="M1235 615H1260V935H375V885" marker-end="url(#arrow)"/>
-<path id="route-release" class="route" data-route="release" d="M1000 630H960V760H525V570H505" marker-end="url(#arrow)"/>
-<path id="route-reply" class="route" data-route="reply" d="M1000 585H940V350H860V365" marker-end="url(#arrow)"/>
-<path id="route-observe" class="route" data-route="observe" d="M505 842H600" marker-end="url(#arrow)"/>
-<path id="route-reap" class="route" data-route="reap" d="M245 290H205V225H300V205" marker-end="url(#arrow)"/>
-<path id="route-control" class="route" data-route="control" d="M520 185H575V525H600" marker-end="url(#arrow)"/>
-<path id="route-stop" class="route" data-route="stop" d="M880 545H1000" marker-end="url(#arrow)"/>
-<path id="route-checkpoint" class="route" data-route="checkpoint" d="M880 525H920V225H1120V205" marker-end="url(#arrow)"/>
-<path id="route-control-ack" class="route" data-route="control-ack" d="M600 575H580V350H100V345" marker-end="url(#arrow)"/>
-<path id="route-stop-ack" class="route" data-route="stop-ack" d="M1000 615H910V580H880" marker-end="url(#arrow)"/>
-<path id="route-user-control" class="route" data-route="user-control" d="M100 205V950H910V570H880" marker-end="url(#arrow)"/>
-<path id="route-restore" class="route" data-route="restore" d="M1120 205V240H890V410H880" marker-end="url(#arrow)"/>
-<path id="route-notify" class="route" data-route="notify" d="M180 290H245" marker-end="url(#arrow)"/>
-<path id="route-resource-exit" class="route" data-route="resource-exit" d="M505 385H540V330" marker-end="url(#arrow)"/>
-<path id="route-workflow-exit" class="route" data-route="workflow-exit" d="M600 385H570V330" marker-end="url(#arrow)"/>
+<path id="route-submit" class="route" data-route="submit" d="M180 155H245" marker-end="url(#arrow)"/>
+<path id="route-policy" class="route" data-route="policy" d="M645 155H690" marker-end="url(#arrow)"/>
+<path id="route-defer" class="route" data-route="defer" d="M445 205V220H530V260" marker-end="url(#arrow)"/>
+<path id="route-select-events" class="route" data-route="select-events" d="M430 540H465" marker-end="url(#arrow)"/>
+<path id="route-poll" class="route" data-route="poll" d="M430 305H465" marker-end="url(#arrow)"/>
+<path id="route-persist" class="route" data-route="persist" d="M755 280H780V80H1240V105" marker-end="url(#arrow)"/>
+<path id="route-accepted" class="route" data-route="accepted" d="M1240 120H1220V60H445V105" marker-end="url(#arrow)"/>
+<path id="route-start" class="route" data-route="start" d="M615 205V260" marker-end="url(#arrow)"/>
+<path id="route-run" class="route" data-route="run" d="M755 310H800" marker-end="url(#arrow)"/>
+<path id="route-acquire" class="route" data-route="acquire" d="M1130 325H1160V520H1130" marker-end="url(#arrow)"/>
+<path id="route-events" class="route" data-route="events" d="M800 520H755" marker-end="url(#arrow)"/>
+<path id="route-lock" class="route" data-route="lock" d="M610 590V630" marker-end="url(#arrow)"/>
+<path id="route-arbitrate" class="route" data-route="arbitrate" d="M755 665H800" marker-end="url(#arrow)"/>
+<path id="route-permit" class="route" data-route="permit" d="M800 730H775V365H970V350" marker-end="url(#arrow)"/>
+<path id="route-wake" class="route" data-route="wake" d="M800 285H755" marker-end="url(#arrow)"/>
+<path id="route-dispatch" class="route" data-route="dispatch" d="M970 350V390" marker-end="url(#arrow)"/>
+<path id="route-observe" class="route" data-route="observe" d="M1240 825H1185V905H680" marker-end="url(#arrow)"/>
+<path id="route-reap" class="route" data-route="reap" d="M245 310H220V220H350V205" marker-end="url(#arrow)"/>
+<path id="route-control" class="route" data-route="control" d="M645 185H790V330H800" marker-end="url(#arrow)"/>
+<path id="route-checkpoint" class="route" data-route="checkpoint" d="M1130 280H1210V120H1240" marker-end="url(#arrow)"/>
+<path id="route-control-ack" class="route" data-route="control-ack" d="M800 330H785V815H430" marker-end="url(#arrow)"/>
+<path id="route-user-control" class="route" data-route="user-control" d="M100 205V915H1190V330H1130" marker-end="url(#arrow)"/>
+<path id="route-restore" class="route" data-route="restore" d="M1240 145H1215V245H725V260" marker-end="url(#arrow)"/>
+<path id="route-notify" class="route" data-route="notify" d="M335 780V755" marker-end="url(#arrow)"/>
+<path id="route-resource-exit" class="route" data-route="resource-exit" d="M465 565H450V725H430" marker-end="url(#arrow)"/>
+<path id="route-workflow-exit" class="route" data-route="workflow-exit" d="M465 330H430" marker-end="url(#arrow)"/>
+<path id="route-wait" class="route" data-route="wait" d="M800 760H755" marker-end="url(#arrow)"/>
+<path id="route-reject" class="route" data-route="reject" d="M800 805H775V815H755" marker-end="url(#arrow)"/>
+<path id="route-withdraw" class="route" data-route="withdraw" d="M1130 335H1160V520H1130" marker-end="url(#arrow)"/>
+<path id="route-send-tier" class="route" data-route="send-tier" d="M1130 425H1220V225H1260" marker-end="url(#arrow)"/>
+<path id="route-execute-tier" class="route" data-route="execute-tier" d="M1370 225V263" marker-end="url(#arrow)"/>
+<path id="route-reply-tier" class="route" data-route="reply-tier" d="M1260 268H1215V250H1090V260" marker-end="url(#arrow)"/>
+<path id="route-release-tier" class="route" data-route="release-tier" d="M1260 276H1195V540H1130" marker-end="url(#arrow)"/>
+<path id="route-settle-tier" class="route" data-route="settle-tier" d="M1480 265H1490V825H1480" marker-end="url(#arrow)"/>
+<path id="route-stop-tier" class="route" data-route="stop-tier" d="M1130 330H1205V250H1260" marker-end="url(#arrow)"/>
+<path id="route-stop-ack-tier" class="route" data-route="stop-ack-tier" d="M1260 258H1200V340H1130" marker-end="url(#arrow)"/>
+<path id="route-send-node" class="route" data-route="send-node" d="M1130 425H1220V340H1260" marker-end="url(#arrow)"/>
+<path id="route-execute-node" class="route" data-route="execute-node" d="M1370 340V378" marker-end="url(#arrow)"/>
+<path id="route-reply-node" class="route" data-route="reply-node" d="M1260 383H1215V250H1090V260" marker-end="url(#arrow)"/>
+<path id="route-release-node" class="route" data-route="release-node" d="M1260 391H1195V540H1130" marker-end="url(#arrow)"/>
+<path id="route-settle-node" class="route" data-route="settle-node" d="M1480 380H1490V825H1480" marker-end="url(#arrow)"/>
+<path id="route-stop-node" class="route" data-route="stop-node" d="M1130 330H1205V365H1260" marker-end="url(#arrow)"/>
+<path id="route-stop-ack-node" class="route" data-route="stop-ack-node" d="M1260 373H1200V340H1130" marker-end="url(#arrow)"/>
+<path id="route-send-disk" class="route" data-route="send-disk" d="M1130 425H1220V455H1260" marker-end="url(#arrow)"/>
+<path id="route-execute-disk" class="route" data-route="execute-disk" d="M1370 455V493" marker-end="url(#arrow)"/>
+<path id="route-reply-disk" class="route" data-route="reply-disk" d="M1260 498H1215V250H1090V260" marker-end="url(#arrow)"/>
+<path id="route-release-disk" class="route" data-route="release-disk" d="M1260 506H1195V540H1130" marker-end="url(#arrow)"/>
+<path id="route-settle-disk" class="route" data-route="settle-disk" d="M1480 495H1490V825H1480" marker-end="url(#arrow)"/>
+<path id="route-stop-disk" class="route" data-route="stop-disk" d="M1130 330H1205V480H1260" marker-end="url(#arrow)"/>
+<path id="route-stop-ack-disk" class="route" data-route="stop-ack-disk" d="M1260 488H1200V340H1130" marker-end="url(#arrow)"/>
+<path id="route-send-vd" class="route" data-route="send-vd" d="M1130 425H1220V570H1260" marker-end="url(#arrow)"/>
+<path id="route-execute-vd" class="route" data-route="execute-vd" d="M1370 570V608" marker-end="url(#arrow)"/>
+<path id="route-reply-vd" class="route" data-route="reply-vd" d="M1260 613H1215V250H1090V260" marker-end="url(#arrow)"/>
+<path id="route-release-vd" class="route" data-route="release-vd" d="M1260 621H1195V540H1130" marker-end="url(#arrow)"/>
+<path id="route-settle-vd" class="route" data-route="settle-vd" d="M1480 610H1490V825H1480" marker-end="url(#arrow)"/>
+<path id="route-stop-vd" class="route" data-route="stop-vd" d="M1130 330H1205V595H1260" marker-end="url(#arrow)"/>
+<path id="route-stop-ack-vd" class="route" data-route="stop-ack-vd" d="M1260 603H1200V340H1130" marker-end="url(#arrow)"/>
+<path id="route-send-balance" class="route" data-route="send-balance" d="M1130 425H1220V685H1260" marker-end="url(#arrow)"/>
+<path id="route-execute-balance" class="route" data-route="execute-balance" d="M1370 685V723" marker-end="url(#arrow)"/>
+<path id="route-reply-balance" class="route" data-route="reply-balance" d="M1260 728H1215V250H1090V260" marker-end="url(#arrow)"/>
+<path id="route-release-balance" class="route" data-route="release-balance" d="M1260 736H1195V540H1130" marker-end="url(#arrow)"/>
+<path id="route-settle-balance" class="route" data-route="settle-balance" d="M1480 725H1490V825H1480" marker-end="url(#arrow)"/>
+<path id="route-stop-balance" class="route" data-route="stop-balance" d="M1130 330H1205V710H1260" marker-end="url(#arrow)"/>
+<path id="route-stop-ack-balance" class="route" data-route="stop-ack-balance" d="M1260 718H1200V340H1130" marker-end="url(#arrow)"/>
+<path id="route-send" class="route" data-route="send" d="M1130 425H1220V455H1260" marker-end="url(#arrow)"/>
+<path id="route-execute" class="route" data-route="execute" d="M1370 455V493" marker-end="url(#arrow)"/>
+<path id="route-reply" class="route" data-route="reply" d="M1260 498H1215V250H1090V260" marker-end="url(#arrow)"/>
+<path id="route-release" class="route" data-route="release" d="M1260 506H1195V540H1130" marker-end="url(#arrow)"/>
+<path id="route-settle" class="route" data-route="settle" d="M1480 495H1490V825H1480" marker-end="url(#arrow)"/>
+<path id="route-stop" class="route" data-route="stop" d="M1130 330H1205V480H1260" marker-end="url(#arrow)"/>
+<path id="route-stop-ack" class="route" data-route="stop-ack" d="M1260 488H1200V340H1130" marker-end="url(#arrow)"/>
 </g>
-<g id="node-caller" class="component" data-node="caller" role="button" tabindex="0" aria-label="业务调用方">
-<rect class="node-card" x="20" y="105" width="160" height="100" rx="9"/><rect class="node-accent" x="20" y="120" width="3" height="70" rx="1"/>
-<text class="node-title" x="35" y="132">业务调用方</text>
-<text class="node-line" x="35" y="155">PoolHandle</text>
-<text class="node-line" x="35" y="175">提交 / 用户控制</text>
+<g id="node-caller" class="component kind-object" data-node="caller" data-kind="object" role="button" tabindex="0" aria-label="PoolHandle">
+<rect class="node-card" x="20" y="105" width="160" height="100" rx="10"/>
+<text class="node-title" x="40" y="133">PoolHandle</text>
+<text class="node-line" x="40" y="158">业务请求</text>
+<text class="node-line" x="40" y="180">提交 / 用户控制</text>
+<rect class="await-ring" x="16" y="101" width="168" height="108" rx="13"/>
 </g>
-<g id="node-state" class="component" data-node="state" role="button" tabindex="0" aria-label="TaskCenter / State">
-<rect class="node-card" x="240" y="105" width="280" height="100" rx="9"/><rect class="node-accent" x="240" y="120" width="3" height="70" rx="1"/>
-<text class="node-title" x="255" y="132">TaskCenter / State</text>
-<text class="node-line" x="255" y="155">reap → pump → 外层 select</text>
-<text class="node-line" x="255" y="175">队列 / 逻辑占用 / StartPermit</text>
+<g id="node-state" class="component kind-object" data-node="state" data-kind="object" role="button" tabindex="0" aria-label="State · 应用协调">
+<rect class="node-card" x="245" y="105" width="400" height="100" rx="10"/>
+<text class="node-title" x="265" y="133">State · 应用协调</text>
+<text class="node-line" x="265" y="158">reap / pump / 外层 select</text>
+<text class="node-line" x="265" y="180">业务准入、排队与逻辑占用</text>
+<rect class="await-ring" x="241" y="101" width="408" height="108" rx="13"/>
 </g>
-<g id="node-policy" class="component" data-node="policy" role="button" tabindex="0" aria-label="SchedulingPolicy">
-<rect class="node-card" x="590" y="105" width="290" height="100" rx="9"/><rect class="node-accent" x="590" y="120" width="3" height="70" rx="1"/>
-<text class="node-title" x="605" y="132">SchedulingPolicy</text>
-<text class="node-line" x="605" y="155">admission / relation / priority</text>
-<text class="node-line" x="605" y="175">topo &gt; 其他 &gt; shrink；同级 FIFO</text>
+<g id="node-policy" class="component kind-object" data-node="policy" data-kind="object" role="button" tabindex="0" aria-label="SchedulingPolicy">
+<rect class="node-card" x="690" y="105" width="310" height="100" rx="10"/>
+<text class="node-title" x="710" y="133">SchedulingPolicy</text>
+<text class="node-line" x="710" y="158">admission / relation / priority</text>
+<text class="node-line" x="710" y="180">由应用定义业务关系</text>
+<rect class="await-ring" x="686" y="101" width="318" height="108" rx="13"/>
 </g>
-<g id="node-store" class="component" data-node="store" role="button" tabindex="0" aria-label="TaskStore">
-<rect class="node-card" x="985" y="105" width="270" height="100" rx="9"/><rect class="node-accent" x="985" y="120" width="3" height="70" rx="1"/>
-<text class="node-title" x="1000" y="132">TaskStore</text>
-<text class="node-line" x="1000" y="155">Journal · blocking IO</text>
-<text class="node-line" x="1000" y="175">epoch / revision 校验</text>
+<g id="node-store" class="component kind-table" data-node="store" data-kind="table" role="button" tabindex="0" aria-label="TaskStore">
+<rect class="node-card" x="1240" y="75" width="240" height="90" rx="10"/>
+<path class="table-rule" d="M1240 122H1480"/>
+<path class="table-rule" d="M1240 157H1480"/>
+<text class="node-title" x="1260" y="103">TaskStore</text>
+<text class="node-line" x="1260" y="128">epoch / revision CAS</text>
+<rect class="await-ring" x="1236" y="71" width="248" height="98" rx="13"/>
 </g>
-<g id="node-driver" class="component" data-node="driver" role="button" tabindex="0" aria-label="WorkflowDriver.tick() · tokio::select! { biased; … }">
-<rect class="node-card" x="245" y="255" width="635" height="75" rx="9"/><rect class="node-accent" x="245" y="270" width="3" height="45" rx="1"/>
-<text class="node-title" x="260" y="282">WorkflowDriver.tick() · tokio::select! { biased; … }</text>
-<text class="node-line" x="260" y="305">检查顺序：通知 → 资源 → 工作流；一支就绪才返回外层</text>
+<g id="node-driver" class="component kind-selector" data-node="driver" data-kind="selector" role="button" tabindex="0" aria-label="tick() / select!">
+<rect class="node-card" x="245" y="260" width="185" height="495" rx="10"/>
+<text class="node-title" x="265" y="288">tick() / select!</text>
+<text class="node-line" x="265" y="313">同一个宿主内</text>
+<text class="node-line" x="265" y="335">biased 检查：</text>
+<text class="node-line" x="265" y="357">通知 → 事件</text>
+<text class="node-line" x="265" y="379">→ Workflow</text>
+<text class="node-line" x="265" y="401"></text>
+<text class="node-line" x="265" y="423">一支就绪后</text>
+<text class="node-line" x="265" y="445">publish 并返回</text>
+<text class="node-line" x="265" y="467">外层再 reap/pump</text>
+<rect class="await-ring" x="241" y="256" width="193" height="503" rx="13"/>
 </g>
-<g id="node-notify" class="component" data-node="notify" role="button" tabindex="0" aria-label="通知分支">
-<rect class="node-card" x="20" y="255" width="160" height="90" rx="9"/><rect class="node-accent" x="20" y="270" width="3" height="60" rx="1"/>
-<text class="node-title" x="35" y="282">通知分支</text>
-<text class="node-line" x="35" y="305">wake.notified()</text>
-<text class="node-line" x="35" y="325">控制 / ACK → None</text>
+<g id="node-futures" class="component kind-future" data-node="futures" data-kind="future" role="button" tabindex="0" aria-label="running.next()">
+<rect class="stack-back" x="473" y="252" width="290" height="100" rx="10"/>
+<rect class="node-card" x="465" y="260" width="290" height="100" rx="10"/>
+<text class="node-title" x="485" y="288">running.next()</text>
+<text class="node-line" x="485" y="313">FuturesUnordered · poll</text>
+<text class="node-line" x="485" y="335">整体结束才返回 Some(id)</text>
+<rect class="await-ring" x="461" y="256" width="298" height="108" rx="13"/>
+<text class="await-label" id="await-futures" x="475" y="379"></text>
 </g>
-<g id="node-event-branch" class="component" data-node="event-branch" role="button" tabindex="0" aria-label="① events.recv()">
-<rect class="node-card" x="245" y="365" width="260" height="90" rx="9"/><rect class="node-accent" x="245" y="380" width="3" height="60" rx="1"/>
-<text class="node-title" x="260" y="392">① events.recv()</text>
-<text class="node-line" x="260" y="415">table.event → publish</text>
-<text class="node-line" x="260" y="435">就绪：返回 None</text>
+<g id="node-context" class="component kind-future" data-node="context" data-kind="future" role="button" tabindex="0" aria-label="WorkflowContext">
+<rect class="stack-back" x="808" y="252" width="330" height="90" rx="10"/>
+<rect class="node-card" x="800" y="260" width="330" height="90" rx="10"/>
+<text class="node-title" x="820" y="288">WorkflowContext</text>
+<text class="node-line" x="820" y="313">Activity Future / await</text>
+<rect class="await-ring" x="796" y="256" width="338" height="98" rx="13"/>
+<text class="await-label" id="await-context" x="810" y="369"></text>
 </g>
-<g id="node-futures" class="component" data-node="futures" role="button" tabindex="0" aria-label="② running.next()">
-<rect class="node-card" x="600" y="365" width="280" height="90" rx="9"/><rect class="node-accent" x="600" y="380" width="3" height="60" rx="1"/>
-<text class="node-title" x="615" y="392">② running.next()</text>
-<text class="node-line" x="615" y="415">poll 就绪 Workflow Futures</text>
-<text class="node-line" x="615" y="435">Pending ≠ 返回；完成才 Some(id)</text>
+<g id="node-client" class="component kind-pipe" data-node="client" data-kind="pipe" role="button" tabindex="0" aria-label="ActivityClient">
+<rect class="node-card" x="800" y="390" width="330" height="70" rx="35.0"/>
+<path class="pipe-cap" d="M812 402V448"/>
+<path class="pipe-cap" d="M1118 402V448"/>
+<text class="node-title" x="820" y="418">ActivityClient</text>
+<text class="node-line" x="820" y="443">Execute → 服务；oneshot ← 结果</text>
+<rect class="await-ring" x="796" y="386" width="338" height="78" rx="13"/>
 </g>
-<g id="node-broker" class="component" data-node="broker" role="button" tabindex="0" aria-label="Broker / 资源队列">
-<rect class="node-card" x="245" y="505" width="260" height="90" rx="9"/><rect class="node-accent" x="245" y="520" width="3" height="60" rx="1"/>
-<text class="node-title" x="260" y="532">Broker / 资源队列</text>
-<text class="node-line" x="260" y="555">Acquire / Release / Withdraw</text>
+<g id="node-broker" class="component kind-pipe" data-node="broker" data-kind="pipe" role="button" tabindex="0" aria-label="Broker / mpsc&lt;Event&gt;">
+<rect class="node-card" x="800" y="490" width="330" height="70" rx="35.0"/>
+<path class="pipe-cap" d="M812 502V548"/>
+<path class="pipe-cap" d="M1118 502V548"/>
+<text class="node-title" x="820" y="518">Broker / mpsc&lt;Event&gt;</text>
+<text class="node-line" x="820" y="543">发送资源事件；acquire 等 Permit</text>
+<rect class="await-ring" x="796" y="486" width="338" height="78" rx="13"/>
 </g>
-<g id="node-context" class="component" data-node="context" role="button" tabindex="0" aria-label="WorkflowContext">
-<rect class="node-card" x="600" y="505" width="280" height="90" rx="9"/><rect class="node-accent" x="600" y="520" width="3" height="60" rx="1"/>
-<text class="node-title" x="615" y="532">WorkflowContext</text>
-<text class="node-line" x="615" y="555">Activity / RunCondition / 控制</text>
+<g id="node-event-branch" class="component kind-receiver" data-node="event-branch" data-kind="receiver" role="button" tabindex="0" aria-label="events.recv()">
+<rect class="node-card" x="465" y="490" width="290" height="100" rx="10"/>
+<text class="node-title" x="485" y="518">events.recv()</text>
+<text class="node-line" id="receiver-event" x="485" y="543">取出一条 Event → table.event</text>
+<text class="node-line" id="receiver-payload" x="485" y="565">处理后返回 None</text>
+<rect class="await-ring" x="461" y="486" width="298" height="108" rx="13"/>
 </g>
-<g id="node-locks" class="component" data-node="locks" role="button" tabindex="0" aria-label="LockTable">
-<rect class="node-card" x="245" y="650" width="260" height="90" rx="9"/><rect class="node-accent" x="245" y="665" width="3" height="60" rx="1"/>
-<text class="node-title" x="260" y="677">LockTable</text>
-<text class="node-line" x="260" y="700">waiting / held / fences</text>
+<g id="node-event-types" class="component kind-router" data-node="event-types" data-kind="router" role="button" tabindex="0" aria-label="Event 分派">
+<rect class="node-card" x="465" y="630" width="290" height="78" rx="10"/>
+<text class="node-title" x="485" y="658">Event 分派</text>
+<rect class="await-ring" x="461" y="626" width="298" height="86" rx="13"/>
 </g>
-<g id="node-client" class="component" data-node="client" role="button" tabindex="0" aria-label="ActivityClient">
-<rect class="node-card" x="600" y="650" width="280" height="90" rx="9"/><rect class="node-accent" x="600" y="665" width="3" height="60" rx="1"/>
-<text class="node-title" x="615" y="677">ActivityClient</text>
-<text class="node-line" x="615" y="700">类型化命令 + Guard</text>
+<text class="event-choice" data-event-type="Acquire" x="480" y="690">Acquire</text>
+<text class="event-choice" data-event-type="Release" x="572" y="690">Release</text>
+<text class="event-choice" data-event-type="Withdraw" x="664" y="690">Withdraw</text>
+<g id="node-locks" class="component kind-table" data-node="locks" data-kind="table" role="button" tabindex="0" aria-label="LockTable · 状态表">
+<rect class="node-card" x="800" y="630" width="330" height="175" rx="10"/>
+<path class="table-rule" d="M800 677H1130"/>
+<path class="table-rule" d="M800 712H1130"/>
+<path class="table-rule" d="M800 747H1130"/>
+<text class="node-title" x="820" y="658">LockTable · 状态表</text>
+<rect class="await-ring" x="796" y="626" width="338" height="183" rx="13"/>
 </g>
-<g id="node-mail" class="component" data-node="mail" role="button" tabindex="0" aria-label="服务邮箱">
-<rect class="node-card" x="1000" y="400" width="235" height="90" rx="9"/><rect class="node-accent" x="1000" y="415" width="3" height="60" rx="1"/>
-<text class="node-title" x="1015" y="427">服务邮箱</text>
-<text class="node-line" x="1015" y="450">Execute / Query</text>
+<text class="table-value" id="table-held" x="820" y="700">held: —</text>
+<text class="table-value" id="table-waiting" x="820" y="735">waiting: —</text>
+<text class="table-value" id="table-fences" x="820" y="770">fences: —</text>
+<g id="node-outcomes" class="component kind-router" data-node="outcomes" data-kind="router" role="button" tabindex="0" aria-label="pump() 仲裁结果">
+<rect class="node-card" x="465" y="745" width="290" height="90" rx="10"/>
+<text class="node-title" x="485" y="773">pump() 仲裁结果</text>
+<rect class="await-ring" x="461" y="741" width="298" height="98" rx="13"/>
 </g>
-<g id="node-service" class="component" data-node="service" role="button" tabindex="0" aria-label="领域动作执行">
-<rect class="node-card" x="1000" y="550" width="235" height="110" rx="9"/><rect class="node-accent" x="1000" y="565" width="3" height="80" rx="1"/>
-<text class="node-title" x="1015" y="577">领域动作执行</text>
-<text class="node-line" x="1015" y="600">Host → Service → Ports</text>
-<text class="node-line" x="1015" y="620">独立 Activity Futures</text>
+<text class="outcome-choice" data-outcome="permit" x="480" y="806">Permit</text>
+<text class="outcome-choice" data-outcome="wait" x="572" y="806">Waiting</text>
+<text class="outcome-choice" data-outcome="reject" x="664" y="806">Rejected</text>
+<g id="node-notify" class="component kind-pipe" data-node="notify" data-kind="pipe" role="button" tabindex="0" aria-label="wake.notified()">
+<rect class="node-card" x="245" y="780" width="185" height="65" rx="32.5"/>
+<path class="pipe-cap" d="M257 792V833"/>
+<path class="pipe-cap" d="M418 792V833"/>
+<text class="node-title" x="265" y="808">wake.notified()</text>
+<text class="node-line" x="265" y="833">通知外层重算</text>
+<rect class="await-ring" x="241" y="776" width="193" height="73" rx="13"/>
 </g>
-<g id="node-tracker" class="component" data-node="tracker" role="button" tabindex="0" aria-label="Tracker / Completion">
-<rect class="node-card" x="245" y="800" width="260" height="85" rx="9"/><rect class="node-accent" x="245" y="815" width="3" height="55" rx="1"/>
-<text class="node-title" x="260" y="827">Tracker / Completion</text>
-<text class="node-line" x="260" y="850">实际停稳 → 发布终态</text>
+<g id="node-service" class="component kind-legend" data-node="service" data-kind="legend" role="button" tabindex="0" aria-label="各服务均独立运行">
+<rect class="node-card" x="1240" y="885" width="240" height="45" rx="10"/>
+<text class="node-title" x="1260" y="913">各服务均独立运行</text>
+<rect class="await-ring" x="1236" y="881" width="248" height="53" rx="13"/>
 </g>
-<g id="node-observe" class="component" data-node="observe" role="button" tabindex="0" aria-label="统一 Task 观察">
-<rect class="node-card" x="600" y="800" width="280" height="85" rx="9"/><rect class="node-accent" x="600" y="815" width="3" height="55" rx="1"/>
-<text class="node-title" x="615" y="827">统一 Task 观察</text>
-<text class="node-line" x="615" y="850">Snapshot / Observer</text>
+<g id="node-service-tier" class="component kind-host" data-node="service-tier" data-kind="host" role="button" tabindex="0" aria-label="Tier · Tokio task">
+<rect class="node-card" x="1260" y="190" width="220" height="90" rx="10"/>
+<text class="node-title" x="1280" y="218">Tier · Tokio task</text>
+<text class="node-line" x="1280" y="243">Mailbox → Activity Futures</text>
+<rect class="await-ring" x="1256" y="186" width="228" height="98" rx="13"/>
+<text class="await-label" id="await-service-tier" x="1270" y="299"></text>
 </g>
-<g id="packet" aria-hidden="true"><circle r="13" class="packet-halo"/><circle r="5" class="packet-dot"/></g><g id="packet-label" aria-hidden="true"><rect width="125" height="26" rx="5"/><text x="8" y="18" id="packet-text"></text></g></svg></div><div class="stage-bottom"><span id="motion-state">就绪 · 点击播放</span><span>实线：调用 / 消息　高亮：本次参与组件</span></div></section>
+<g id="node-service-node" class="component kind-host" data-node="service-node" data-kind="host" role="button" tabindex="0" aria-label="Node · Tokio task">
+<rect class="node-card" x="1260" y="305" width="220" height="90" rx="10"/>
+<text class="node-title" x="1280" y="333">Node · Tokio task</text>
+<text class="node-line" x="1280" y="358">Mailbox → Activity Futures</text>
+<rect class="await-ring" x="1256" y="301" width="228" height="98" rx="13"/>
+<text class="await-label" id="await-service-node" x="1270" y="414"></text>
+</g>
+<g id="node-service-disk" class="component kind-host" data-node="service-disk" data-kind="host" role="button" tabindex="0" aria-label="Disk · Tokio task">
+<rect class="node-card" x="1260" y="420" width="220" height="90" rx="10"/>
+<text class="node-title" x="1280" y="448">Disk · Tokio task</text>
+<text class="node-line" x="1280" y="473">Mailbox → Activity Futures</text>
+<rect class="await-ring" x="1256" y="416" width="228" height="98" rx="13"/>
+<text class="await-label" id="await-service-disk" x="1270" y="529"></text>
+</g>
+<g id="node-service-vd" class="component kind-host" data-node="service-vd" data-kind="host" role="button" tabindex="0" aria-label="VD · Tokio task">
+<rect class="node-card" x="1260" y="535" width="220" height="90" rx="10"/>
+<text class="node-title" x="1280" y="563">VD · Tokio task</text>
+<text class="node-line" x="1280" y="588">Mailbox → Activity Futures</text>
+<rect class="await-ring" x="1256" y="531" width="228" height="98" rx="13"/>
+<text class="await-label" id="await-service-vd" x="1270" y="644"></text>
+</g>
+<g id="node-service-balance" class="component kind-host" data-node="service-balance" data-kind="host" role="button" tabindex="0" aria-label="Balance · Tokio task">
+<rect class="node-card" x="1260" y="650" width="220" height="90" rx="10"/>
+<text class="node-title" x="1280" y="678">Balance · Tokio task</text>
+<text class="node-line" x="1280" y="703">Mailbox → Activity Futures</text>
+<rect class="await-ring" x="1256" y="646" width="228" height="98" rx="13"/>
+<text class="await-label" id="await-service-balance" x="1270" y="759"></text>
+</g>
+<g id="node-tracker" class="component kind-object" data-node="tracker" data-kind="object" role="button" tabindex="0" aria-label="Tracker / Completion">
+<rect class="node-card" x="1240" y="790" width="240" height="70" rx="10"/>
+<text class="node-title" x="1260" y="818">Tracker / Completion</text>
+<text class="node-line" x="1260" y="843">Guard 结算 → 真实停稳</text>
+<rect class="await-ring" x="1236" y="786" width="248" height="78" rx="13"/>
+</g>
+<g id="node-observe" class="component kind-legend" data-node="observe" data-kind="legend" role="button" tabindex="0" aria-label="统一 Task 观察">
+<rect class="node-card" x="440" y="880" width="240" height="45" rx="10"/>
+<text class="node-title" x="460" y="908">统一 Task 观察</text>
+<rect class="await-ring" x="436" y="876" width="248" height="53" rx="13"/>
+</g>
+<g id="packet" aria-hidden="true"><circle r="12" class="packet-halo"/><circle r="5" class="packet-dot"/></g><g id="packet-label" aria-hidden="true"><rect width="180" height="28" rx="5"/><text x="8" y="19" id="packet-text"></text></g></svg></div><div class="stage-bottom"><span id="motion-state">就绪 · 点击播放</span><span>蓝色：本帧推进　琥珀虚线：持续等待　外框：宿主</span></div></section>
 <section class="task-section"><div class="section-heading"><h2>任务与请求</h2><span>状态在事件完成后更新 · 全场景身份保持不变</span></div><div id="tasks" class="task-list"></div></section></div>
 <aside><section class="event-panel"><div class="eyebrow"><span id="event-counter">00 / 00</span><span id="event-kind">已完成事件</span></div><h2 id="event-title" aria-live="polite"></h2><p id="event-why"></p><div id="gate" hidden><strong>在这里停一下</strong><p id="gate-text"></p><button id="continue">继续观察 →</button></div><div class="delta"><span>本次状态变化</span><div id="delta"></div></div></section>
-<section id="wait-graph" hidden><strong>任务等待关系</strong><p id="wait-chain"></p><small id="wait-note"></small></section><section class="queue-panel"><div class="section-heading"><h2>调度现场</h2><span id="decision-badge">等待请求</span></div><div class="queue-block"><h3>业务等待队列 <small>StartPermit 未发放</small></h3><div id="business-queue"></div></div><div class="queue-block"><h3>逻辑占用 <small>由 TaskCenter 管理</small></h3><div id="owners"></div></div><div class="queue-block"><h3>步骤资源 <small>由 LockTable 管理</small></h3><div id="resources"></div></div><div class="queue-block"><h3>隔离区 <small>Uncertain 后保留</small></h3><div id="fences"></div></div><dl class="live-values"><dt>最近执行链</dt><dd id="future"></dd><dt>服务</dt><dd id="service"></dd><dt>资源事件</dt><dd id="resource-events"></dd><dt>恢复条件</dt><dd id="guard"></dd><dt>持久化</dt><dd id="store"></dd></dl></section>
+<section class="received-panel"><h2 id="received-title">最近收到的资源事件</h2><code id="received-payload"></code><p id="received-detail"></p><strong id="received-result"></strong></section><section class="await-panel"><h2>谁在 await · 由谁推进</h2><div id="await-list"></div></section><section id="wait-graph" hidden><strong>任务等待关系</strong><p id="wait-chain"></p><small id="wait-note"></small></section><section class="queue-panel"><div class="section-heading"><h2>调度现场</h2><span id="decision-badge">等待请求</span></div><div class="queue-block"><h3>业务等待队列 <small>StartPermit 未发放</small></h3><div id="business-queue"></div></div><div class="queue-block"><h3>逻辑占用 <small>由 TaskCenter 管理</small></h3><div id="owners"></div></div><div class="queue-block"><h3>步骤资源 <small>由 LockTable 管理</small></h3><div id="resources"></div></div><div class="queue-block"><h3>隔离区 <small>Uncertain 后保留</small></h3><div id="fences"></div></div><dl class="live-values"><dt>最近执行链</dt><dd id="future"></dd><dt>服务</dt><dd id="service"></dd><dt>资源事件</dt><dd id="resource-events"></dd><dt>恢复条件</dt><dd id="guard"></dd><dt>持久化</dt><dd id="store"></dd></dl></section>
 <details class="component-panel" id="component-detail"><summary>组件职责 <span id="component-name">点击图中组件</span></summary><p id="component-description">点击或键盘选中组件，了解它处理什么，以及它不负责什么。</p></details></aside></main>
 <section class="player" aria-label="教学动画播放器"><div class="player-main"><button id="restart" title="重新开始">↺</button><button id="back-step" title="上一事件">←</button><button id="play" class="primary">▶ 开始演示</button><button id="next-step" title="下一事件">→</button><label>速度<select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label><label class="explain-toggle"><input id="auto-explain" type="checkbox" checked>冲突关键点停下讲解</label><span id="position">0 / 0</span></div><input id="timeline" type="range" min="0" max="1" value="0" aria-label="事件时间线"><div id="chapters" class="chapters"></div></section>
 <footer><span>RUNTIME LAB / 请求流转与冲突交接</span><span>空格播放 / 暂停 · ← → 单步 · 支持减少动态效果</span><a href="https://temporal.io/" target="_blank" rel="noreferrer">视觉参考 Temporal ↗</a></footer><noscript>此动画需要 JavaScript。可打开组件架构导读查看静态图。</noscript></body></html>

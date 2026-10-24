@@ -1,80 +1,111 @@
-"""Update the animation's SVG. Explicit select branches, not sequential workers."""
+"""Generate hosts, stacked select branches, pipes, event dispatch and a state table."""
 from pathlib import Path
 from html import escape
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / 'docs/diagrams/task-center-simulation/index.html'
-parts = ['''<svg id="architecture" viewBox="0 0 1280 980" role="img" aria-labelledby="graph-title graph-desc">
-<title id="graph-title">Driver tick 的资源事件与工作流轮询分支</title>
-<desc id="graph-desc">同一个 TaskCenter 宿主，tick 使用 biased select。资源事件分支返回 None；工作流分支在 Pending 时继续等待，只有整体结束返回 Some(TaskId)。通知分支另行让外层重算。</desc>
-<defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".8" fill="#313447"/></pattern><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker></defs>
-<rect width="1280" height="980" fill="url(#grid)"/>
-<rect class="boundary" x="200" y="82" width="735" height="835" rx="18"/>
-<text class="boundary-label" x="220" y="44">TASKCENTER / 每池一个 Tokio task</text>
-<rect class="driver-boundary" x="230" y="235" width="673" height="545" rx="12"/>
-<text class="boundary-label small" x="245" y="225">WORKFLOW DRIVER / 同一宿主内的两个工作分支</text>
-<rect class="service-boundary" x="975" y="350" width="280" height="365" rx="12"/>
-<text class="boundary-label small" x="990" y="335">领域服务 / 独立 Tokio task</text>
-<text class="boundary-label small" x="995" y="698">Disk / Node / Tier / VD / Balance</text>
+parts = ['''<svg id="architecture" viewBox="0 0 1500 940" role="img" aria-labelledby="graph-title graph-desc">
+<title id="graph-title">异步执行现场：宿主、等待点与资源事件</title>
+<desc id="graph-desc">TaskCenter 宿主内，running.next 在上，events.recv 在下。Broker 和 mpsc 是管道；LockTable 是状态表。各领域服务分别拥有独立 Tokio task。琥珀色虚线持续标出 Pending Future，蓝色表示本帧推进。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1L7 4L1 7" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker></defs>
+<rect width="1500" height="940" fill="#ffffff"/>
+<rect class="host-boundary" data-host="taskcenter" x="205" y="65" width="1000" height="810" rx="16"/>
+<text class="boundary-label" x="225" y="45">TaskCenter · 一个 Tokio task</text>
+<text class="host-status" id="host-taskcenter" x="1185" y="45" text-anchor="end">等待提交</text>
+<rect class="driver-boundary" x="230" y="230" width="950" height="620" rx="10"/>
+<text class="boundary-label small" x="250" y="220">WorkflowDriver · 嵌入 TaskCenter，无独立宿主</text>
+<text class="boundary-label small" x="1250" y="45">领域服务 · 各自独立 Tokio task</text>
 ''']
-
 routes = {
-    'submit':'M180 155H240', 'policy':'M520 155H590',
-    'defer':'M380 205V255', 'select-events':'M375 330V365',
-    'poll':'M740 330V365', 'persist':'M880 400H950V70H1120V105',
-    'accepted':'M985 145H940V60H380V105', 'start':'M520 180H920V345H820V365',
-    'run':'M715 455V505', 'acquire':'M600 550H505',
-    'events':'M375 505V455', 'lock':'M245 410H220V695H245',
-    'permit':'M505 695H560V570H600', 'wake':'M795 505V455',
-    'dispatch':'M740 595V650', 'send':'M880 695H950V445H1000',
-    'execute':'M1118 490V550', 'settle':'M1235 615H1260V935H375V885',
-    'release':'M1000 630H960V760H525V570H505',
-    'reply':'M1000 585H940V350H860V365', 'observe':'M505 842H600',
-    'reap':'M245 290H205V225H300V205',
-    'control':'M520 185H575V525H600', 'stop':'M880 545H1000',
-    'checkpoint':'M880 525H920V225H1120V205',
-    'control-ack':'M600 575H580V350H100V345',
-    'stop-ack':'M1000 615H910V580H880',
-    'user-control':'M100 205V950H910V570H880',
-    'restore':'M1120 205V240H890V410H880',
-    'notify':'M180 290H245', 'resource-exit':'M505 385H540V330',
-    'workflow-exit':'M600 385H570V330',
+    'submit':'M180 155H245', 'policy':'M645 155H690',
+    'defer':'M445 205V220H530V260', 'select-events':'M430 540H465',
+    'poll':'M430 305H465', 'persist':'M755 280H780V80H1240V105',
+    'accepted':'M1240 120H1220V60H445V105', 'start':'M615 205V260',
+    'run':'M755 310H800', 'acquire':'M1130 325H1160V520H1130',
+    'events':'M800 520H755', 'lock':'M610 590V630', 'arbitrate':'M755 665H800',
+    'permit':'M800 730H775V365H970V350', 'wake':'M800 285H755',
+    'dispatch':'M970 350V390',
+    'observe':'M1240 825H1185V905H680',
+    'reap':'M245 310H220V220H350V205',
+    'control':'M645 185H790V330H800',
+    'checkpoint':'M1130 280H1210V120H1240',
+    'control-ack':'M800 330H785V815H430',
+    'user-control':'M100 205V915H1190V330H1130',
+    'restore':'M1240 145H1215V245H725V260',
+    'notify':'M335 780V755',
+    'resource-exit':'M465 565H450V725H430',
+    'workflow-exit':'M465 330H430',
+    'wait':'M800 760H755',
+    'reject':'M800 805H775V815H755',
+    'withdraw':'M1130 335H1160V520H1130',
 }
+services = [('tier','Tier',190),('node','Node',305),('disk','Disk',420),('vd','VD',535),('balance','Balance',650)]
+for key, _, y in services:
+    routes['send-'+key]=f'M1130 425H1220V{y+35}H1260'
+    routes['execute-'+key]=f'M1370 {y+35}V{y+73}'
+    routes['reply-'+key]=f'M1260 {y+78}H1215V250H1090V260'
+    routes['release-'+key]=f'M1260 {y+86}H1195V540H1130'
+    routes['settle-'+key]=f'M1480 {y+75}H1490V825H1480'
+    routes['stop-'+key]=f'M1130 330H1205V{y+60}H1260'
+    routes['stop-ack-'+key]=f'M1260 {y+68}H1200V340H1130'
+for base in ['send','execute','reply','release','settle','stop','stop-ack']:
+    routes[base]=routes[base+'-disk']
 parts.append('<g id="routes">')
 for key, route in routes.items():
     parts.append(f'<path id="route-{key}" class="route" data-route="{key}" d="{route}" marker-end="url(#arrow)"/>')
 parts.append('</g>')
 
-
-def node(key, x, y, w, h, title, lines):
-    parts.append(f'<g id="node-{key}" class="component" data-node="{key}" role="button" tabindex="0" aria-label="{escape(title)}">')
-    parts.append(f'<rect class="node-card" x="{x}" y="{y}" width="{w}" height="{h}" rx="9"/><rect class="node-accent" x="{x}" y="{y+15}" width="3" height="{h-30}" rx="1"/>')
-    parts.append(f'<text class="node-title" x="{x+15}" y="{y+27}">{escape(title)}</text>')
+def node(key, x, y, w, h, title, lines, kind='object'):
+    parts.append(f'<g id="node-{key}" class="component kind-{kind}" data-node="{key}" data-kind="{kind}" role="button" tabindex="0" aria-label="{escape(title)}">')
+    if kind == 'future':
+        parts.append(f'<rect class="stack-back" x="{x+8}" y="{y-8}" width="{w}" height="{h}" rx="10"/>')
+    radius = h/2 if kind == 'pipe' else 10
+    parts.append(f'<rect class="node-card" x="{x}" y="{y}" width="{w}" height="{h}" rx="{radius}"/>')
+    if kind == 'pipe':
+        for offset in (12, w-12):
+            parts.append(f'<path class="pipe-cap" d="M{x+offset} {y+12}V{y+h-12}"/>')
+    if kind == 'table':
+        for offset in (47,82,117):
+            if offset < h:
+                parts.append(f'<path class="table-rule" d="M{x} {y+offset}H{x+w}"/>')
+    parts.append(f'<text class="node-title" x="{x+20}" y="{y+28}">{escape(title)}</text>')
     for i, line in enumerate(lines):
-        parts.append(f'<text class="node-line" x="{x+15}" y="{y+50+i*20}">{escape(line)}</text>')
+        extra = (' id="receiver-event"' if i == 0 else ' id="receiver-payload"') if key == 'event-branch' else ''
+        parts.append(f'<text class="node-line"{extra} x="{x+20}" y="{y+53+i*22}">{escape(line)}</text>')
+    parts.append(f'<rect class="await-ring" x="{x-4}" y="{y-4}" width="{w+8}" height="{h+8}" rx="13"/>')
+    if key in ['futures','context'] or key.startswith('service-'):
+        parts.append(f'<text class="await-label" id="await-{key}" x="{x+10}" y="{y+h+19}"></text>')
     parts.append('</g>')
 
-
-node('caller',20,105,160,100,'业务调用方',['PoolHandle','提交 / 用户控制'])
-node('state',240,105,280,100,'TaskCenter / State',['reap → pump → 外层 select','队列 / 逻辑占用 / StartPermit'])
-node('policy',590,105,290,100,'SchedulingPolicy',['admission / relation / priority','topo > 其他 > shrink；同级 FIFO'])
-node('store',985,105,270,100,'TaskStore',['Journal · blocking IO','epoch / revision 校验'])
-node('driver',245,255,635,75,'WorkflowDriver.tick() · tokio::select! { biased; … }',['检查顺序：通知 → 资源 → 工作流；一支就绪才返回外层'])
-node('notify',20,255,160,90,'通知分支',['wake.notified()','控制 / ACK → None'])
-node('event-branch',245,365,260,90,'① events.recv()',['table.event → publish','就绪：返回 None'])
-node('futures',600,365,280,90,'② running.next()',['poll 就绪 Workflow Futures','Pending ≠ 返回；完成才 Some(id)'])
-node('broker',245,505,260,90,'Broker / 资源队列',['Acquire / Release / Withdraw'])
-node('context',600,505,280,90,'WorkflowContext',['Activity / RunCondition / 控制'])
-node('locks',245,650,260,90,'LockTable',['waiting / held / fences'])
-node('client',600,650,280,90,'ActivityClient',['类型化命令 + Guard'])
-node('mail',1000,400,235,90,'服务邮箱',['Execute / Query'])
-node('service',1000,550,235,110,'领域动作执行',['Host → Service → Ports','独立 Activity Futures'])
-node('tracker',245,800,260,85,'Tracker / Completion',['实际停稳 → 发布终态'])
-node('observe',600,800,280,85,'统一 Task 观察',['Snapshot / Observer'])
-parts.append('''<g id="packet" aria-hidden="true"><circle r="13" class="packet-halo"/><circle r="5" class="packet-dot"/></g><g id="packet-label" aria-hidden="true"><rect width="125" height="26" rx="5"/><text x="8" y="18" id="packet-text"></text></g></svg>''')
+node('caller',20,105,160,100,'PoolHandle',['业务请求','提交 / 用户控制'])
+node('state',245,105,400,100,'State · 应用协调',['reap / pump / 外层 select','业务准入、排队与逻辑占用'])
+node('policy',690,105,310,100,'SchedulingPolicy',['admission / relation / priority','由应用定义业务关系'])
+node('store',1240,75,240,90,'TaskStore',['epoch / revision CAS'],'table')
+node('driver',245,260,185,495,'tick() / select!',['同一个宿主内','biased 检查：','通知 → 事件','→ Workflow','','一支就绪后','publish 并返回','外层再 reap/pump'],'selector')
+node('futures',465,260,290,100,'running.next()',['FuturesUnordered · poll','整体结束才返回 Some(id)'],'future')
+node('context',800,260,330,90,'WorkflowContext',['Activity Future / await'],'future')
+node('client',800,390,330,70,'ActivityClient',['Execute → 服务；oneshot ← 结果'],'pipe')
+node('broker',800,490,330,70,'Broker / mpsc<Event>',['发送资源事件；acquire 等 Permit'],'pipe')
+node('event-branch',465,490,290,100,'events.recv()',['取出一条 Event → table.event','处理后返回 None'],'receiver')
+node('event-types',465,630,290,78,'Event 分派',[],'router')
+for index, name in enumerate(['Acquire','Release','Withdraw']):
+    parts.append(f'<text class="event-choice" data-event-type="{name}" x="{480+index*92}" y="690">{name}</text>')
+node('locks',800,630,330,175,'LockTable · 状态表',[],'table')
+for i, name in enumerate(['held','waiting','fences']):
+    parts.append(f'<text class="table-value" id="table-{name}" x="820" y="{700+i*35}">{name}: —</text>')
+node('outcomes',465,745,290,90,'pump() 仲裁结果',[],'router')
+for index, (name, label) in enumerate([('permit','Permit'),('wait','Waiting'),('reject','Rejected')]):
+    parts.append(f'<text class="outcome-choice" data-outcome="{name}" x="{480+index*92}" y="806">{label}</text>')
+node('notify',245,780,185,65,'wake.notified()',['通知外层重算'],'pipe')
+node('service',1240,885,240,45,'各服务均独立运行',[],'legend')
+for key, label, y in services:
+    node('service-'+key,1260,y,220,90,label+' · Tokio task',['Mailbox → Activity Futures'],'host')
+node('tracker',1240,790,240,70,'Tracker / Completion',['Guard 结算 → 真实停稳'])
+node('observe',440,880,240,45,'统一 Task 观察',[],'legend')
+parts.append('''<g id="packet" aria-hidden="true"><circle r="12" class="packet-halo"/><circle r="5" class="packet-dot"/></g><g id="packet-label" aria-hidden="true"><rect width="180" height="28" rx="5"/><text x="8" y="19" id="packet-text"></text></g></svg>''')
 html = PAGE.read_text(encoding='utf-8')
 html, count = re.subn(r'<svg id="architecture".*?</svg>', lambda _: '\n'.join(parts), html, count=1, flags=re.S)
 assert count == 1
 PAGE.write_text(html, encoding='utf-8')
-print('Generated runtime SVG with two work branches and a separate notification branch')
+print('Generated hosts / stacked tick branches / Broker pipe / event dispatch / LockTable')
