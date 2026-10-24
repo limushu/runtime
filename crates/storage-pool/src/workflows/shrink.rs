@@ -145,85 +145,91 @@ impl ShrinkWorkflow {
         };
         let disks = &self.request.disks;
 
-        if progress.stage == RecordIntent {
-            ctx.activity(
-                &self.domains.disk,
-                DiskCommand::RequestShrink(disks.clone()),
-            )
-            .await?;
-            self.advance(ctx, &mut progress, DisableAllocation).await?;
-        }
-        if progress.stage == DisableAllocation {
-            ctx.activity(
-                &self.domains.disk,
-                DiskCommand::DisableAllocation(disks.clone()),
-            )
-            .await?;
-            self.advance(ctx, &mut progress, Migrate).await?;
-        }
-        while progress.stage == Migrate {
-            let exit = ctx
-                .activity(
-                    self.domains
-                        .balance
-                        .as_ref()
-                        .expect("validated at construction"),
-                    crate::domains::balance::Migrate {
-                        pool: self.domains.pool.clone(),
-                        task_id: ctx.id(),
-                        disks: disks.clone(),
-                        checkpoint: progress.migration.clone(),
-                    },
-                )
-                .await?;
-            match exit {
-                ActivityExit::Completed(done) => {
-                    progress.migration.progress = done;
-                    self.advance(ctx, &mut progress, VerifyEvacuated).await?;
+        // Execute one business stage per iteration, including after restoration.
+        loop {
+            match progress.stage {
+                RecordIntent => {
+                    ctx.activity(
+                        &self.domains.disk,
+                        DiskCommand::RequestShrink(disks.clone()),
+                    )
+                    .await?;
+                    self.advance(ctx, &mut progress, DisableAllocation).await?;
                 }
-                ActivityExit::Suspended(checkpoint) => {
-                    // The native invocation has ended. Persist BEFORE acknowledging
-                    // suspension and yielding to topology; resume creates a new Activity.
-                    progress.migration = checkpoint;
-                    self.save(ctx, &progress).await?;
-                    ctx.wait_until_runnable().await?;
+                DisableAllocation => {
+                    ctx.activity(
+                        &self.domains.disk,
+                        DiskCommand::DisableAllocation(disks.clone()),
+                    )
+                    .await?;
+                    self.advance(ctx, &mut progress, Migrate).await?;
                 }
+                Migrate => {
+                    let exit = ctx
+                        .activity(
+                            self.domains
+                                .balance
+                                .as_ref()
+                                .expect("validated at construction"),
+                            crate::domains::balance::Migrate {
+                                pool: self.domains.pool.clone(),
+                                task_id: ctx.id(),
+                                disks: disks.clone(),
+                                checkpoint: progress.migration.clone(),
+                            },
+                        )
+                        .await?;
+                    match exit {
+                        ActivityExit::Completed(done) => {
+                            progress.migration.progress = done;
+                            self.advance(ctx, &mut progress, VerifyEvacuated).await?;
+                        }
+                        ActivityExit::Suspended(checkpoint) => {
+                            // The native invocation has ended. Persist BEFORE acknowledging
+                            // suspension and yielding to topology; resume creates a new Activity.
+                            // Keep the Migrate stage for the next iteration.
+                            progress.migration = checkpoint;
+                            self.save(ctx, &progress).await?;
+                            ctx.wait_until_runnable().await?;
+                        }
+                    }
+                }
+                VerifyEvacuated => {
+                    ctx.activity(
+                        &self.domains.vd,
+                        VdCommand::RequireDisksUnreferenced(disks.clone()),
+                    )
+                    .await?;
+                    ctx.activity(
+                        &self.domains.disk,
+                        DiskCommand::RequireEmptyMany(disks.clone()),
+                    )
+                    .await?;
+                    self.advance(ctx, &mut progress, DisableIo).await?;
+                }
+                DisableIo => {
+                    ctx.activity(
+                        &self.domains.disk,
+                        DiskCommand::SetIoMany(disks.clone(), IoState::Down),
+                    )
+                    .await?;
+                    self.advance(ctx, &mut progress, RemoveMembers).await?;
+                }
+                RemoveMembers => {
+                    ctx.activity(
+                        &self.domains.disk,
+                        DiskCommand::RemoveEmptyMany(disks.clone()),
+                    )
+                    .await?;
+                    // No await between confirmed removal and the Pool's index cleanup.
+                    if let Some(membership) = &self.membership {
+                        membership.complete();
+                    }
+                    self.advance(ctx, &mut progress, Complete).await?;
+                }
+                Complete => return Ok(()),
             }
         }
-        if progress.stage == VerifyEvacuated {
-            ctx.activity(
-                &self.domains.vd,
-                VdCommand::RequireDisksUnreferenced(disks.clone()),
-            )
-            .await?;
-            ctx.activity(
-                &self.domains.disk,
-                DiskCommand::RequireEmptyMany(disks.clone()),
-            )
-            .await?;
-            self.advance(ctx, &mut progress, DisableIo).await?;
-        }
-        if progress.stage == DisableIo {
-            ctx.activity(
-                &self.domains.disk,
-                DiskCommand::SetIoMany(disks.clone(), IoState::Down),
-            )
-            .await?;
-            self.advance(ctx, &mut progress, RemoveMembers).await?;
-        }
-        if progress.stage == RemoveMembers {
-            ctx.activity(
-                &self.domains.disk,
-                DiskCommand::RemoveEmptyMany(disks.clone()),
-            )
-            .await?;
-            // No await between confirmed removal and the Pool's index cleanup.
-            if let Some(membership) = &self.membership {
-                membership.complete();
-            }
-            self.advance(ctx, &mut progress, Complete).await?;
-        }
-        Ok(())
     }
 }
 impl PoolWorkflow for ShrinkWorkflow {

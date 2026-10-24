@@ -11,12 +11,22 @@
 
 ## 执行顺序
 
-1. 记录缩容意图。
-2. 禁止目标盘分配。
-3. 调用均衡领域迁移全部目标盘；停稳返回时保存续作数据，等待允许继续，然后再次调用。
-4. 查询权威 BG 引用及分配归属，确认目标盘已排空。
-5. 关闭目标盘 IO。
-6. 再次校验引用与 IO 状态，提交成员移除。
+主流程用 `loop + match progress.stage` 穷举全部阶段，每轮处理一个阶段。
+从检查点恢复时直接进入保存的阶段；新增阶段需要补齐对应的 `match` 分支。
+
+| 当前阶段 | 动作或结果 | 下一阶段 |
+| --- | --- | --- |
+| `RecordIntent` | 记录目标盘缩容意图 | `DisableAllocation` |
+| `DisableAllocation` | 禁止目标盘分配 | `Migrate` |
+| `Migrate` | 整批迁移返回 `Completed` | `VerifyEvacuated` |
+| `Migrate` | 停稳并返回 `Suspended`：保存续作数据，等待允许继续 | 保持 `Migrate`，唤醒后重新调用 Activity |
+| `VerifyEvacuated` | 确认权威 BG 引用与分配均已清空 | `DisableIo` |
+| `DisableIo` | 关闭目标盘 IO | `RemoveMembers` |
+| `RemoveMembers` | 再次校验引用与 IO，移除成员并清理 Pool 索引 | `Complete` |
+| `Complete` | 返回成功 | 流程结束 |
+
+动作成功后才推进并保存下一阶段；错误通过 `?` 返回，不跳过失败步骤。
+`ShrinkStage` 表示业务进度，`RunState` 表示执行状态；迁移被挂起时，业务阶段仍为 `Migrate`。
 
 这对应旧业务文档的 RequestShrink → DisableAllocation → Evacuate → NoRefs → Down → Remove。
 现行 TaskCenter 的 topo 优先暂停协议代替旧文档的“取消旧执行并重新调和”。
