@@ -52,7 +52,7 @@ impl Gate {
     fn open(&self) {
         self.release.add_permits(1);
     }
-    async fn pause(&self) {
+    async fn suspend(&self) {
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
     }
@@ -90,7 +90,7 @@ impl ControlledStore {
     fn fail(&self, point: Point, failure: Failure, applied: bool) {
         *self.next.lock().unwrap() = Some((point, Behavior::Fail(failure, applied)));
     }
-    fn pause(&self, point: Point) -> Arc<Gate> {
+    fn suspend(&self, point: Point) -> Arc<Gate> {
         let gate = Gate::new();
         *self.next.lock().unwrap() = Some((point, Behavior::Pause(gate.clone())));
         gate
@@ -114,7 +114,7 @@ impl MetadataStore for ControlledStore {
                 }
                 return Err(failure);
             }
-            Some(Behavior::Pause(gate)) => gate.pause().await,
+            Some(Behavior::Pause(gate)) => gate.suspend().await,
             None => {}
         }
         self.inner.commit(pool, change).await
@@ -145,7 +145,7 @@ impl DataPlane for ControlledPlane {
         self.disk_calls.lock().unwrap().push("open");
         let gate = self.open_gate.lock().unwrap().take();
         if let Some(gate) = gate {
-            gate.pause().await;
+            gate.suspend().await;
         }
         self.open_failure.lock().unwrap().take().map_or(Ok(()), Err)
     }
@@ -185,7 +185,7 @@ impl DataPlane for ControlledPlane {
             }
         };
         if let Some(gate) = gate {
-            gate.pause().await;
+            gate.suspend().await;
         }
         // Once started, this simulated external effect completes successfully
         // despite cancellation. The framework must wait for this confirmation.
@@ -691,7 +691,7 @@ async fn io_success_then_metadata_failure_is_uncertain() {
 async fn metadata_in_flight_keeps_old_view_and_object_ownership() {
     let store = Arc::new(ControlledStore::default());
     let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 2).await;
-    let gate = store.pause(Point::Allocate(disk_id("d1")));
+    let gate = store.suspend(Point::Allocate(disk_id("d1")));
     let create = pool.create_volume(request("v")).await.unwrap();
     gate.wait().await;
     assert!(pool.disks().await.unwrap()[0].allocated.is_empty());
@@ -716,7 +716,7 @@ async fn metadata_in_flight_keeps_old_view_and_object_ownership() {
 async fn cancellation_after_allocation_retains_safe_orphan_and_unblocks_next_run() {
     let store = Arc::new(ControlledStore::default());
     let (manager, pool) = fixture(store.clone(), Arc::new(SimulatedDataPlane), 3).await;
-    let gate = store.pause(Point::Allocate(disk_id("d1")));
+    let gate = store.suspend(Point::Allocate(disk_id("d1")));
     let mut run = pool.create_volume(request("v")).await.unwrap();
     gate.wait().await;
     run.control.cancel();
@@ -784,7 +784,7 @@ async fn pools_isolate_execution_but_cannot_share_physical_disk() {
             .await
             .is_err()
     );
-    let gate = store.pause(Point::Allocate(disk_id("d1")));
+    let gate = store.suspend(Point::Allocate(disk_id("d1")));
     let first = a.create_volume(request("same-vd-id")).await.unwrap();
     gate.wait().await;
     result(
@@ -885,7 +885,7 @@ async fn online_is_one_run_with_read_add_open_enable_steps_and_no_early_success(
     assert_eq!(
         run.control.state(),
         RunState::Activity(workflow_foundation::ActivityId {
-            workflow: run.id(),
+            task_id: run.id(),
             sequence: 4
         })
     );
@@ -975,14 +975,14 @@ async fn pause_after_open_blocks_enable_and_resume_continues_same_online_run() {
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
     let mut run = manager.online_disk(pool.id(), spec).await.unwrap();
     gate.wait().await;
-    run.control.pause().unwrap();
+    run.control.suspend().unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), run.control.wait_paused())
+        tokio::time::timeout(Duration::from_millis(20), run.control.wait_suspended())
             .await
             .is_err()
     );
     gate.open();
-    bounded(run.control.wait_paused()).await.unwrap();
+    bounded(run.control.wait_suspended()).await.unwrap();
     assert_eq!(plane.disk_calls.lock().unwrap().as_slice(), ["open"]);
     assert_eq!(pool.disks().await.unwrap()[0].io, IoState::Down);
     assert!(
@@ -1042,9 +1042,9 @@ async fn paused_online_can_be_cancelled_by_offline_without_resume() {
     *plane.open_gate.lock().unwrap() = Some(gate.clone());
     let online = manager.online_disk(pool.id(), spec.clone()).await.unwrap();
     gate.wait().await;
-    online.control.pause().unwrap();
+    online.control.suspend().unwrap();
     gate.open();
-    bounded(online.control.wait_paused()).await.unwrap();
+    bounded(online.control.wait_suspended()).await.unwrap();
     let offline = pool.offline_disk(spec.id).await.unwrap();
     assert_eq!(result(online).await, Err(Failure::Cancelled));
     rebuild_pending(offline).await;
@@ -1423,7 +1423,7 @@ async fn node_offline_includes_member_whose_initial_add_is_still_committing() {
     let (manager, pool, mut spec) = new_disk_fixture(store.clone(), plane.clone()).await;
     // Use the node observed by new_disk_fixture, which starts at sequence 1.
     spec.node = node_id("n");
-    let gate = store.pause(Point::Add);
+    let gate = store.suspend(Point::Add);
     let online = manager.online_disk(pool.id(), spec.clone()).await.unwrap();
     gate.wait().await;
     assert!(pool.disks().await.unwrap().is_empty());

@@ -55,15 +55,17 @@ async fn id_based_controls_and_observation_survive_dropped_run_handle() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(client.task(id).unwrap().state, RunState::Paused);
-    assert!(client.task(id).unwrap().pause_requested);
+    assert_eq!(client.task(id).unwrap().state, RunState::Suspended);
+    assert!(client.task(id).unwrap().suspend_requested);
     client.resume(id).unwrap();
     client.cancel(id).unwrap();
     let snapshot = terminal(&mut observer).await;
     assert_eq!(snapshot.state, RunState::Failed(Failure::Cancelled));
     assert!(snapshot.cancellation_requested);
     assert!(client.suspend(id).is_err());
-    assert!(client.cancel(WorkflowId(u64::MAX)).is_err());
+    let mut unknown = id;
+    unknown.sequence = u64::MAX;
+    assert!(client.cancel(unknown).is_err());
     pool.shutdown().await.unwrap();
     assert_eq!(
         client.task(id).unwrap().state,

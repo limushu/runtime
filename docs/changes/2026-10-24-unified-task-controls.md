@@ -15,7 +15,7 @@
 | topo 优先 | topo 阻止缩容启动，运行中缩容实际停稳后才放行 topo | 默认策略、停稳交接测试、managed_shrink 示例 |
 | 用户控制 | 用户暂停与策略原因独立，观察/挂起/恢复/取消同一 Task | RunControl 与 TaskSnapshot |
 | 两种下游契约 | 保留原调用，或返回业务部分结果，不新增 Activity 类型 | managed_workflows 两种契约测试 |
-| 恢复先检查 | 未满足条件保持 WaitingConditions，不恢复迁移 | ContinuationGuard 与示例 |
+| 恢复先检查 | 未满足条件保持 WaitingConditions，不恢复迁移 | RunCondition 与示例 |
 | 上游选择命令 | 不同 Workflow 可为同一服务选择不同控制命令 | workflow_can_choose_different_domain_control_commands 测试 |
 | 存量业务不改 | storage-pool/src/workflows 与基线无差异 | git diff 与原有测试 |
 
@@ -23,7 +23,7 @@
 
 Workflow 承载业务执行，Task 管理该执行的完整生命周期。Run 是结果/控制句柄，SavedTask
 是同一 Task 的存储表示，Restored 是恢复交接回执；这些没有新身份或第二个观察中心。
-WorkflowId 是 TaskId 的兼容别名，旧 Workflow 的 run/activity 调用不需要修改。
+任务身份统一为 TaskId，Workflow 只表示业务流程定义。
 既有 PoolTaskSnapshot 只是多池查询的路由信封（TaskRef + 同一个 TaskSnapshot），
 instance 用来拒绝旧 PoolHandle 路由；它不生成任务 ID、不维护第二份任务状态。
 
@@ -70,7 +70,7 @@ checkpoint 只能在先前 Activity 停稳后写入，不表示远端效果与�
 
 Durable 提交等待初始写入，失败时不执行业务，也不对既有任务发出替代取消或抢占暂停。
 尚未确认写入的任务不参与运行关系规划；FIFO 针对已确认的任务。用户取消意图先写盘再交付取消令牌，暂停 ACK
-也在意图写入后产生。pause/resume/cancel 本身是请求，不是持久化确认；调用者等待 wait_paused、
+也在意图写入后产生。pause/resume/cancel 本身是请求，不是持久化确认；调用者等待 wait_suspended、
 状态或终态。请求尚未写盘时崩溃，可能丢失未确认的请求。
 宿主关闭/失主导致的已停稳中断保存 Pending；用户取消保存 Cancelled；不确定效果保存 NeedsCheck。
 中断时遗留的取消意图需要核对，不能直接当成可重执行业务的 Pending。
@@ -86,7 +86,7 @@ TaskStore 是可替换后端。MemoryTaskStore 用于测试；FileTaskStore 为�
 | 情形 | Activity.await | Task 暂停确认 | resume 后 |
 | --- | --- | --- | --- |
 | 保留调用 | 等待业务结果 | ActivityControl::suspend 实际停稳 | 先执行 Workflow guard，再调用所选 resume 命令 |
-| 停稳返回 | 返回领域部分结果 | Workflow 保存进度并到 safe_point | 先执行 guard，再由 Workflow 发起下一次普通 Activity |
+| 停稳返回 | 返回领域部分结果 | Workflow 保存进度并到 wait_until_runnable | 先执行 guard，再由 Workflow 发起下一次普通 Activity |
 
 服务可用 ActivityContext::register_control 提供默认控制；Workflow 可用 set_activity_control
 覆盖下一次调用，让缩容与扩容选择不同命令。这是现有 Activity 的可选能力，不是新 Activity 类型。
@@ -96,7 +96,7 @@ TaskStore 是可替换后端。MemoryTaskStore 用于测试；FileTaskStore 为�
 完成。TaskCenter 不因请求送达就释放占用。保留调用仍持有 Activity 资源锁，使用相同资源的 topo
 仍需等待；此时应选择停稳返回方式，或按真实资源边界声明能力。
 
-ContinuationGuard 由 Workflow 定义，只读且允许取消。返回 Wait(reason) 进入 WaitingConditions，
+RunCondition 由 Workflow 定义，只读且允许取消。返回 Wait(reason) 进入 WaitingConditions，
 业务状态变化后 recheck 唤醒检查。它在继续执行边界检查，初始执行也检查；不同阶段可用 Workflow
 共享状态表达。它不能替代领域命令提交时的版本/状态校验。
 resume 期间又来暂停请求，新的控制代次撤销旧 ACK，须再次停稳后才交接。
@@ -119,3 +119,5 @@ managed_shrink 是框架接入示例：普通迁移服务/client、Workflow 自�
 - storage-pool/src/workflows 与 HEAD 无差异；7 个预先存在的用户文档/图文件与备份逐一哈希一致。
 
 命令及本机 GNU 环境见 [verification.md](../verification.md)。
+
+后续接入：真实顺序缩容 WF、C 控制端口及验收测试见 [缩容工作流](../shrink-workflow.md)。

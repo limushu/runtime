@@ -56,7 +56,7 @@ d=Diagram('01-layers','逻辑分层：谁决定业务，谁负责推进？','先
 rows=[
  ('01  应用入口 / 装配','ink', [('root','Pool / 组合根',['装配 TaskCenter、客户端、依赖','新主轮次由外部选主系统提供']),('entry','PoolHandle / 业务调用方',['提交 Workflow；按 TaskId 管理','一个主的各池共享 TaskIds']),('defs','Workflow 类型定义',['声明 input、details、persistence','需要恢复的类型绑定 dependencies'])]),
  ('02  应用编排 / 决策','blue',[('wf','业务 Workflow',['组织步骤与 checkpoint','定义恢复前业务条件 guard']),('policy','SchedulingPolicy',['准入决策 + 有方向的运行关系','默认 topo → 缩容；可替换策略']),('center','TaskCenter / State',['队列、占用、隔离、启动许可','计算暂停原因；等待真实 ACK'])]),
- ('03  通用执行机制','purple',[('driver','WorkflowDriver',['由 TaskCenter 轮询 Future 集合','不是额外的 Tokio task']),('context','WorkflowContext',['Activity / safe_point / 控制','资源申请、停稳跟踪、续跑记录']),('index','TaskRegistry / ExecutionView',['同一个 Task 的观察与控制入口','Snapshot / Observer / RunControl'])]),
+ ('03  通用执行机制','purple',[('driver','WorkflowDriver',['由 TaskCenter 轮询 Future 集合','不是额外的 Tokio task']),('context','WorkflowContext',['Activity / wait_until_runnable / 控制','资源申请、停稳跟踪、续跑记录']),('index','TaskRegistry / ExecutionView',['同一个 Task 的观察与控制入口','Snapshot / Observer / RunControl'])]),
  ('04  领域能力 / 适配','green',[('host','ServiceHost / ServiceHandler',['邮箱 + Activity Futures','每个服务有独立 Tokio 宿主']),('domain','Disk / Node / VD / Migration',['命令校验、状态和实际业务动作','迁移示例也通过普通 client 接入']),('ports','Ports / Adapters',['元数据、数据面等外部接口','领域停稳确认来自真实执行'])]),
  ('05  持久化 / 外部效果','amber',[('store','TaskStore',['同一个 Task 的存储表示','epoch fencing + revision CAS']),('io','数据面 / 元数据后端',['执行真实 IO 与领域状态提交','TaskStore 不能替代数据面 fencing']),('scope','当前实现范围',['领域侧仍为模拟；无确定性重放','完整跨主接入需领域恢复与对账'])])]
 for i,(label,color,cards) in enumerate(rows):
@@ -80,7 +80,7 @@ d.card('state',80,230,926,110,'State.reap / pump + select',['处理提交、关�
 d.panel(80,380,926,445,'WorkflowDriver.tick()   ·   同一条执行链','purple')
 d.card('future',110,450,405,112,'running.next()',['FuturesUnordered<Workflow Future>','轮询就绪流程；整体完成才返回 ID'],'purple')
 d.card('resource',550,450,420,136,'Broker / 队列 / LockTable',['Broker 发送 Acquire / Release','LockTable 决定等待或返回 Permit','状态仅在 Driver 循环中修改'],'amber')
-d.card('context',110,650,405,135,'WorkflowContext',['safe_point → ctx.activity()','等待 Permit / 业务结果时 Pending','Tracker 等待真实 Activity 停稳'],'purple')
+d.card('context',110,650,405,135,'WorkflowContext',['wait_until_runnable → ctx.activity()','等待 Permit / 业务结果时 Pending','Tracker 等待真实 Activity 停稳'],'purple')
 d.card('client',550,650,420,108,'ActivityClient',['发送 Execute + Context + Guard','通过 oneshot 等待类型化结果'],'purple')
 d.card('domain',1122,240,398,125,'Handler → Service → Ports',['领域校验、命令、外部效果','停稳结果决定资源释放 / 隔离'],'green')
 d.card('host',1122,440,398,125,'ServiceHost 循环',['轮询 Activity Futures','接收命令和 Query；处理停止'],'green')
@@ -123,8 +123,8 @@ d.done()
 d=Diagram('04-pause','同一个 Activity 接口，两种暂停契约','上游 Workflow 选择语义；迁移服务仍通过普通 client / command 接口提供能力。')
 d.panel(48,175,730,682,'A   保留调用   ·   await 暂不返回','purple')
 d.panel(822,175,730,682,'B   停稳返回   ·   await 返回部分业务结果','green')
-left=[('a1','1  普通 ctx.activity(...).await',['服务注册默认 ActivityControl','Workflow 也可覆盖下一次调用']),('a2','2  收到暂停 → suspend 命令',['适配器等待真实停稳 ACK','原 Activity Future 继续存在']),('a3','3  Task = Paused',['原调用与资源锁保留','TaskCenter 此时才可安全交接']),('a4','4  暂停原因清除 → guard 检查',['不满足：WaitingConditions','满足：调用所选 resume，原 await 继续'])]
-right=[('b1','1  普通 ctx.activity(...).await',['服务读取控制 token','暂停时自行停止并结算已完成进度']),('b2','2  返回类型化部分结果',['原 await 返回 cursor / 业务结果','没有新增统一的 Suspended Activity']),('b3','3  保存 checkpoint → safe_point',['Workflow 保存进度，再确认 Task 暂停','已结束 Activity 释放其资源']),('b4','4  暂停原因清除 → guard 检查',['满足后 Workflow 发起下一次 Activity','仍然使用同一个 TaskId'])]
+left=[('a1','1  普通 ctx.activity(...).await',['服务注册默认 ActivityControl','Workflow 也可覆盖下一次调用']),('a2','2  收到暂停 → suspend 命令',['适配器等待真实停稳 ACK','原 Activity Future 继续存在']),('a3','3  Task = Suspended',['原调用与资源锁保留','TaskCenter 此时才可安全交接']),('a4','4  暂停原因清除 → guard 检查',['不满足：WaitingConditions','满足：调用所选 resume，原 await 继续'])]
+right=[('b1','1  普通 ctx.activity(...).await',['服务读取控制 token','暂停时自行停止并结算已完成进度']),('b2','2  返回类型化部分结果',['原 await 返回 cursor / 业务结果','没有新增统一的 Suspended Activity']),('b3','3  保存 checkpoint → wait_until_runnable',['Workflow 保存进度，再确认 Task 暂停','已结束 Activity 释放其资源']),('b4','4  暂停原因清除 → guard 检查',['满足后 Workflow 发起下一次 Activity','仍然使用同一个 TaskId'])]
 for x,items,color in [(78,left,'purple'),(852,right,'green')]:
     for i,(key,title,lines) in enumerate(items):
         y=230+i*151
@@ -134,7 +134,7 @@ d.note(70,902,'没有暂停能力的服务：等动作自然完成。控制失�
 d.note(70,940,'A 保留资源锁；若 topo 需要同一资源，需选择 B 或重新定义符合实际的资源范围。','amber')
 d.step('仍然只有普通 Activity','两种方式都用 ctx.activity。上游可以选择不同 suspend/resume 命令，不新增 Activity 类型。','a1','b1')
 d.step('await 是否返回','A 等最终业务结果；B 停稳后返回领域定义的部分结果，Workflow 有机会保存续跑数据。','a2','b2')
-d.step('何时确认 Task 暂停','A 是停稳适配器 ACK；B 是 Workflow 消费结果、保存 checkpoint 后进入 safe_point。','a3','b3')
+d.step('何时确认 Task 暂停','A 是停稳适配器 ACK；B 是 Workflow 消费结果、保存 checkpoint 后进入 wait_until_runnable。','a3','b3')
 d.step('恢复前重新准入','guard 属于 Workflow。条件变化用 recheck 唤醒；检查通过后才继续迁移。','a4','b4')
 d.done()
 
@@ -159,13 +159,13 @@ d.done()
 
 d=Diagram('06-observation','观察与控制：所有入口指向同一个 Task','Run 是类型化结果句柄；Snapshot 是观察快照；SavedTask 是存储表示。它们不会生成新的 TaskId。')
 d.card('caller',48,200,400,155,'用户 / 调度策略 / 业务事件',['用户：pause / resume / cancel','策略：维护各自的暂停原因','业务：条件变化后 recheck'],'blue')
-d.card('control',545,200,510,155,'RunControl / ControlToken',['请求 ≠ 确认；控制代次使旧 ACK 失效','用户原因与 policy 原因独立','wait_paused 等实际停稳'],'purple')
+d.card('control',545,200,510,155,'RunControl / ControlToken',['请求 ≠ 确认；控制代次使旧 ACK 失效','用户原因与 policy 原因独立','wait_suspended 等实际停稳'],'purple')
 d.card('actor',1150,200,402,155,'Workflow / Activity',['Driver 处理控制与条件检查','领域执行者确认停稳 / 返回结果','取消也必须等待实际动作结束'],'green')
 d.arrow([(448,270),(545,270)],'请求',lx=468,ly=253)
 d.arrow([(1055,270),(1150,270)],'交付',color='purple',lx=1076,ly=253)
 d.panel(48,425,1504,355,'同一个 Task   ·   上排：TaskSnapshot 内容；下排：访问句柄与存储表示','purple')
 d.card('identity',78,490,440,110,'身份与结果状态',['TaskId / name / objects / RunState','progress / cancellation_requested'],'purple')
-d.card('pauses',580,490,440,110,'调度与暂停',['conflicts：准入时解释','blockers / pause_reasons / ACK'],'blue')
+d.card('pauses',580,490,440,110,'调度与暂停',['conflicts：准入时解释','blockers / suspend_reasons / ACK'],'blue')
 d.card('details',1080,490,442,110,'业务与步骤观察',['details：类型化业务附加信息','activities：当前宿主内调用历史'],'green')
 d.card('view',78,645,440,104,'ExecutionView / TaskObserver',['同一快照；watch 可合并更新','不是无损事件日志'],'purple')
 d.card('saved',580,645,440,104,'SavedTask / TaskStore',['同一 ID 的可选恢复记录','不持久化 Activity 历史 / Rust 栈'],'amber')

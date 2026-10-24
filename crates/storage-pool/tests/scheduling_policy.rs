@@ -131,7 +131,7 @@ async fn failed_durable_replacement_does_not_cancel_or_pause_existing_work() {
         .is_err()
     );
     assert!(!old.control.cancellation_requested());
-    assert!(!old.control.pause_requested());
+    assert!(!old.control.suspend_requested());
     assert!(ack.try_recv().is_err());
     assert!(events.try_recv().is_err());
     finish.send(()).unwrap();
@@ -200,15 +200,15 @@ async fn policy_waits_for_real_ack_exposes_live_blockers_and_preserves_user_paus
     assert!(events.try_recv().is_err());
     let snapshot = center.task(scan.id()).unwrap();
     assert_eq!(snapshot.blockers, vec![maintenance.id()]);
-    assert!(!snapshot.pause_acknowledged);
+    assert!(!snapshot.suspend_acknowledged);
     pause.send(()).unwrap();
     let (name, finish_maintenance) = bounded(events.recv()).await.unwrap();
     assert_eq!(name, "maintenance");
-    scan.control.pause().unwrap();
+    scan.control.suspend().unwrap();
     finish_maintenance.send(()).unwrap();
     bounded(maintenance.result()).await.unwrap();
-    bounded(scan.control.wait_paused()).await.unwrap();
-    assert!(scan.control.pause_reasons().contains("user"));
+    bounded(scan.control.wait_suspended()).await.unwrap();
+    assert!(scan.control.suspend_reasons().contains("user"));
     let mut observer = center.observe_task(scan.id()).unwrap();
     bounded(async {
         while !observer.snapshot().blockers.is_empty() {

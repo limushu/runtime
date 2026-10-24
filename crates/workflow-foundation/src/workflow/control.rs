@@ -11,7 +11,7 @@ impl WorkflowContext {
         self.next_control = Some(control);
     }
 
-    pub(super) async fn continue_when_ready(&mut self, cancel: &CancellationToken) -> Outcome<()> {
+    pub(super) async fn wait_for_readiness(&mut self, cancel: &CancellationToken) -> Outcome<()> {
         let mut token = self.controls.token(cancel.clone());
         loop {
             self.persist_intent().await?;
@@ -21,7 +21,7 @@ impl WorkflowContext {
             let request = token.request();
             if request.paused() {
                 if self.controls.acknowledge(request.generation, cancel) {
-                    self.state.send_replace(RunState::Paused);
+                    self.state.send_replace(RunState::Suspended);
                 }
                 token.changed().await?;
                 continue;
@@ -40,8 +40,8 @@ impl WorkflowContext {
                 continue;
             }
             match decision {
-                ContinueDecision::Ready => return Ok(()),
-                ContinueDecision::Wait(reason) => {
+                Readiness::Ready => return Ok(()),
+                Readiness::Blocked(reason) => {
                     self.state.send_replace(RunState::WaitingConditions(reason));
                     tokio::select! {
                         r = token.changed() => { r?; },
@@ -68,7 +68,7 @@ impl WorkflowContext {
         let mut activity_events = self.activities.subscribe();
         loop {
             // Completion remains a business result. The caller may save a partial result
-            // before safe_point(); the next Activity is always behind that same gate.
+            // before wait_until_runnable(); the next Activity is always behind that same gate.
             if let Some(result) = operation.as_mut().now_or_never() {
                 self.controls.revoke();
                 return if result.as_ref().is_err_and(|e| e.uncertain()) {
@@ -112,7 +112,7 @@ impl WorkflowContext {
             };
             if request.paused() {
                 if !stopped {
-                    self.state.send_replace(RunState::Pausing);
+                    self.state.send_replace(RunState::Suspending);
                     if let Some(hook) = hook {
                         // A dispatched control command must settle even if requests change.
                         match AssertUnwindSafe(hook.suspend()).catch_unwind().await {
@@ -132,14 +132,14 @@ impl WorkflowContext {
                         continue;
                     }
                 } else if self.controls.acknowledge(request.generation, &cancel) {
-                    self.state.send_replace(RunState::Paused);
+                    self.state.send_replace(RunState::Suspended);
                 }
             } else if stopped {
                 // Keep the original operation alive while business readiness is checked.
                 let checked = tokio::select! {
                     biased;
                     result = &mut operation => { self.controls.revoke(); return result; },
-                    checked = AssertUnwindSafe(self.continue_when_ready(&cancel)).catch_unwind() => checked,
+                    checked = AssertUnwindSafe(self.wait_for_readiness(&cancel)).catch_unwind() => checked,
                 };
                 match checked {
                     Ok(Ok(())) => {}

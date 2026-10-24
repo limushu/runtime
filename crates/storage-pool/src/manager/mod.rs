@@ -36,7 +36,11 @@ pub(crate) struct Registry {
 #[derive(Clone)]
 pub struct PoolManager {
     pub(crate) registry: Arc<Mutex<Registry>>,
-    task_ids: Option<TaskIds>,
+    task_ids: TaskIds,
+    shrink: Option<(
+        Arc<dyn crate::domains::shrink::ShrinkStorage>,
+        Arc<dyn crate::domains::balance::BalanceBackend>,
+    )>,
     config: Config,
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
@@ -53,7 +57,8 @@ impl PoolManager {
                 history_limit: config.task_history,
                 ..Registry::default()
             })),
-            task_ids: None,
+            task_ids: TaskIds::default(),
+            shrink: None,
             config,
             metadata,
             data_plane,
@@ -61,7 +66,17 @@ impl PoolManager {
         }
     }
     pub fn with_task_ids(mut self, ids: TaskIds) -> Self {
-        self.task_ids = Some(ids);
+        self.task_ids = ids;
+        self
+    }
+    /// Bind the same authoritative storage domains and C balance bridge used by
+    /// the application. Default pools reject shrink until these capabilities exist.
+    pub fn with_shrink(
+        mut self,
+        storage: Arc<dyn crate::domains::shrink::ShrinkStorage>,
+        balance: Arc<dyn crate::domains::balance::BalanceBackend>,
+    ) -> Self {
+        self.shrink = Some((storage, balance));
         self
     }
     pub fn create(&self, request: CreatePool) -> Outcome<PoolHandle> {
@@ -85,6 +100,7 @@ impl PoolManager {
             self.data_plane.clone(),
             Arc::downgrade(&self.registry),
             self.task_ids.clone(),
+            self.shrink.clone(),
         )?;
         let handle = pool.handle();
         registry
@@ -183,17 +199,17 @@ impl PoolManager {
     pub fn cancel(&self, task: TaskRef) -> Outcome<()> {
         let pool = self.get(task.pool)?;
         pool.check_task_ref(task)?;
-        pool.cancel(task.workflow)
+        pool.cancel(task.task_id)
     }
     pub fn suspend(&self, task: TaskRef) -> Outcome<()> {
         let pool = self.get(task.pool)?;
         pool.check_task_ref(task)?;
-        pool.suspend(task.workflow)
+        pool.suspend(task.task_id)
     }
     pub fn resume(&self, task: TaskRef) -> Outcome<()> {
         let pool = self.get(task.pool)?;
         pool.check_task_ref(task)?;
-        pool.resume(task.workflow)
+        pool.resume(task.task_id)
     }
     /// Compatibility facade. Membership validation and reservation live in Pool.
     pub async fn online_disk(&self, pool: &PoolId, spec: DiskSpec) -> Outcome<Run<MemberDisk>> {

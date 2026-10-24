@@ -258,3 +258,6 @@ impl DataPlane for SimulatedDataPlane {
         ready(cancel)
     }
 }
+
+mod shrink;
+pub use shrink::{SimulatedBalance, SimulatedShrinkStorage};

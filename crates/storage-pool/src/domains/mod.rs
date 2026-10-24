@@ -40,3 +40,6 @@ pub mod disk;
 pub mod node;
 pub mod tier;
 pub mod vd;
+
+pub mod balance;
+pub mod shrink;

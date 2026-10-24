@@ -31,7 +31,7 @@ pub type Outcome<T> = Result<T, Failure>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivityId {
-    pub workflow: crate::TaskId,
+    pub task_id: crate::TaskId,
     pub sequence: u64,
 }
 
@@ -100,8 +100,8 @@ pub enum RunState {
     WaitingObjects,
     Running,
     /// Acknowledged safe pause, including an in-flight operation that has stopped.
-    Paused,
-    Pausing,
+    Suspended,
+    Suspending,
     WaitingConditions(String),
     WaitingResources,
     WaitingSignal,

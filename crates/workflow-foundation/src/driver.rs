@@ -29,37 +29,37 @@ impl ExecutionView {
         self.tasks.lock().unwrap().snapshots()
     }
     /// List retained tasks without copying their Activity histories.
-    pub fn task_ids(&self) -> Vec<WorkflowId> {
+    pub fn task_ids(&self) -> Vec<TaskId> {
         self.tasks.lock().unwrap().ids()
     }
-    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
+    pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
         Ok(self.observe_task(id)?.snapshot())
     }
-    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+    pub fn observe_task(&self, id: TaskId) -> Outcome<TaskObserver> {
         self.tasks.lock().unwrap().observer(id)
     }
-    fn control(&self, id: WorkflowId) -> Outcome<RunControl> {
+    fn control(&self, id: TaskId) -> Outcome<RunControl> {
         if self.scope.is_closed() {
             return Err(Failure::Unavailable);
         }
         self.tasks.lock().unwrap().control(id)
     }
-    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
-        self.control(id)?.pause()
+    pub fn suspend(&self, id: TaskId) -> Outcome<()> {
+        self.control(id)?.suspend()
     }
-    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn resume(&self, id: TaskId) -> Outcome<()> {
         self.control(id)?.resume()
     }
     pub fn recheck(&self, id: TaskId) -> Outcome<()> {
         self.control(id)?.recheck();
         Ok(())
     }
-    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn cancel(&self, id: TaskId) -> Outcome<()> {
         self.control(id)?.cancel();
         Ok(())
     }
-    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
-        self.control(id)?.wait_paused().await
+    pub async fn wait_suspended(&self, id: TaskId) -> Outcome<()> {
+        self.control(id)?.wait_suspended().await
     }
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.state.borrow().clone()
@@ -93,7 +93,7 @@ pub struct WorkflowDriver {
     broker: Broker,
     events: mpsc::UnboundedReceiver<Event>,
     table: LockTable,
-    running: FuturesUnordered<BoxFuture<'static, WorkflowId>>,
+    running: FuturesUnordered<BoxFuture<'static, TaskId>>,
     services: Vec<ServiceOwner>,
     names: BTreeSet<String>,
     failure: Option<Failure>,
@@ -319,7 +319,7 @@ impl WorkflowDriver {
     }
     /// Cancellation-safe. Returns after one resource event or completed workflow.
     /// An idle driver waits for a new event; the enclosing select can still accept submissions.
-    pub async fn tick(&mut self) -> Option<WorkflowId> {
+    pub async fn tick(&mut self) -> Option<TaskId> {
         let completed = tokio::select! {
             biased;
             _ = self.wake.notified() => None,

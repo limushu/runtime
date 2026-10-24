@@ -276,20 +276,20 @@ impl PoolHandle {
     pub fn instance(&self) -> PoolUuid {
         self.shared.instance
     }
-    pub fn task_ref(&self, workflow: WorkflowId) -> TaskRef {
+    pub fn task_ref(&self, task_id: TaskId) -> TaskRef {
         TaskRef {
             pool: self.uuid(),
             instance: self.instance(),
-            workflow,
+            task_id,
         }
     }
     pub fn task_by_ref(&self, task: TaskRef) -> Outcome<TaskSnapshot> {
         self.check_task_ref(task)?;
-        self.task(task.workflow)
+        self.task(task.task_id)
     }
     pub fn observe_task_by_ref(&self, task: TaskRef) -> Outcome<TaskObserver> {
         self.check_task_ref(task)?;
-        self.observe_task(task.workflow)
+        self.observe_task(task.task_id)
     }
     pub(crate) fn check_task_ref(&self, task: TaskRef) -> Outcome<()> {
         if task.pool != self.uuid() || task.instance != self.instance() {

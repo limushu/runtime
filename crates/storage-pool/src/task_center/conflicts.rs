@@ -94,7 +94,24 @@ impl OperationKind {
     }
 }
 impl SchedulingPolicy<PoolOperation> for PoolSchedulingPolicy {
+    fn priority(&self, task: &PoolOperation) -> i32 {
+        if task.kind.topology() {
+            2
+        } else if matches!(task.kind, OperationKind::Shrink(_)) {
+            0
+        } else {
+            1
+        }
+    }
     fn admission(&self, incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
+        if matches!(incoming.kind, OperationKind::Shrink(_))
+            && matches!(existing.kind, OperationKind::Shrink(_))
+        {
+            return conflict_result(
+                ConflictDecision::Reject("pool already has an unfinished shrink task"),
+                "single-shrink",
+            );
+        }
         if matches!(incoming.kind, OperationKind::Shrink(_))
             || matches!(existing.kind, OperationKind::Shrink(_))
         {

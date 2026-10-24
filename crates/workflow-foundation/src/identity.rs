@@ -107,6 +107,12 @@ impl<'de> Deserialize<'de> for TaskId {
 /// Recreating an allocator with a used epoch is forbidden, including after process restart.
 #[derive(Clone)]
 pub struct TaskIds(Arc<Generation>);
+impl Default for TaskIds {
+    /// Process-local identities. Persistence requires an election-supplied epoch.
+    fn default() -> Self {
+        Self::local()
+    }
+}
 struct Generation {
     epoch: u64,
     next: AtomicU64,
@@ -144,6 +150,7 @@ impl TaskIds {
     pub fn active(&self) -> bool {
         self.0.active.load(Ordering::SeqCst)
     }
+    #[allow(deprecated)] // fetch_update also supports the documented Rust 1.95 toolchain.
     pub(crate) fn allocate(&self, pool: u128, business: &str) -> Outcome<TaskId> {
         let business = Business::new(business)?;
         if !self.active() {
@@ -163,18 +170,5 @@ impl TaskIds {
             pool,
             business,
         })
-    }
-}
-
-/// Compatibility spelling; this is the SAME identity, not an execution ID.
-pub type WorkflowId = TaskId;
-/// Legacy invalid/local ID constructor, retained for old diagnostic callers.
-#[allow(non_snake_case)]
-pub fn WorkflowId(sequence: u64) -> TaskId {
-    TaskId {
-        epoch: 0,
-        sequence,
-        pool: 0,
-        business: Business::new("legacy").unwrap(),
     }
 }

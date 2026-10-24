@@ -59,7 +59,7 @@ topo 完成只清除它自己的暂停原因；其他 topo 或用户暂停仍有
 - 保留调用：ActivityControl 发送领域 suspend 命令并等待停稳。原 await 继续等待；
   暂停原因清除后，Workflow guard 先检查，满足才执行所选 resume 命令。
 - 停稳返回：服务观察控制 token，自行停稳后返回业务部分结果。Workflow 保存 checkpoint，
-  再进入 safe_point 确认 Task 暂停；恢复并通过 guard 后发起下一次普通 Activity。
+  再进入 wait_until_runnable 确认 Task 暂停；恢复并通过 guard 后发起下一次普通 Activity。
 
 Workflow 可覆盖下一次调用的控制适配器，因此缩容和扩容可以选择不同领域命令。
 完全不支持暂停的服务需等自然完成。保留调用仍持有 Activity 资源锁，topo 若需要同一资源，

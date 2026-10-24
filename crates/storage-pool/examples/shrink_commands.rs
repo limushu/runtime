@@ -78,22 +78,22 @@ impl Workflow for ShrinkWorkflow {
 enum Command {
     Start {
         chunks: u32,
-        reply: oneshot::Sender<Outcome<WorkflowId>>,
+        reply: oneshot::Sender<Outcome<TaskId>>,
     },
     Suspend {
-        id: WorkflowId,
+        id: TaskId,
         reply: oneshot::Sender<Outcome<()>>,
     },
     WaitSuspended {
-        id: WorkflowId,
+        id: TaskId,
         reply: oneshot::Sender<Outcome<()>>,
     },
     Resume {
-        id: WorkflowId,
+        id: TaskId,
         reply: oneshot::Sender<Outcome<()>>,
     },
     Finish {
-        id: WorkflowId,
+        id: TaskId,
         reply: oneshot::Sender<Outcome<u32>>,
     },
 }
@@ -105,7 +105,7 @@ async fn commands(
     service: ServiceClient<ShrinkService>,
     mut rx: mpsc::Receiver<Command>,
 ) -> Outcome<()> {
-    let mut results: BTreeMap<WorkflowId, Run<u32>> = BTreeMap::new();
+    let mut results: BTreeMap<TaskId, Run<u32>> = BTreeMap::new();
     let coordinator = pool.client();
     let mut waiters = tokio::task::JoinSet::new();
     while let Some(command) = rx.recv().await {

@@ -11,6 +11,11 @@ pub enum Relation {
 pub trait SchedulingPolicy<D>: Send + Sync + 'static {
     fn admission(&self, incoming: &D, existing: &D) -> Conflict;
     fn relation(&self, task: &D, other: &D) -> Relation;
+    /// Queued precedence; equal priorities preserve FIFO. Yield targets should
+    /// outrank the tasks yielding to them and intervening queued competitors.
+    fn priority(&self, _task: &D) -> i32 {
+        0
+    }
 }
 pub struct Candidate<'a, D> {
     pub id: TaskId,
@@ -24,7 +29,7 @@ pub struct Plan {
     pub blockers: BTreeMap<TaskId, Vec<TaskId>>,
     pub ready: Vec<TaskId>,
 }
-/// Input order is FIFO. Yield is directional; policies must not introduce cycles.
+/// Equal priority uses input FIFO order. Yield is directional; policies must not introduce cycles.
 /// Apply pause requests, then recompute with fresh ACKs before opening start gates.
 pub fn plan<D: 'static>(policy: &dyn SchedulingPolicy<D>, tasks: &[Candidate<'_, D>]) -> Plan {
     let mut result = Plan::default();
@@ -43,7 +48,10 @@ pub fn plan<D: 'static>(policy: &dyn SchedulingPolicy<D>, tasks: &[Candidate<'_,
             } else if matches!(reverse, Relation::YieldTo(_)) {
                 other.started && !other.paused
             } else if relation == Relation::Exclusive || reverse == Relation::Exclusive {
-                other.started || (!task.started && other_index < index)
+                let before = policy.priority(other.descriptor) > policy.priority(task.descriptor)
+                    || (policy.priority(other.descriptor) == policy.priority(task.descriptor)
+                        && other_index < index);
+                other.started || (!task.started && before)
             } else {
                 false
             };

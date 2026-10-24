@@ -10,7 +10,7 @@ pub enum ActivityState {
     /// Includes waiting for space in the service mailbox.
     Queued,
     Running,
-    Paused,
+    Suspended,
     Completed,
     Failed(Failure),
 }
@@ -132,15 +132,15 @@ pub struct TaskProgress {
 #[derive(Debug, Clone)]
 pub struct TaskSnapshot {
     pub pool: String,
-    pub id: WorkflowId,
+    pub id: TaskId,
     pub name: &'static str,
     pub state: RunState,
     pub objects: Vec<ObjectKey>,
     pub progress: TaskProgress,
     pub activities: ActivityHistory,
-    pub pause_requested: bool,
-    pub pause_acknowledged: bool,
-    pub pause_reasons: std::collections::BTreeSet<String>,
+    pub suspend_requested: bool,
+    pub suspend_acknowledged: bool,
+    pub suspend_reasons: std::collections::BTreeSet<String>,
     pub cancellation_requested: bool,
     pub details: serde_json::Value,
     pub conflicts: Vec<ConflictMatch>,
@@ -167,9 +167,9 @@ impl TaskRecord {
             objects: self.control.objects.lock().unwrap().clone(),
             progress: self.control.progress(),
             activities: self.control.activities(),
-            pause_requested: self.control.pause_requested(),
-            pause_acknowledged: self.control.pause_acknowledged(),
-            pause_reasons: self.control.pause_reasons(),
+            suspend_requested: self.control.suspend_requested(),
+            suspend_acknowledged: self.control.suspend_acknowledged(),
+            suspend_reasons: self.control.suspend_reasons(),
             cancellation_requested: self.control.cancellation_requested(),
             details: info.details,
             conflicts: info.conflicts,
@@ -211,8 +211,8 @@ impl TaskObserver {
     }
 }
 pub(crate) struct TaskRegistry {
-    entries: BTreeMap<WorkflowId, TaskRecord>,
-    completed: VecDeque<WorkflowId>,
+    entries: BTreeMap<TaskId, TaskRecord>,
+    completed: VecDeque<TaskId>,
     limit: usize,
 }
 impl TaskRegistry {
@@ -227,7 +227,7 @@ impl TaskRegistry {
         self.entries
             .insert(control.id, TaskRecord { control, pool });
     }
-    pub fn finish(&mut self, id: WorkflowId) {
+    pub fn finish(&mut self, id: TaskId) {
         if self.entries.get(&id).is_some_and(|record| {
             matches!(
                 record.control.state(),
@@ -243,7 +243,7 @@ impl TaskRegistry {
             }
         }
     }
-    pub fn observer(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+    pub fn observer(&self, id: TaskId) -> Outcome<TaskObserver> {
         let record = self
             .entries
             .get(&id)
@@ -260,10 +260,10 @@ impl TaskRegistry {
     pub fn snapshots(&self) -> Vec<TaskSnapshot> {
         self.entries.values().map(TaskRecord::snapshot).collect()
     }
-    pub fn ids(&self) -> Vec<WorkflowId> {
+    pub fn ids(&self) -> Vec<TaskId> {
         self.entries.keys().copied().collect()
     }
-    pub fn control(&self, id: WorkflowId) -> Outcome<RunControl> {
+    pub fn control(&self, id: TaskId) -> Outcome<RunControl> {
         let control = self.observer(id)?.record.control;
         if matches!(control.state(), RunState::Completed | RunState::Failed(_)) {
             return Err(Failure::Rejected("task is terminal".into()));

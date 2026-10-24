@@ -239,7 +239,7 @@ Pool 负责创建/删除的提交顺序和对账；Catalog 负责原子唯一性
 重新加载已有 Pool 必须恢复元数据和成员归属、同步事实，不将同名 create 当作恢复。
 
 TUI 先枚举 Manager 的 PoolDescriptor，再从各 PoolHandle 订阅任务和 Activity。
-任务引用包含 `(PoolUuid, instance_epoch, WorkflowId)`，创建/删除 Pool 的流程同样归属于该池。
+任务引用包含 `(PoolUuid, instance_epoch, TaskId)`，创建/删除 Pool 的流程同样归属于该池。
 Manager 可汇总查询结果，但不拥有另一份任务状态机。
 卸载期间保留逻辑 PoolHandle；删除后保留有界只读历史引用，与活跃目录分开淘汰。
 当前 Task/Activity 历史仍是进程内有界观测，跨重启查询需另外持久化。

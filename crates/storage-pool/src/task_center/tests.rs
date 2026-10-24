@@ -18,7 +18,7 @@ fn operation(kind: OperationKind, keys: &[&str]) -> PoolOperation {
 }
 struct Work {
     operation: PoolOperation,
-    started: mpsc::UnboundedSender<WorkflowId>,
+    started: mpsc::UnboundedSender<TaskId>,
     uncertain: bool,
 }
 impl PoolWorkflow for Work {
@@ -45,8 +45,8 @@ impl Workflow for Work {
 }
 struct Fixture {
     center: TaskCenter,
-    started: mpsc::UnboundedSender<WorkflowId>,
-    events: mpsc::UnboundedReceiver<WorkflowId>,
+    started: mpsc::UnboundedSender<TaskId>,
+    events: mpsc::UnboundedReceiver<TaskId>,
 }
 impl Fixture {
     fn new(limit: usize) -> Self {
@@ -75,7 +75,7 @@ impl Fixture {
         .await
         .unwrap()
     }
-    async fn next(&mut self) -> WorkflowId {
+    async fn next(&mut self) -> TaskId {
         tokio::time::timeout(LIMIT, self.events.recv())
             .await
             .unwrap()

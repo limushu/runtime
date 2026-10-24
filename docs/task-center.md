@@ -54,9 +54,9 @@ YieldTo 有方向，策略不能形成让出环。规划器不猜测资源、业
 
 长 Activity 有两种接入方式，接口仍为 ctx.activity(...).await：
 
-1. 调用保持等待，ActivityControl::suspend 返回真实停稳确认；Workflow 的 continuation_guard
+1. 调用保持等待，ActivityControl::suspend 返回真实停稳确认；Workflow 的 run_condition
    重新判断条件后，框架调用这个 Workflow 选择的 resume 适配器。
-2. 服务停稳并返回业务部分结果；Workflow 保存 checkpoint 后到达 safe_point，Task 才确认暂停。
+2. 服务停稳并返回业务部分结果；Workflow 保存 checkpoint 后到达 wait_until_runnable，Task 才确认暂停。
    恢复检查满足后继续下一次 Activity。没有假造统一的“Activity 暂停结果”。
 
 如果服务不能暂停，框架只能等它自然完成。暂停保留 Activity 资源锁：让出关系不允许另一个
@@ -69,7 +69,7 @@ YieldTo 有方向，策略不能形成让出环。规划器不猜测资源、业
 task(id)、observe_task(id) 都返回 foundation 的同一个 TaskSnapshot/TaskObserver：
 
 - conflicts：准入时的解释；blockers：当前阻塞者。
-- pause_reasons、pause_acknowledged：暂停来源与真实确认。
+- suspend_reasons、suspend_acknowledged：暂停来源与真实确认。
 - details：业务附加信息；details_as::<T>() 类型化读取。
 - activities：当前宿主的调用历史，默认最多 1024 条，total/omitted 明确累计和淘汰数量。
 

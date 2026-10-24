@@ -67,7 +67,7 @@ async fn live_and_historical_snapshots_retain_each_actual_step() {
     assert!(first.started_at.is_some());
     assert!(first.finished_at.is_some());
     let second = &snapshot.activities.entries[1];
-    assert_eq!(second.id.workflow, run.id());
+    assert_eq!(second.id.task_id, run.id());
     assert_eq!(second.id.sequence, 2);
     assert_eq!(second.state, ActivityState::Running);
     assert!(second.finished_at.is_none());

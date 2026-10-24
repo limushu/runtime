@@ -1,7 +1,7 @@
 //! Business-free execution mechanics; applications can drive workflows in their own event loop.
 mod driver;
 mod identity;
-pub use identity::{TaskId, TaskIds, WorkflowId};
+pub use identity::{TaskId, TaskIds};
 mod locks;
 mod model;
 mod service;
@@ -22,8 +22,8 @@ pub use workflow::{Run, RunControl, Workflow, WorkflowContext};
 
 mod control;
 pub use control::{
-    ActivityControl, CancellationReason, ContinuationGuard, ContinueDecision, ControlRequest,
-    ControlToken,
+    ActivityControl, ActivityExit, CancellationReason, ControlRequest, ControlToken, Readiness,
+    RunCondition,
 };
 
 pub mod persistence;

@@ -46,8 +46,8 @@ async fn typed_pipeline_calls_two_services_and_accepts_an_early_signal() {
     assert_eq!(next(&mut rx2).await, "second");
     let first_id = first.query(()).await.unwrap().1[0];
     let second_id = second.query(()).await.unwrap().1[0];
-    assert_eq!(first_id.workflow, run.id());
-    assert_eq!(second_id.workflow, run.id());
+    assert_eq!(first_id.task_id, run.id());
+    assert_eq!(second_id.task_id, run.id());
     assert_eq!((first_id.sequence, second_id.sequence), (1, 2));
     assert_eq!(run.control.state(), RunState::Completed);
     assert!(matches!(run.result().await, Err(Failure::Rejected(_))));

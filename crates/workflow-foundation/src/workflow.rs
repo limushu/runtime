@@ -44,7 +44,7 @@ pub trait Workflow: Send + 'static {
             "workflow does not define restoration".into(),
         ))
     }
-    fn continuation_guard(&self) -> Option<Arc<dyn ContinuationGuard>> {
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         None
     }
     async fn run(self, context: &mut WorkflowContext) -> Outcome<Self::Output>;
@@ -57,7 +57,7 @@ pub struct Run<T> {
     accepted: watch::Receiver<Option<Outcome<()>>>,
 }
 impl<T> Run<T> {
-    pub fn id(&self) -> WorkflowId {
+    pub fn id(&self) -> TaskId {
         self.control.id
     }
     /// Confirms durable acceptance (or immediate in-memory registration). Driver owners
@@ -87,7 +87,7 @@ impl<T> Run<T> {
 }
 #[derive(Clone)]
 pub struct RunControl {
-    pub id: WorkflowId,
+    pub id: TaskId,
     pub name: &'static str,
     cancel: CancellationToken,
     signals: mpsc::Sender<Signal>,
@@ -107,13 +107,13 @@ impl RunControl {
         self.acceptance.borrow().clone()
     }
     /// Request a pause at the next safe boundary, not preemption of external IO.
-    pub fn pause(&self) -> Outcome<()> {
-        self.set_pause(true)
+    pub fn suspend(&self) -> Outcome<()> {
+        self.set_suspended(true)
     }
     pub fn resume(&self) -> Outcome<()> {
-        self.set_pause(false)
+        self.set_suspended(false)
     }
-    fn set_pause(&self, value: bool) -> Outcome<()> {
+    fn set_suspended(&self, value: bool) -> Outcome<()> {
         if self.cancel.is_cancelled()
             || matches!(self.state(), RunState::Completed | RunState::Failed(_))
         {
@@ -149,19 +149,19 @@ impl RunControl {
     }
     pub fn activities(&self) -> ActivityHistory {
         let mut history = self.activities.borrow().clone();
-        if self.pause_acknowledged() {
+        if self.suspend_acknowledged() {
             for e in &mut history.entries {
                 if e.state == ActivityState::Running {
-                    e.state = ActivityState::Paused;
+                    e.state = ActivityState::Suspended;
                 }
             }
         }
         history
     }
-    pub fn pause_requested(&self) -> bool {
+    pub fn suspend_requested(&self) -> bool {
         self.controls.tx.borrow().paused()
     }
-    pub fn pause_acknowledged(&self) -> bool {
+    pub fn suspend_acknowledged(&self) -> bool {
         !self.cancel.is_cancelled()
             && !matches!(
                 self.state.borrow().clone(),
@@ -169,10 +169,10 @@ impl RunControl {
             )
             && self.controls.acknowledged()
     }
-    pub fn pause_reasons(&self) -> std::collections::BTreeSet<String> {
+    pub fn suspend_reasons(&self) -> std::collections::BTreeSet<String> {
         self.controls.reasons()
     }
-    pub fn set_policy_pauses(&self, reasons: &std::collections::BTreeSet<String>) {
+    pub fn set_policy_suspensions(&self, reasons: &std::collections::BTreeSet<String>) {
         self.controls.update(|current| {
             current.retain(|s| !s.starts_with("policy:"));
             current.extend(reasons.iter().map(|s| format!("policy:{s}")));
@@ -182,7 +182,7 @@ impl RunControl {
         self.controls.recheck.notify_one();
     }
     /// Cancellation-safe wait for acknowledgement, not merely request delivery.
-    pub async fn wait_paused(&self) -> Outcome<()> {
+    pub async fn wait_suspended(&self) -> Outcome<()> {
         let mut state = self.state.clone();
         let mut request = self.controls.tx.subscribe();
         loop {
@@ -193,7 +193,7 @@ impl RunControl {
                 return Err(Failure::Rejected("pause request is not active".into()));
             }
             match state.borrow_and_update().clone() {
-                RunState::Paused if self.pause_acknowledged() => return Ok(()),
+                RunState::Suspended if self.suspend_acknowledged() => return Ok(()),
                 RunState::Completed | RunState::Failed(_) => {
                     return Err(Failure::Rejected(
                         "run ended before pause acknowledgement".into(),
@@ -228,8 +228,8 @@ impl RunControl {
                 .load(std::sync::atomic::Ordering::SeqCst)
     }
     pub fn state(&self) -> RunState {
-        if self.pause_acknowledged() {
-            RunState::Paused
+        if self.suspend_acknowledged() {
+            RunState::Suspended
         } else {
             self.state.borrow().clone()
         }
@@ -339,7 +339,7 @@ impl Drop for ActivityGuard {
 
 /// Non-cloneable execution capability. All effects go through activity().
 pub struct WorkflowContext {
-    pub(crate) id: WorkflowId,
+    pub(crate) id: TaskId,
     pub(crate) scope: Arc<Scope>,
     pub(crate) pool: String,
     pub(crate) broker: Broker,
@@ -357,13 +357,13 @@ pub struct WorkflowContext {
     next_activity: u64,
     pause: watch::Receiver<ControlRequest>,
     controls: crate::control::Controls,
-    continuation: Option<Arc<dyn ContinuationGuard>>,
+    continuation: Option<Arc<dyn RunCondition>>,
     next_control: Option<Arc<dyn ActivityControl>>,
     journal: Option<crate::persistence::Journal>,
     restored_checkpoint: serde_json::Value,
 }
 impl WorkflowContext {
-    pub fn id(&self) -> WorkflowId {
+    pub fn id(&self) -> TaskId {
         self.id
     }
     pub fn pool(&self) -> &str {
@@ -421,24 +421,25 @@ impl WorkflowContext {
     async fn persist_intent(&self) -> Outcome<()> {
         sync_controls(&self.journal, &self.controls, &self.cancel).await
     }
-    pub fn checkpoint(&self) -> Outcome<()> {
+    pub fn check_execution(&self) -> Outcome<()> {
         if self.cancel.is_cancelled() || self.scope.is_closed() {
             Err(Failure::Cancelled)
         } else {
             self.tracker.ready()
         }
     }
-    /// Cooperative boundary for custom computation; checkpoint() only checks cancel.
-    pub async fn safe_point(&mut self) -> Outcome<()> {
-        self.checkpoint()?;
+    /// Wait for suspension reasons to clear and the workflow's RunCondition to
+    /// become Ready. All earlier activities must have settled at this boundary.
+    pub async fn wait_until_runnable(&mut self) -> Outcome<()> {
+        self.check_execution()?;
         let cancel = self.cancel.clone();
-        self.continue_when_ready(&cancel).await?;
+        self.wait_for_readiness(&cancel).await?;
         self.state.send_replace(RunState::Running);
         Ok(())
     }
     pub async fn next_signal(&mut self) -> Outcome<Signal> {
         loop {
-            self.safe_point().await?;
+            self.wait_until_runnable().await?;
             self.state.send_replace(RunState::WaitingSignal);
             tokio::select! {
                 biased;
@@ -446,7 +447,7 @@ impl WorkflowContext {
                 changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
                 signal = self.signals.recv() => {
                     let signal = signal.ok_or(Failure::Unavailable)?;
-                    self.safe_point().await?;
+                    self.wait_until_runnable().await?;
                     return Ok(signal);
                 }
             }
@@ -455,13 +456,13 @@ impl WorkflowContext {
     pub async fn sleep(&mut self, delay: Duration) -> Outcome<()> {
         let deadline = tokio::time::Instant::now() + delay;
         loop {
-            self.safe_point().await?;
+            self.wait_until_runnable().await?;
             self.state.send_replace(RunState::WaitingTimer);
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
                 changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-                _ = tokio::time::sleep_until(deadline) => return self.safe_point().await,
+                _ = tokio::time::sleep_until(deadline) => return self.wait_until_runnable().await,
             }
         }
     }
@@ -476,7 +477,7 @@ impl WorkflowContext {
         request: R,
     ) -> Outcome<P> {
         let override_hook = self.next_control.take();
-        self.safe_point().await?;
+        self.wait_until_runnable().await?;
         if !Arc::ptr_eq(&self.scope, &service.scope) {
             return Err(Failure::Rejected(
                 "service belongs to another Pool instance".into(),
@@ -485,7 +486,7 @@ impl WorkflowContext {
         let resources = (service.resources)(&request);
         self.next_activity += 1;
         let id = ActivityId {
-            workflow: self.id,
+            task_id: self.id,
             sequence: self.next_activity,
         };
         let mut observation = ActivityObservation::new(
@@ -498,7 +499,7 @@ impl WorkflowContext {
         );
         let permit: Outcome<Permit> = async {
             loop {
-                self.safe_point().await?;
+                self.wait_until_runnable().await?;
                 self.state.send_replace(RunState::WaitingResources);
                 let broker = self.broker.clone();
                 tokio::select! {
@@ -507,7 +508,7 @@ impl WorkflowContext {
                     permit = broker.acquire(Kind::Activity, resources.clone(), &self.cancel) => {
                         let permit = permit?;
                         if self.pause.borrow().paused() { drop(permit); continue; }
-                        self.checkpoint()?;
+                        self.check_execution()?;
                         break Ok(permit);
                     }
                 }
@@ -533,6 +534,7 @@ impl WorkflowContext {
                 cancel: cancel.clone(),
                 control: self.controls.token(cancel.clone()),
                 hooks: hook_tx,
+                progress: self.progress.clone(),
             },
             guard,
         );
@@ -579,7 +581,7 @@ impl<T> Drop for Completion<T> {
 }
 
 pub(crate) struct ExecutionEnv {
-    pub id: WorkflowId,
+    pub id: TaskId,
     pub wake: Arc<Notify>,
     pub scope: Arc<Scope>,
     pub pool: String,
@@ -595,7 +597,7 @@ pub(crate) fn execution<W: Workflow>(
     env: ExecutionEnv,
 ) -> (
     Run<W::Output>,
-    futures_util::future::BoxFuture<'static, WorkflowId>,
+    futures_util::future::BoxFuture<'static, TaskId>,
 ) {
     let ExecutionEnv {
         id,
@@ -687,7 +689,7 @@ pub(crate) fn execution<W: Workflow>(
             }
             accepted.send_replace(Some(Ok(())));
             context.controls.wake.notify_one();
-            context.continuation = workflow.continuation_guard();
+            context.continuation = workflow.run_condition();
             context.report_details(
                 &restored
                     .as_ref()
@@ -729,7 +731,7 @@ pub(crate) fn execution<W: Workflow>(
                     }
                 }
             }
-            context.safe_point().await?;
+            context.wait_until_runnable().await?;
             let journal = context.journal.clone();
             let controls = context.controls.clone();
             let cancel = context.cancel.clone();
@@ -846,7 +848,7 @@ async fn sync_controls(
 ) -> Outcome<()> {
     loop {
         let request = controls.tx.borrow().clone();
-        let paused = request.pause_reasons.contains("user");
+        let paused = request.suspend_reasons.contains("user");
         let cancelled = controls
             .user_cancelled
             .load(std::sync::atomic::Ordering::SeqCst);

@@ -24,12 +24,12 @@ struct Details {
 }
 struct Conditions(AtomicBool);
 #[async_trait]
-impl ContinuationGuard for Conditions {
-    async fn check(&self) -> Outcome<ContinueDecision> {
+impl RunCondition for Conditions {
+    async fn check(&self) -> Outcome<Readiness> {
         Ok(if self.0.load(Ordering::SeqCst) {
-            ContinueDecision::Ready
+            Readiness::Ready
         } else {
-            ContinueDecision::Wait("waiting for valid placement".into())
+            Readiness::Blocked("waiting for valid placement".into())
         })
     }
 }
@@ -136,7 +136,7 @@ impl Workflow for Shrink {
             services: (*dependencies.get::<Services>()?).clone(),
         })
     }
-    fn continuation_guard(&self) -> Option<Arc<dyn ContinuationGuard>> {
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         Some(self.services.conditions.clone())
     }
     async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
@@ -159,7 +159,7 @@ impl Workflow for Shrink {
             ctx.save_checkpoint(&cursor).await?;
             // Retained calls arrive here when complete. Stopping calls may return a
             // partial result; persist it BEFORE acknowledging the task's safe pause.
-            ctx.safe_point().await?;
+            ctx.wait_until_runnable().await?;
         }
         Ok(())
     }
@@ -167,7 +167,7 @@ impl Workflow for Shrink {
 impl PoolWorkflow for Shrink {
     fn operation(&self) -> PoolOperation {
         PoolOperation {
-            kind: OperationKind::Shrink(DiskId::new(&self.input.disk).unwrap()),
+            kind: OperationKind::Shrink(vec![DiskId::new(&self.input.disk).unwrap()]),
             objects: self.objects(),
         }
     }

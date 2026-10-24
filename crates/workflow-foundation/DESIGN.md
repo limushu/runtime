@@ -79,7 +79,7 @@ Pool 是实例隔离范围；Workflow 组织过程；Coordinator 统一管理执
 - 新增 AdmissionPolicy<D> 扩展点，应用自己定义描述和冲突原则，Runtime 只执行决定。
   所有准入决定串行、完整评估；容量或任一拒绝时不取消旧工作；策略 panic 拒绝本次输入。
   CancelExisting 只发取消，不早释对象、不越过旧 Activity 的停稳，也不解除不确定阻塞。
-- 新增 pause / wait_paused / resume / safe_point。请求和确认分离；不抢停在途 IO，
+- 新增 pause / wait_suspended / resume / wait_until_runnable。请求和确认分离；不抢停在途 IO，
   在下一执行边界确认暂停。暂停保留流程对象，完成步骤释放资源；资源等待可撤回。
   Signal 有界缓存，Timer 截止时间继续流逝；取消和 shutdown 优先唤醒暂停。
   最终成功已完成时不伪造暂停或取消结果；控制操作是进程内语义，不是崩溃恢复。

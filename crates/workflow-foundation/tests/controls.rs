@@ -40,15 +40,15 @@ async fn pause_waits_for_inflight_step_and_retains_only_workflow_ownership() {
         .await
         .unwrap();
     assert_eq!(next(&mut events).await, "first");
-    run.control.pause().unwrap();
-    assert!(run.control.pause_requested());
+    run.control.suspend().unwrap();
+    assert!(run.control.suspend_requested());
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), run.control.wait_paused())
+        tokio::time::timeout(Duration::from_millis(20), run.control.wait_suspended())
             .await
             .is_err()
     );
     gate.add_permits(1);
-    tokio::time::timeout(LIMIT, run.control.wait_paused())
+    tokio::time::timeout(LIMIT, run.control.wait_suspended())
         .await
         .unwrap()
         .unwrap();
@@ -95,10 +95,10 @@ async fn signal_is_buffered_while_paused_and_resume_does_not_restart_run() {
     let (mut pool, _, _) = setup();
     let mut run = pool.submit(Wait { timer: false }).await.unwrap();
     state(&run.control, RunState::WaitingSignal).await;
-    assert!(run.control.wait_paused().await.is_err());
+    assert!(run.control.wait_suspended().await.is_err());
     let id = run.id();
-    run.control.pause().unwrap();
-    tokio::time::timeout(LIMIT, run.control.wait_paused())
+    run.control.suspend().unwrap();
+    tokio::time::timeout(LIMIT, run.control.wait_suspended())
         .await
         .unwrap()
         .unwrap();
@@ -122,8 +122,8 @@ async fn expired_timer_waits_for_resume_and_cancellation_wakes_paused_run() {
     let (mut pool, _, _) = setup();
     let mut timer = pool.submit(Wait { timer: true }).await.unwrap();
     state(&timer.control, RunState::WaitingTimer).await;
-    timer.control.pause().unwrap();
-    tokio::time::timeout(LIMIT, timer.control.wait_paused())
+    timer.control.suspend().unwrap();
+    tokio::time::timeout(LIMIT, timer.control.wait_suspended())
         .await
         .unwrap()
         .unwrap();
@@ -139,8 +139,8 @@ async fn expired_timer_waits_for_resume_and_cancellation_wakes_paused_run() {
         .unwrap();
     let mut paused = pool.submit(Wait { timer: false }).await.unwrap();
     state(&paused.control, RunState::WaitingSignal).await;
-    paused.control.pause().unwrap();
-    tokio::time::timeout(LIMIT, paused.control.wait_paused())
+    paused.control.suspend().unwrap();
+    tokio::time::timeout(LIMIT, paused.control.wait_suspended())
         .await
         .unwrap()
         .unwrap();
@@ -166,8 +166,8 @@ async fn pause_withdraws_pending_resource_request_and_shutdown_cancels_pause() {
         .await
         .unwrap();
     state(&waiter.control, RunState::WaitingResources).await;
-    waiter.control.pause().unwrap();
-    tokio::time::timeout(LIMIT, waiter.control.wait_paused())
+    waiter.control.suspend().unwrap();
+    tokio::time::timeout(LIMIT, waiter.control.wait_suspended())
         .await
         .unwrap()
         .unwrap();
@@ -183,9 +183,9 @@ async fn deferred_execution_requires_explicit_start_and_obeys_pause() {
     let (mut runtime, _, _) = setup();
     let (mut run, permit) = runtime.client().defer(Wait { timer: false }).await.unwrap();
     assert_eq!(run.control.state(), RunState::WaitingObjects);
-    run.control.pause().unwrap();
+    run.control.suspend().unwrap();
     permit.start();
-    tokio::time::timeout(LIMIT, run.control.wait_paused())
+    tokio::time::timeout(LIMIT, run.control.wait_suspended())
         .await
         .unwrap()
         .unwrap();

@@ -32,8 +32,21 @@ pub struct ActivityContext {
     pub(crate) cancel: CancellationToken,
     pub(crate) control: ControlToken,
     pub(crate) hooks: watch::Sender<Option<Arc<dyn ActivityControl>>>,
+    pub(crate) progress: watch::Sender<TaskProgress>,
 }
 impl ActivityContext {
+    /// Live task progress from a long domain operation; reporting has no business effects.
+    pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
+        let stage = stage.into();
+        if stage.trim().is_empty() || stage.len() > 256 || total.is_some_and(|n| completed > n) {
+            return;
+        }
+        self.progress.send_replace(TaskProgress {
+            stage: Some(stage),
+            completed,
+            total,
+        });
+    }
     /// A stopping-return service can watch this token and return its normal typed partial result.
     pub fn control(&self) -> ControlToken {
         self.control.clone()

@@ -21,3 +21,5 @@
 
 各 crate 的 DESIGN.md 保留分阶段设计及历史验证记录；不能把早期阶段的测试数量、
 未实现范围或源码路径当作最新状态。当前验证命令见 verification.md。
+
+- [完整缩容工作流与 C 均衡接入](shrink-workflow.md)

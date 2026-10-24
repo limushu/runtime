@@ -13,7 +13,7 @@
 | RuntimeHandle | 仅为可选独立宿主提供本地调用句柄，TaskCenter 不持有它 |
 | Workflow / WorkflowContext | 流程体、Activity/Signal/Timer、安全边界 |
 | Run / RunControl | 类型化结果与执行控制 |
-| TaskId / TaskSnapshot / TaskObserver | 唯一的任务身份、快照和观察；WorkflowId 只是 TaskId 的兼容别名 |
+| TaskId / TaskSnapshot / TaskObserver | 唯一的任务身份、快照和观察 |
 | Persistence / TaskStore | Workflow 声明的存储方式与 Task checkpoint 后端 |
 | SchedulingPolicy / Relation | 应用定义的准入决策与调度关系，驱动不解释业务类型 |
 | ActivityClient | 带类型的能力通道，不暴露具体宿主类型给应用 |
@@ -61,10 +61,10 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 - Uncertain/panic 会保留步骤资源隔离，不能被 Workflow 忽略成成功。单纯被隔离的后继
   返回 Rejected，避免扩大隔离。在 defer 模式下，应用负责 Workflow 级对象隔离。
 - ActivityContext 是适配层执行上下文，不应进入纯领域对象。
-- pause 在 Activity/Signal/Timer 或 safe_point 边界确认；Activity 可以注册可选的停稳控制适配器，
+- suspend 在 Activity/Signal/Timer 或 wait_until_runnable 边界确认；Activity 可以注册可选的停稳控制适配器，
   在原调用保持等待时确认暂停。没有该适配器时等待动作返回，再由 Workflow 到达安全边界。
   不抢占外部 IO，暂停不会回滚步骤。
-  排队准入期间还不能即时确认 Paused。取消/关闭可以直接唤醒暂停。
+  排队准入期间还不能即时确认 Suspended。取消/关闭可以直接唤醒暂停。
 - client 绑定 Runtime 实例，即使 Pool 名称相同也不能跨实例执行 Activity。
 - shutdown 拒绝新工作、请求取消、等待停稳、关闭服务；等待可取消后重试。
   强制 Drop 只保证本地任务回收，不能保证远端 IO 停止。
@@ -74,7 +74,7 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 ## 逐 Activity 观测
 
 每次通过 `WorkflowContext::activity()` 发起的步骤自动进入 `TaskSnapshot.activities`，
-不需要在 Workflow 中手工上报开始/结束。每条记录包含稳定的 `ActivityId`（Workflow ID + 调用序号）、
+不需要在 Workflow 中手工上报开始/结束。每条记录包含稳定的 `ActivityId`（TaskId + 当前宿主内调用序号）、
 注册服务名、步骤名、资源声明、当前状态和创建/实际开始/实际结束时间。
 
 ```rust,ignore
@@ -86,7 +86,7 @@ let mut observer = client.observe_task(id)?;
 let updated = observer.changed().await?; // Activity 更新也会唤醒，不依赖 Workflow 状态变化
 ```
 
-状态为 `WaitingResources -> Queued -> Running / Paused -> Completed / Failed(Failure)`。
+状态为 `WaitingResources -> Queued -> Running / Suspended -> Completed / Failed(Failure)`。
 `Queued` 包含等待服务邮箱容量；取消、拒绝、服务不可用可以在实际开始前结束，
 此时 `started_at` 为 None。取消请求不会提前标记完成；调用方丢弃 Activity 等待 Future 后，
 记录仍由服务端实际执行更新。handler panic 或执行中强制终止记录为 Uncertain，不能误报成功。
@@ -129,14 +129,14 @@ with_task_ids(pool_uuid, ids) 绑定不可变池 UUID。失主调用 ids.revoke(
 
 1. 保留调用：ActivityContext::register_control 或 ctx.set_activity_control 为下一次 activity
    提供 ActivityControl。suspend 必须等到领域动作实际停稳才返回；原 activity.await 仍等待业务结果。
-   Workflow::continuation_guard 检查满足后才调用 resume。不同 Workflow 可选择不同领域命令。
+   Workflow::run_condition 检查满足后才调用 resume。不同 Workflow 可选择不同领域命令。
 2. 返回进度：服务读取 ActivityContext::control()，停稳后返回自己的类型化部分结果。
-   原 activity.await 返回该结果；Workflow 保存 checkpoint，再调用 safe_point 确认整个 Task 暂停。
-   恢复并通过 continuation_guard 后发起下一次普通 activity，TaskId 不变。
+   原 activity.await 返回该结果；Workflow 保存 checkpoint，再调用 wait_until_runnable 确认整个 Task 暂停。
+   恢复并通过 run_condition 后发起下一次普通 activity，TaskId 不变。
 
-guard 返回 Wait 时状态为 WaitingConditions；条件变化后调用 RunControl::recheck 或观察句柄的
+RunCondition 返回 Blocked 时状态为 WaitingConditions；条件变化后调用 RunControl::recheck 或观察句柄的
 recheck(id)，不自动忙轮询。guard 必须只读且允许取消，不能承担远端提交。
-pause/resume/cancel 是请求；暂停确认需 wait_paused，取消确认需等待终态。
+suspend/resume/cancel 是请求；暂停确认需 wait_suspended，取消确认需等待终态。
 ControlToken::cancellation_reason 区分用户 Requested 与宿主/主轮次撤销 Interrupted。
 完整的安全、恢复边界和示例见 [规格](../../docs/changes/2026-10-24-unified-task-controls.md)。
 
@@ -152,3 +152,7 @@ cargo run --locked -p workflow-foundation --example two_services
 
 [two_services.rs](examples/two_services.rs) 演示两个能力的串联。
 DESIGN.md 保留历史阶段记录，当前接口以本页与源码为准。
+
+`ActivityExit<T, C>` 为停稳返回的调用提供统一的 Completed / Suspended 结果协议；
+取消仍使用 `Err(Failure::Cancelled)`。领域可通过 `ActivityContext::report_progress` 更新任务进度。
+完整应用示例见 [缩容工作流](../../docs/shrink-workflow.md)。

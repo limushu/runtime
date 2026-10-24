@@ -7,7 +7,7 @@ use workflow_foundation::{RunControl, RunState};
 pub struct TaskRef {
     pub pool: PoolUuid,
     pub instance: PoolUuid,
-    pub workflow: WorkflowId,
+    pub task_id: TaskId,
 }
 #[derive(Debug, Clone)]
 pub struct PoolTaskSnapshot {
@@ -138,7 +138,7 @@ impl PoolEventReceipt {
                 let task = TaskRef {
                     pool: self.pool,
                     instance: self.instance,
-                    workflow: control.id,
+                    task_id: control.id,
                 };
                 match control.state() {
                     RunState::Completed => TargetStatus::Completed(task),

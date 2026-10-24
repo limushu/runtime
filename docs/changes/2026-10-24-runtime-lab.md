@@ -7,7 +7,7 @@
 
 在原地址升级：[打开动态演示](../diagrams/task-center-simulation/index.html)。
 
-![topo 到达后，缩容进入 Pausing，后继等待真实停稳 ACK](../diagrams/task-center-simulation/preview.png)
+![topo 到达后，缩容进入 Suspending，后继等待真实停稳 ACK](../diagrams/task-center-simulation/preview.png)
 
 基于实现 `53b5ea6`，视觉参考 [Temporal 官网](https://temporal.io/) 的技术产品展示方向，
 使用浅色页面、紫色强调、深色运行画布和高对比消息。未复制商标、图片或业务能力声明。

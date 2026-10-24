@@ -52,7 +52,7 @@ pub enum OperationKind {
     RenamePool,
     UnloadPool,
     LoadPool,
-    Shrink(DiskId),
+    Shrink(Vec<DiskId>),
     Custom(String),
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -93,7 +93,7 @@ struct Entry {
     replacements: Vec<TaskId>,
 }
 struct State {
-    entries: BTreeMap<WorkflowId, Entry>,
+    entries: BTreeMap<TaskId, Entry>,
     fences: Vec<(TaskId, PoolOperation)>,
     policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
 }
@@ -150,7 +150,7 @@ impl State {
                 id: *id,
                 descriptor: &e.operation,
                 started: e.start.is_none(),
-                paused: e.control.pause_acknowledged(),
+                paused: e.control.suspend_acknowledged(),
             })
             .chain(self.fences.iter().map(|(id, op)| Candidate {
                 id: *id,
@@ -191,7 +191,7 @@ impl State {
         let plan = self.plan();
         for (id, reasons) in plan.pauses {
             if let Some(e) = self.entries.get(&id) {
-                e.control.set_policy_pauses(&reasons);
+                e.control.set_policy_suspensions(&reasons);
             }
         }
         let plan = self.plan();
@@ -435,25 +435,25 @@ impl TaskCenter {
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.execution.tasks()
     }
-    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
+    pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
         self.execution.task(id)
     }
-    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+    pub fn observe_task(&self, id: TaskId) -> Outcome<TaskObserver> {
         self.execution.observe_task(id)
     }
-    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn suspend(&self, id: TaskId) -> Outcome<()> {
         self.execution.suspend(id)
     }
-    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn resume(&self, id: TaskId) -> Outcome<()> {
         self.execution.resume(id)
     }
     pub fn recheck(&self, id: TaskId) -> Outcome<()> {
         self.execution.recheck(id)
     }
-    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn cancel(&self, id: TaskId) -> Outcome<()> {
         self.execution.cancel(id)
     }
-    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
+    pub async fn wait_suspended(&self, id: TaskId) -> Outcome<()> {
         self.execution.wait_suspended(id).await
     }
     pub fn scheduling(&self) -> SchedulingSnapshot {

@@ -57,7 +57,7 @@ TaskCenter 检查全部在途冲突及容量。只有成功登记才实施取消
 通用独立 submit 仍提供简单对象互斥供示例/测试使用，不能绕过 Pool 正式入口混用。
 
 暂停仍保留逻辑对象；YieldTo 关系允许在真实停稳确认后暂时交接，但不会释放 Activity 资源锁。
-排队任务只记录暂停请求，获准到达安全边界才确认 Paused。用户与策略暂停原因分别维护。
+排队任务只记录暂停请求，获准到达安全边界才确认 Suspended。用户与策略暂停原因分别维护。
 pool.scheduling() 表示业务排队/运行/逻辑隔离；pool.execution() 表示底层执行与资源计数。
 pool.task(id).conflicts 是准入时解释，不是实时等待图。
 同一 snapshot 的 blockers 是当前阻塞者，details 是 Workflow 提供的附加信息。

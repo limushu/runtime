@@ -8,14 +8,23 @@ use std::{
 use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
+/// Completed finishes the business step. Suspended ends this invocation after
+/// actual effects and callback lifetimes have settled, retaining only resumable
+/// data. Cancellation uses Err(Failure::Cancelled), never Suspended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityExit<T, C> {
+    Completed(T),
+    Suspended(C),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlRequest {
     pub generation: u64,
-    pub pause_reasons: BTreeSet<String>,
+    pub suspend_reasons: BTreeSet<String>,
 }
 impl ControlRequest {
     pub fn paused(&self) -> bool {
-        !self.pause_reasons.is_empty()
+        !self.suspend_reasons.is_empty()
     }
 }
 
@@ -28,14 +37,14 @@ pub trait ActivityControl: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContinueDecision {
+pub enum Readiness {
     Ready,
-    Wait(String),
+    Blocked(String),
 }
 /// Business-defined, side-effect-free check. It can use stage state shared with run().
 #[async_trait]
-pub trait ContinuationGuard: Send + Sync + 'static {
-    async fn check(&self) -> Outcome<ContinueDecision>;
+pub trait RunCondition: Send + Sync + 'static {
+    async fn check(&self) -> Outcome<Readiness>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,13 +118,13 @@ impl Controls {
         }
     }
     pub fn reasons(&self) -> BTreeSet<String> {
-        self.tx.borrow().pause_reasons.clone()
+        self.tx.borrow().suspend_reasons.clone()
     }
     pub fn update(&self, update: impl FnOnce(&mut BTreeSet<String>)) {
         let changed = self.tx.send_if_modified(|request| {
-            let old = request.pause_reasons.clone();
-            update(&mut request.pause_reasons);
-            if old == request.pause_reasons {
+            let old = request.suspend_reasons.clone();
+            update(&mut request.suspend_reasons);
+            if old == request.suspend_reasons {
                 return false;
             }
             request.generation = request

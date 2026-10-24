@@ -9,7 +9,7 @@ use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex, Weak},
 };
-use workflow_foundation::{RuntimeSnapshot, WorkflowDriver, WorkflowId};
+use workflow_foundation::{RuntimeSnapshot, TaskId, WorkflowDriver};
 
 /// A composition/lifecycle boundary, not an aggregate containing all domain data.
 pub struct Pool {
@@ -22,18 +22,20 @@ impl Pool {
         metadata: Arc<dyn MetadataStore>,
         data_plane: Arc<dyn DataPlane>,
         registry: Weak<Mutex<crate::manager::Registry>>,
-        task_ids: Option<TaskIds>,
+        task_ids: TaskIds,
+        shrink: Option<(
+            Arc<dyn crate::domains::shrink::ShrinkStorage>,
+            Arc<dyn crate::domains::balance::BalanceBackend>,
+        )>,
     ) -> Outcome<Self> {
         let id = descriptor.id.clone();
         let mut driver = WorkflowDriver::new(id.as_str(), config.clone())?;
-        if let Some(ids) = task_ids {
-            let uuid = descriptor
-                .uuid
-                .to_string()
-                .parse::<uuid::Uuid>()
-                .map_err(|e| reject(e.to_string()))?;
-            driver = driver.with_task_ids(uuid.as_u128(), ids)?;
-        }
+        let uuid = descriptor
+            .uuid
+            .to_string()
+            .parse::<uuid::Uuid>()
+            .map_err(|e| reject(e.to_string()))?;
+        driver = driver.with_task_ids(uuid.as_u128(), task_ids)?;
         let tier = driver.register(
             "tier",
             TierHost(TierService::new(id.clone(), metadata.clone())),
@@ -70,12 +72,18 @@ impl Pool {
                 domains: domains.clone(),
             },
         )?;
+        let shrink = shrink
+            .map(|(storage, balance)| {
+                ShrinkServices::register(&mut driver, id.clone(), storage, balance)
+            })
+            .transpose()?;
         let handle = PoolHandle {
             id,
             task_center: TaskCenter::start(driver, &config),
             domains,
             shared,
             admin,
+            shrink,
         };
         Ok(Self { handle })
     }
@@ -95,33 +103,58 @@ pub struct PoolHandle {
     pub(crate) domains: Domains,
     pub(crate) shared: Arc<crate::manager::PoolShared>,
     pub(crate) admin: crate::manager::admin::AdminClient,
+    shrink: Option<ShrinkServices>,
 }
 impl PoolHandle {
+    pub async fn shrink(&self, request: ShrinkRequest) -> Outcome<Run<()>> {
+        self.descriptor().active()?;
+        let services = self
+            .shrink
+            .clone()
+            .ok_or_else(|| reject("shrink backends are not configured"))?;
+        self.task_center
+            .submit(ShrinkWorkflow::new(request, services)?)
+            .await
+    }
+    /// A caller can query by pool without saving a TaskId. Includes uncertain tasks
+    /// which still fence the pool's shrink slot and require reconciliation.
+    pub fn current_shrink(&self) -> Option<TaskSnapshot> {
+        self.tasks().into_iter().find(|task| {
+            task.name == "storage.shrink"
+                && match &task.state {
+                    workflow_foundation::RunState::Completed => false,
+                    workflow_foundation::RunState::Failed(error) => {
+                        matches!(error, Failure::Uncertain(_))
+                    }
+                    _ => true,
+                }
+        })
+    }
     pub fn id(&self) -> &PoolId {
         &self.id
     }
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.task_center.tasks()
     }
-    pub fn task(&self, id: WorkflowId) -> Outcome<TaskSnapshot> {
+    pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
         self.task_center.task(id)
     }
-    pub fn observe_task(&self, id: WorkflowId) -> Outcome<TaskObserver> {
+    pub fn observe_task(&self, id: TaskId) -> Outcome<TaskObserver> {
         self.task_center.observe_task(id)
     }
-    pub fn suspend(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn suspend(&self, id: TaskId) -> Outcome<()> {
         self.task_center.suspend(id)
     }
-    pub fn resume(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn resume(&self, id: TaskId) -> Outcome<()> {
         self.task_center.resume(id)
     }
     pub fn recheck_task(&self, id: TaskId) -> Outcome<()> {
         self.task_center.recheck(id)
     }
-    pub fn cancel(&self, id: WorkflowId) -> Outcome<()> {
+    pub fn cancel(&self, id: TaskId) -> Outcome<()> {
         self.task_center.cancel(id)
     }
-    pub async fn wait_suspended(&self, id: WorkflowId) -> Outcome<()> {
+    pub async fn wait_suspended(&self, id: TaskId) -> Outcome<()> {
         self.task_center.wait_suspended(id).await
     }
     pub fn scheduling(&self) -> crate::task_center::SchedulingSnapshot {

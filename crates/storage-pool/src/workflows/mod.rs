@@ -53,3 +53,6 @@ fn batch_disks(reply: DiskReply) -> Outcome<Vec<MemberDisk>> {
         _ => Err(Failure::Uncertain("unexpected batch disk reply".into())),
     }
 }
+
+mod shrink;
+pub use shrink::{ShrinkProgress, ShrinkRequest, ShrinkWorkflow};

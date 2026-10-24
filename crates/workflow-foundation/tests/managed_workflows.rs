@@ -29,12 +29,12 @@ async fn state(control: &RunControl, predicate: impl Fn(&RunState) -> bool) {
 }
 struct Gate(AtomicBool);
 #[async_trait]
-impl ContinuationGuard for Gate {
-    async fn check(&self) -> Outcome<ContinueDecision> {
+impl RunCondition for Gate {
+    async fn check(&self) -> Outcome<Readiness> {
         Ok(if self.0.load(Ordering::SeqCst) {
-            ContinueDecision::Ready
+            Readiness::Ready
         } else {
-            ContinueDecision::Wait("placement changed".into())
+            Readiness::Blocked("placement changed".into())
         })
     }
 }
@@ -108,7 +108,7 @@ struct Flow {
 impl Workflow for Flow {
     type Output = u64;
     const NAME: &'static str = "shrink";
-    fn continuation_guard(&self) -> Option<Arc<dyn ContinuationGuard>> {
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         Some(self.gate.clone())
     }
     async fn run(self, ctx: &mut WorkflowContext) -> Outcome<u64> {
@@ -117,7 +117,7 @@ impl Workflow for Flow {
         ctx.report_details(&json!({"migrated": first, "source": "disk-a"}))?;
         if first == 7 {
             // The partial business reply is consumed BEFORE acknowledging a safe pause.
-            ctx.safe_point().await?;
+            ctx.wait_until_runnable().await?;
             ctx.activity(&self.client, false).await
         } else {
             Ok(first)
@@ -189,11 +189,11 @@ async fn retained_activity_rechecks_workflow_conditions_and_never_returns_a_paus
     let mut f = Fixture::new();
     let (mut run, mut progress) = f.submit(false).await;
     bounded(f.started.recv()).await.unwrap();
-    run.control.pause().unwrap();
+    run.control.suspend().unwrap();
     let suspend = f.command("suspend").await;
-    assert!(!run.control.pause_acknowledged());
+    assert!(!run.control.suspend_acknowledged());
     suspend.reply.send(()).unwrap();
-    bounded(run.control.wait_paused()).await.unwrap();
+    bounded(run.control.wait_suspended()).await.unwrap();
     assert!(progress.try_recv().is_err());
     f.gate.0.store(false, Ordering::SeqCst);
     run.control.resume().unwrap();
@@ -222,16 +222,16 @@ async fn stopping_activity_returns_partial_result_before_the_same_task_pauses_an
     let id = run.id();
     let mut observer = f.runtime.client().observe_task(id).unwrap();
     bounded(f.started.recv()).await.unwrap();
-    run.control.pause().unwrap();
+    run.control.suspend().unwrap();
     assert_eq!(bounded(progress.recv()).await.unwrap(), 7);
-    bounded(run.control.wait_paused()).await.unwrap();
+    bounded(run.control.wait_suspended()).await.unwrap();
     let snapshot = observer.snapshot();
     assert_eq!(snapshot.details["migrated"], 7);
     assert_eq!(
         snapshot.activities.entries[0].state,
         ActivityState::Completed
     );
-    assert_eq!(snapshot.state, RunState::Paused);
+    assert_eq!(snapshot.state, RunState::Suspended);
     assert!(f.commands.try_recv().is_err());
     f.gate.0.store(false, Ordering::SeqCst);
     run.control.resume().unwrap();
@@ -255,21 +255,22 @@ async fn new_pause_during_resume_requires_fresh_stop_and_preserves_user_reason()
     let mut f = Fixture::new();
     let (mut run, _) = f.submit(false).await;
     bounded(f.started.recv()).await.unwrap();
-    run.control.pause().unwrap();
+    run.control.suspend().unwrap();
     f.command("suspend").await.reply.send(()).unwrap();
-    bounded(run.control.wait_paused()).await.unwrap();
+    bounded(run.control.wait_suspended()).await.unwrap();
     run.control.resume().unwrap();
     let resume = f.command("resume").await;
-    run.control.set_policy_pauses(&["topo-1".into()].into());
-    run.control.pause().unwrap();
-    assert!(!run.control.pause_acknowledged());
+    run.control
+        .set_policy_suspensions(&["topo-1".into()].into());
+    run.control.suspend().unwrap();
+    assert!(!run.control.suspend_acknowledged());
     resume.reply.send(()).unwrap();
     let again = f.command("suspend").await;
-    assert!(!run.control.pause_acknowledged());
+    assert!(!run.control.suspend_acknowledged());
     again.reply.send(()).unwrap();
-    bounded(run.control.wait_paused()).await.unwrap();
-    run.control.set_policy_pauses(&Default::default());
-    assert!(run.control.pause_requested());
+    bounded(run.control.wait_suspended()).await.unwrap();
+    run.control.set_policy_suspensions(&Default::default());
+    assert!(run.control.suspend_requested());
     run.control.cancel();
     assert!(matches!(
         bounded(run.result()).await,
@@ -353,8 +354,8 @@ async fn same_task_restores_checkpoint_details_user_pause_and_new_owner_epoch() 
     let (stop, join) = host(driver).await;
     bounded(run.accepted()).await.unwrap();
     bounded(rx.recv()).await.unwrap();
-    run.control.pause().unwrap();
-    bounded(run.control.wait_paused()).await.unwrap();
+    run.control.suspend().unwrap();
+    bounded(run.control.wait_suspended()).await.unwrap();
     stop.cancel();
     bounded(join).await.unwrap();
     let old = store.list(55).unwrap().remove(0);
@@ -372,7 +373,7 @@ async fn same_task_restores_checkpoint_details_user_pause_and_new_owner_epoch() 
     restored.start.start();
     let view = next.view();
     let (stop, join) = host(next).await;
-    bounded(restored.control.wait_paused()).await.unwrap();
+    bounded(restored.control.wait_suspended()).await.unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(view.task(id).unwrap().details["copied"], 7);
     assert_eq!(store.list(55).unwrap()[0].owner_epoch, 11);
@@ -537,11 +538,11 @@ async fn workflow_can_choose_different_domain_control_commands_for_the_same_serv
         .await
         .unwrap();
     bounded(f.started.recv()).await.unwrap();
-    run.control.pause().unwrap();
+    run.control.suspend().unwrap();
     let command = bounded(rx.recv()).await.unwrap();
     assert_eq!(command.name, "drain-batch");
     command.reply.send(()).unwrap();
-    bounded(run.control.wait_paused()).await.unwrap();
+    bounded(run.control.wait_suspended()).await.unwrap();
     assert!(f.commands.try_recv().is_err());
     run.control.resume().unwrap();
     let command = bounded(rx.recv()).await.unwrap();

@@ -91,7 +91,7 @@ Enter 沿现有框架继续展开，Esc 返回一层并恢复父层的选择、�
 | Running | 蓝/青色圆点，显示当前 Activity |
 | Waiting | 黄色时钟，并具体说明 resources / objects / signal / timer |
 | Pause requested | 请求已发出，还没到安全边界 |
-| Paused | 已确认暂停，可以 Resume |
+| Suspended | 已确认暂停，可以 Resume |
 | Cancel requested | 执行可能还在继续，显示“等待实际停稳” |
 | Cancelled | 仅在已确认取消的终态显示；对应 Failed(Cancelled) |
 | Completed | 绿色勾，当前动作区域改为结果摘要 |
@@ -156,7 +156,7 @@ Backpressured/Unavailable 不按“不相关”统计；重试只重投尚未接
   这项摘要接口尚需补充，现有 manager.tasks() 返回完整任务快照。
 - 只对当前选中的任务订阅 observe_task；切换选中只改变订阅，不发送业务取消。
 - 高频更新合并到固定渲染节奏（例如 10 Hz），但数据模型保留服务器给出的所有在界限内步骤。
-- 焦点与选择绑定完整 TaskRef（PoolUuid + instance + WorkflowId），池名和短 ID 仅用于显示。
+- 焦点与选择绑定完整 TaskRef（PoolUuid + instance + TaskId），池名和短 ID 仅用于显示。
 - 搜索、筛选、冻结显示都在客户端处理；业务控制通过对应 PoolHandle 或 Manager 的作用域校验接口发送。
 - 本仓库当前可见的是运行库和命令行示例，未发现截图对应的 TUI 源码；具体面板类型、快捷键与路由名，
   接入时以真实平台代码为准，本文不假定已经找到或修改了该实现。
