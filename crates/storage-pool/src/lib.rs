@@ -16,7 +16,7 @@ pub use requests::{CreateVolume, NodeTransitionRequest};
 pub use task_center::{TaskObserver, TaskSnapshot};
 pub use workflow_foundation::{Config, Failure, Outcome, Run, TaskId, TaskIds};
 
-pub use workflows::{ShrinkProgress, ShrinkRequest, ShrinkWorkflow};
+pub use workflows::{ShrinkProgress, ShrinkRequest, ShrinkStage, ShrinkWorkflow};
 
-mod shrink;
-pub use shrink::ShrinkServices;
+mod domain_clients;
+pub use domain_clients::Domains;

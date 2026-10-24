@@ -219,3 +219,68 @@ impl PoolHandle {
         })
     }
 }
+
+/// Membership indexes belong to Pool, not to Disk metadata or a native adapter.
+pub(crate) struct DiskRemoval {
+    shared: Arc<PoolShared>,
+    routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
+    disks: Vec<DiskId>,
+    guards: Vec<RemovalGuard>,
+}
+impl DiskRemoval {
+    pub fn begin(&mut self) {
+        for gate in &mut self.guards {
+            gate.begin();
+        }
+    }
+    pub fn settled(&mut self, result: &Outcome<()>) {
+        for gate in &mut self.guards {
+            gate.settled(result);
+        }
+    }
+    pub fn complete(&self) {
+        let owner = self.shared.descriptor.lock().unwrap().uuid;
+        if let Some(registry) = self.shared.registry.upgrade() {
+            let mut registry = registry.lock().unwrap();
+            for id in &self.disks {
+                if registry
+                    .disks
+                    .get(id)
+                    .is_some_and(|entry| entry.owner == owner)
+                {
+                    registry.disks.remove(id);
+                }
+            }
+        }
+        let mut routing = self.routing.lock().unwrap();
+        for id in &self.disks {
+            routing.remove(id);
+        }
+    }
+}
+impl PoolHandle {
+    pub(crate) fn reserve_removal(&self, disks: &[DiskId]) -> Outcome<DiskRemoval> {
+        let registry = self.shared.registry.upgrade().ok_or(Failure::Unavailable)?;
+        let _registry = registry.lock().unwrap();
+        self.descriptor().active()?;
+        let mut retiring = self.shared.retiring_disks.lock().unwrap();
+        for id in disks {
+            if self.task_center.disk_spec(id).is_none() {
+                return Err(reject("unknown disk membership"));
+            }
+            if retiring.contains(id) {
+                return Err(reject("disk removal already requested"));
+            }
+        }
+        retiring.extend(disks.iter().cloned());
+        Ok(DiskRemoval {
+            shared: self.shared.clone(),
+            routing: self.task_center.disk_directory(),
+            disks: disks.to_vec(),
+            guards: disks
+                .iter()
+                .map(|id| RemovalGuard::disk(self.shared.clone(), id.clone()))
+                .collect(),
+        })
+    }
+}

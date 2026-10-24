@@ -66,8 +66,8 @@ impl ServiceHandler for AdminHost {
             AdminCommand::CheckEmpty => {
                 let (nodes, disks, volumes, tiers) = tokio::try_join!(
                     self.domains.node.query(None),
-                    self.domains.disk.query(None),
-                    self.domains.vd.query(None),
+                    self.domains.disks(),
+                    self.domains.volumes(),
                     self.domains.tier.query(None)
                 )?;
                 if !nodes.is_empty()

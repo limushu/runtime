@@ -171,14 +171,7 @@ impl PoolHandle {
             .await
     }
     pub async fn delete_volume(&self, id: VolumeId) -> Outcome<Run<()>> {
-        let volume = self
-            .domains
-            .vd
-            .query(Some(id))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| reject("unknown volume"))?;
+        let volume = self.domains.volume(&id).await?;
         let nodes = volume
             .groups
             .iter()

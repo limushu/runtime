@@ -1,12 +1,10 @@
 //! Application workflows, one business process per module.
 //! Construct through PoolHandle so callers cannot omit the required conflict set.
-use crate::domains::disk::service::{DiskCommand, DiskReply};
-use crate::domains::node::service::NodeCommand;
-use crate::domains::tier::{TierCommand, TierReply};
-use crate::domains::vd::service::{VdCommand, VdReply};
+pub(crate) use crate::Domains;
+use crate::domains::disk::service::DiskReply;
 use crate::support::object;
 use crate::*;
-use workflow_foundation::{ActivityClient, ObjectKey};
+use workflow_foundation::ObjectKey;
 
 mod create_volume;
 mod load_node;
@@ -25,14 +23,6 @@ pub use offline_disk::OfflineDiskWorkflow;
 pub use offline_node::OfflineNodeWorkflow;
 pub use online_disk::OnlineDiskWorkflow;
 pub use online_node::OnlineNodeWorkflow;
-
-#[derive(Clone)]
-pub(crate) struct Domains {
-    pub tier: ActivityClient<TierCommand, TierReply, Option<TierId>, Vec<Tier>>,
-    pub disk: ActivityClient<DiskCommand, DiskReply, Option<DiskId>, Vec<MemberDisk>>,
-    pub node: ActivityClient<NodeCommand, PoolNode, Option<NodeId>, Vec<PoolNode>>,
-    pub vd: ActivityClient<VdCommand, VdReply, Option<VolumeId>, Vec<VirtualDisk>>,
-}
 
 fn disk_result(reply: DiskReply) -> Outcome<MemberDisk> {
     match reply {
@@ -55,4 +45,4 @@ fn batch_disks(reply: DiskReply) -> Outcome<Vec<MemberDisk>> {
 }
 
 mod shrink;
-pub use shrink::{ShrinkProgress, ShrinkRequest, ShrinkWorkflow};
+pub use shrink::{ShrinkProgress, ShrinkRequest, ShrinkStage, ShrinkWorkflow};

@@ -7,7 +7,7 @@ mod ownership;
 mod pool_ops;
 pub use fanout::*;
 pub use identity::*;
-pub(crate) use ownership::{DiskReservation, NodeReservation, RemovalGuard};
+pub(crate) use ownership::{DiskRemoval, DiskReservation, NodeReservation, RemovalGuard};
 pub(crate) use pool_ops::PoolShared;
 
 use crate::{ports::*, support::reject, *};
@@ -37,10 +37,7 @@ pub(crate) struct Registry {
 pub struct PoolManager {
     pub(crate) registry: Arc<Mutex<Registry>>,
     task_ids: TaskIds,
-    shrink: Option<(
-        Arc<dyn crate::domains::shrink::ShrinkStorage>,
-        Arc<dyn crate::domains::balance::BalanceBackend>,
-    )>,
+    balance: Option<Arc<dyn crate::domains::balance::BalanceBackend>>,
     config: Config,
     metadata: Arc<dyn MetadataStore>,
     data_plane: Arc<dyn DataPlane>,
@@ -58,7 +55,7 @@ impl PoolManager {
                 ..Registry::default()
             })),
             task_ids: TaskIds::default(),
-            shrink: None,
+            balance: None,
             config,
             metadata,
             data_plane,
@@ -69,14 +66,12 @@ impl PoolManager {
         self.task_ids = ids;
         self
     }
-    /// Bind the same authoritative storage domains and C balance bridge used by
-    /// the application. Default pools reject shrink until these capabilities exist.
-    pub fn with_shrink(
+    /// Bind the native balance capability; all storage operations use existing domains.
+    pub fn with_balance(
         mut self,
-        storage: Arc<dyn crate::domains::shrink::ShrinkStorage>,
         balance: Arc<dyn crate::domains::balance::BalanceBackend>,
     ) -> Self {
-        self.shrink = Some((storage, balance));
+        self.balance = Some(balance);
         self
     }
     pub fn create(&self, request: CreatePool) -> Outcome<PoolHandle> {
@@ -100,7 +95,7 @@ impl PoolManager {
             self.data_plane.clone(),
             Arc::downgrade(&self.registry),
             self.task_ids.clone(),
-            self.shrink.clone(),
+            self.balance.clone(),
         )?;
         let handle = pool.handle();
         registry

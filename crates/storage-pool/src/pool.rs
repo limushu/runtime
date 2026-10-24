@@ -1,9 +1,3 @@
-use crate::domains::tier::{TierService, runtime::TierHost};
-use crate::domains::{
-    disk::{runtime::DiskHost, service::DiskService},
-    node::{runtime::NodeHost, service::NodeService},
-    vd::{runtime::VdHost, service::VdService},
-};
 use crate::{ports::*, support::reject, task_center::TaskCenter, workflows::*, *};
 use std::{
     collections::BTreeSet,
@@ -23,10 +17,7 @@ impl Pool {
         data_plane: Arc<dyn DataPlane>,
         registry: Weak<Mutex<crate::manager::Registry>>,
         task_ids: TaskIds,
-        shrink: Option<(
-            Arc<dyn crate::domains::shrink::ShrinkStorage>,
-            Arc<dyn crate::domains::balance::BalanceBackend>,
-        )>,
+        balance: Option<Arc<dyn crate::domains::balance::BalanceBackend>>,
     ) -> Outcome<Self> {
         let id = descriptor.id.clone();
         let mut driver = WorkflowDriver::new(id.as_str(), config.clone())?;
@@ -36,32 +27,7 @@ impl Pool {
             .parse::<uuid::Uuid>()
             .map_err(|e| reject(e.to_string()))?;
         driver = driver.with_task_ids(uuid.as_u128(), task_ids)?;
-        let tier = driver.register(
-            "tier",
-            TierHost(TierService::new(id.clone(), metadata.clone())),
-        )?;
-        let disk = driver.register(
-            "disk",
-            DiskHost(DiskService::new(
-                id.clone(),
-                metadata.clone(),
-                data_plane.clone(),
-            )),
-        )?;
-        let node = driver.register(
-            "node",
-            NodeHost(NodeService::new(id.clone(), data_plane.clone())),
-        )?;
-        let vd = driver.register(
-            "vd",
-            VdHost(VdService::new(id.clone(), metadata, data_plane)),
-        )?;
-        let domains = Domains {
-            disk,
-            node,
-            vd,
-            tier,
-        };
+        let domains = Domains::register(&mut driver, id.clone(), metadata, data_plane, balance)?;
         let shared = Arc::new(crate::manager::PoolShared::new(
             descriptor, registry, &config,
         ));
@@ -72,18 +38,12 @@ impl Pool {
                 domains: domains.clone(),
             },
         )?;
-        let shrink = shrink
-            .map(|(storage, balance)| {
-                ShrinkServices::register(&mut driver, id.clone(), storage, balance)
-            })
-            .transpose()?;
         let handle = PoolHandle {
             id,
             task_center: TaskCenter::start(driver, &config),
             domains,
             shared,
             admin,
-            shrink,
         };
         Ok(Self { handle })
     }
@@ -103,17 +63,14 @@ pub struct PoolHandle {
     pub(crate) domains: Domains,
     pub(crate) shared: Arc<crate::manager::PoolShared>,
     pub(crate) admin: crate::manager::admin::AdminClient,
-    shrink: Option<ShrinkServices>,
 }
 impl PoolHandle {
     pub async fn shrink(&self, request: ShrinkRequest) -> Outcome<Run<()>> {
         self.descriptor().active()?;
-        let services = self
-            .shrink
-            .clone()
-            .ok_or_else(|| reject("shrink backends are not configured"))?;
+        let request = ShrinkRequest::new(request.disks)?;
+        let membership = self.reserve_removal(&request.disks)?;
         self.task_center
-            .submit(ShrinkWorkflow::new(request, services)?)
+            .submit(ShrinkWorkflow::new(request, self.domains.clone())?.with_membership(membership))
             .await
     }
     /// A caller can query by pool without saving a TaskId. Includes uncertain tasks
@@ -164,13 +121,13 @@ impl PoolHandle {
         self.task_center.snapshot()
     }
     pub async fn disks(&self) -> Outcome<Vec<MemberDisk>> {
-        self.domains.disk.query(None).await
+        self.domains.disks().await
     }
     pub async fn nodes(&self) -> Outcome<Vec<PoolNode>> {
         self.domains.node.query(None).await
     }
     pub async fn volumes(&self) -> Outcome<Vec<VirtualDisk>> {
-        self.domains.vd.query(None).await
+        self.domains.volumes().await
     }
     pub async fn observe_node(
         &self,
@@ -204,8 +161,7 @@ impl PoolHandle {
             .await
     }
     pub async fn online_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
-        let disks = self.domains.disk.query(Some(id)).await?;
-        let disk = &disks[0];
+        let disk = self.domains.disk(&id).await?;
         self.task_center
             .submit(OnlineDiskWorkflow {
                 domains: self.domains.clone(),
@@ -220,7 +176,7 @@ impl PoolHandle {
             .await
     }
     pub async fn offline_disk(&self, id: DiskId) -> Outcome<Run<MemberDisk>> {
-        let disk = self.domains.disk.query(Some(id.clone())).await?.remove(0);
+        let disk = self.domains.disk(&id).await?;
         self.task_center
             .submit(OfflineDiskWorkflow {
                 domains: self.domains.clone(),
@@ -255,14 +211,14 @@ impl PoolHandle {
     }
     pub async fn create_volume(&self, request: CreateVolume) -> Outcome<Run<VirtualDisk>> {
         request.validate()?;
-        // Placement identities are immutable in this slice. Future relocation
-        // must add a versioned placement protocol, not trust this pre-read.
+        // This pre-read builds the conflict set. Domain activities re-read and
+        // validate authoritative placement under their revision checks.
         let mut nodes = BTreeSet::new();
         let mut tiers = BTreeSet::new();
         for disk in &request.disks {
-            let view = self.domains.disk.query(Some(disk.clone())).await?;
-            nodes.insert(view[0].node.clone());
-            tiers.insert(view[0].tier.clone());
+            let view = self.domains.disk(disk).await?;
+            nodes.insert(view.node);
+            tiers.insert(view.tier);
         }
         if nodes.len() != request.disks.len() || tiers.len() != 1 {
             return Err(reject("replicas must be in one tier on distinct nodes"));

@@ -13,6 +13,7 @@ use workflow_foundation::Outcome;
 
 pub(crate) enum VdCommand {
     RequireDiskUnreferenced(DiskId),
+    RequireDisksUnreferenced(Vec<DiskId>),
     Delete(VolumeId),
     RequireAbsent(VolumeId),
     Create {
@@ -57,7 +58,30 @@ impl VdService {
         request: VdCommand,
         cancel: &CancellationToken,
     ) -> Outcome<VdReply> {
+        if let Some(state) = self.metadata.volumes(&self.pool).await? {
+            *self.volumes.lock().unwrap() = state
+                .volumes
+                .into_iter()
+                .map(|v| (v.id.clone(), v))
+                .collect();
+            self.deleted
+                .lock()
+                .unwrap()
+                .extend(state.deleted.into_iter().map(|v| (v.id.clone(), v)));
+        }
         match request {
+            VdCommand::RequireDisksUnreferenced(ids) => {
+                if self.volumes.lock().unwrap().values().any(|volume| {
+                    volume
+                        .groups
+                        .iter()
+                        .flat_map(|g| &g.entries)
+                        .any(|entry| ids.contains(&entry.disk))
+                }) {
+                    return Err(reject("disk is still referenced by a volume"));
+                }
+                Ok(VdReply::Checked)
+            }
             VdCommand::RequireDiskUnreferenced(id) => {
                 if self.volumes.lock().unwrap().values().any(|volume| {
                     volume
@@ -170,6 +194,31 @@ impl VdService {
                 Ok(VdReply::Invalidated)
             }
         }
+    }
+    pub async fn read_one(&self, id: &VolumeId) -> Outcome<VirtualDisk> {
+        match self.metadata.volumes(&self.pool).await? {
+            Some(state) => state
+                .volumes
+                .into_iter()
+                .chain(state.deleted)
+                .find(|volume| &volume.id == id)
+                .ok_or_else(|| reject("unknown volume")),
+            None => self
+                .query(Some(id.clone()))
+                .map(|mut volumes| volumes.remove(0)),
+        }
+    }
+    pub async fn read(&self) -> Outcome<Vec<VirtualDisk>> {
+        match self.metadata.volumes(&self.pool).await? {
+            Some(state) => Ok(state.volumes),
+            None => self.query(None),
+        }
+    }
+    pub async fn authoritative(&self) -> Outcome<VdMetadata> {
+        self.metadata
+            .volumes(&self.pool)
+            .await?
+            .ok_or_else(|| reject("shrink requires authoritative VD metadata reads"))
     }
     pub fn query(&self, id: Option<VolumeId>) -> Outcome<Vec<VirtualDisk>> {
         let volumes = self.volumes.lock().unwrap();

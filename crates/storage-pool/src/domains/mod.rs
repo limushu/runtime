@@ -42,4 +42,3 @@ pub mod tier;
 pub mod vd;
 
 pub mod balance;
-pub mod shrink;

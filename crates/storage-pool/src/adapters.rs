@@ -12,12 +12,13 @@ use tokio_util::sync::CancellationToken;
 pub struct MemoryMetadata {
     state: Mutex<MemoryState>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MemoryState {
     tiers: BTreeMap<(PoolId, TierId), Tier>,
     retired_tiers: BTreeSet<(PoolId, TierId)>,
     retired_disks: BTreeSet<(PoolId, DiskId)>,
     retired_volumes: BTreeSet<(PoolId, VolumeId)>,
+    deleted_volumes: BTreeMap<(PoolId, VolumeId), VirtualDisk>,
     allocations: BTreeMap<(PoolId, DiskId, u32), VolumeId>,
     released: BTreeSet<(PoolId, DiskId, u32, VolumeId)>,
     log: Vec<(PoolId, MetadataChange)>,
@@ -25,15 +26,208 @@ struct MemoryState {
     volumes: BTreeMap<(PoolId, VolumeId), VirtualDisk>,
 }
 impl MemoryMetadata {
+    /// Simulator of the C side's committed BG migration. All changes below use
+    /// the same metadata consumed by Disk/VD; this is not a second shrink catalogue.
+    pub fn evacuate(&self, pool: &PoolId, targets: &[DiskId]) -> Outcome<()> {
+        let mut guard = self.state.lock().unwrap();
+        let mut next = guard.clone();
+        let volumes: Vec<_> = next
+            .volumes
+            .values()
+            .filter(|v| &v.pool == pool)
+            .cloned()
+            .collect();
+        for mut volume in volumes {
+            let mut changed = false;
+            for group in &mut volume.groups {
+                for index in 0..group.entries.len() {
+                    let old = group.entries[index].clone();
+                    if !targets.contains(&old.disk) {
+                        continue;
+                    }
+                    let source = next
+                        .disks
+                        .get(&(pool.clone(), old.disk.clone()))
+                        .ok_or_else(|| reject("missing source disk"))?
+                        .clone();
+                    if source.allocation != AllocationState::Inactive {
+                        return Err(reject("source allocation is still enabled"));
+                    }
+                    let nodes: BTreeSet<_> = group
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != index)
+                        .filter_map(|(_, e)| {
+                            next.disks
+                                .get(&(pool.clone(), e.disk.clone()))
+                                .map(|d| d.node.clone())
+                        })
+                        .collect();
+                    let destination = next
+                        .disks
+                        .values()
+                        .find(|d| {
+                            d.pool == *pool
+                                && d.tier == source.tier
+                                && !targets.contains(&d.id)
+                                && !nodes.contains(&d.node)
+                                && d.allocatable()
+                                && d.allocated.len() < d.capacity_blks as usize
+                        })
+                        .cloned()
+                        .ok_or_else(|| reject("no valid destination for migration"))?;
+                    let blk = (0..destination.capacity_blks)
+                        .find(|b| !destination.allocated.contains(b))
+                        .unwrap();
+                    if next
+                        .allocations
+                        .get(&(pool.clone(), old.disk.clone(), old.blk))
+                        != Some(&volume.id)
+                    {
+                        return Err(reject("source allocation owner mismatch"));
+                    }
+                    let disk = next
+                        .disks
+                        .get_mut(&(pool.clone(), old.disk.clone()))
+                        .unwrap();
+                    disk.allocated.remove(&old.blk);
+                    disk.revision += 1;
+                    let disk = next
+                        .disks
+                        .get_mut(&(pool.clone(), destination.id.clone()))
+                        .unwrap();
+                    disk.allocated.insert(blk);
+                    disk.revision += 1;
+                    next.allocations.remove(&(pool.clone(), old.disk, old.blk));
+                    next.allocations.insert(
+                        (pool.clone(), destination.id.clone(), blk),
+                        volume.id.clone(),
+                    );
+                    group.entries[index] = BgEntry {
+                        disk: destination.id,
+                        blk,
+                        data: old.data,
+                    };
+                    changed = true;
+                }
+            }
+            if changed {
+                volume.revision += 1;
+                next.volumes
+                    .insert((pool.clone(), volume.id.clone()), volume);
+            }
+        }
+        if next
+            .disks
+            .values()
+            .any(|d| d.pool == *pool && targets.contains(&d.id) && !d.allocated.is_empty())
+        {
+            return Err(reject(
+                "unreferenced allocations still require reconciliation",
+            ));
+        }
+        *guard = next;
+        Ok(())
+    }
     pub fn committed(&self) -> Vec<(PoolId, MetadataChange)> {
         self.state.lock().unwrap().log.clone()
     }
 }
 #[async_trait]
 impl MetadataStore for MemoryMetadata {
+    async fn disks(&self, pool: &PoolId) -> Outcome<Option<DiskMetadata>> {
+        let state = self.state.lock().unwrap();
+        Ok(Some(DiskMetadata {
+            disks: state
+                .disks
+                .values()
+                .filter(|d| &d.pool == pool)
+                .cloned()
+                .collect(),
+            allocations: state
+                .allocations
+                .iter()
+                .filter(|((p, _, _), _)| p == pool)
+                .map(|((_, disk, blk), volume)| (disk.clone(), *blk, volume.clone()))
+                .collect(),
+            retired: state
+                .retired_disks
+                .iter()
+                .filter(|(p, _)| p == pool)
+                .map(|(_, d)| d.clone())
+                .collect(),
+        }))
+    }
+    async fn volumes(&self, pool: &PoolId) -> Outcome<Option<VdMetadata>> {
+        let state = self.state.lock().unwrap();
+        Ok(Some(VdMetadata {
+            volumes: state
+                .volumes
+                .values()
+                .filter(|v| &v.pool == pool)
+                .cloned()
+                .collect(),
+            deleted: state
+                .deleted_volumes
+                .values()
+                .filter(|v| &v.pool == pool)
+                .cloned()
+                .collect(),
+        }))
+    }
     async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()> {
         let mut state = self.state.lock().unwrap();
         match &change {
+            MetadataChange::RequestShrink { disks }
+            | MetadataChange::DisableAllocation { disks }
+            | MetadataChange::RemoveDisks { disks } => {
+                let mut seen = BTreeSet::new();
+                for (id, revision) in disks {
+                    let disk = state
+                        .disks
+                        .get(&(pool.clone(), id.clone()))
+                        .ok_or_else(|| reject("unknown disk"))?;
+                    if !seen.insert(id) || disk.revision != *revision {
+                        return Err(reject("duplicate disk or stale revision"));
+                    }
+                    if matches!(change, MetadataChange::DisableAllocation { .. })
+                        && !disk.shrink_requested
+                    {
+                        return Err(reject(
+                            "allocation disable requires persisted shrink intent",
+                        ));
+                    }
+                    if matches!(change, MetadataChange::RemoveDisks { .. })
+                        && (disk.io != IoState::Down
+                            || !disk.allocated.is_empty()
+                            || state.volumes.values().any(|v| {
+                                v.pool == *pool
+                                    && v.groups
+                                        .iter()
+                                        .flat_map(|g| &g.entries)
+                                        .any(|e| e.disk == *id)
+                            }))
+                    {
+                        return Err(reject("disk is still in use"));
+                    }
+                }
+                for (id, _) in disks {
+                    let key = (pool.clone(), id.clone());
+                    if matches!(change, MetadataChange::RemoveDisks { .. }) {
+                        state.disks.remove(&key);
+                        state.retired_disks.insert(key);
+                    } else {
+                        let disk = state.disks.get_mut(&key).unwrap();
+                        if matches!(change, MetadataChange::RequestShrink { .. }) {
+                            disk.shrink_requested = true;
+                        } else {
+                            disk.allocation = AllocationState::Inactive;
+                        }
+                        disk.revision += 1;
+                    }
+                }
+            }
             MetadataChange::CreateTier(tier) => {
                 let key = (pool.clone(), tier.id.clone());
                 if tier.pool != *pool
@@ -101,7 +295,8 @@ impl MetadataStore for MemoryMetadata {
                 if current.revision != *expected_revision {
                     return Err(reject("stale volume revision"));
                 }
-                state.volumes.remove(&key);
+                let volume = state.volumes.remove(&key).unwrap();
+                state.deleted_volumes.insert(key.clone(), volume);
                 state.retired_volumes.insert(key);
             }
             MetadataChange::ReleaseAllocation {
@@ -259,5 +454,5 @@ impl DataPlane for SimulatedDataPlane {
     }
 }
 
-mod shrink;
-pub use shrink::{SimulatedBalance, SimulatedShrinkStorage};
+mod balance;
+pub use balance::SimulatedBalance;

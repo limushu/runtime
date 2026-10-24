@@ -3,7 +3,7 @@ use crate::support::object;
 use async_trait::async_trait;
 use workflow_foundation::{ActivityContext, Outcome, ResourceAccess, ServiceHandler};
 
-pub(crate) struct DiskHost(pub DiskService);
+pub(crate) struct DiskHost(pub std::sync::Arc<DiskService>);
 
 #[async_trait]
 impl ServiceHandler for DiskHost {
@@ -13,6 +13,10 @@ impl ServiceHandler for DiskHost {
     type View = Vec<MemberDisk>;
     fn activity_name(request: &DiskCommand) -> &'static str {
         match request {
+            DiskCommand::RequestShrink(_) => "disk.request-shrink",
+            DiskCommand::DisableAllocation(_) => "disk.disable-allocation",
+            DiskCommand::RequireEmptyMany(_) => "disk.require-empty-many",
+            DiskCommand::RemoveEmptyMany(_) => "disk.remove-empty-many",
             DiskCommand::RequireTierEmpty(_) => "disk.require-tier-empty",
             DiskCommand::RemoveEmpty(_) => "disk.remove-empty",
             DiskCommand::Release { .. } => "disk.release-allocation",
@@ -31,39 +35,13 @@ impl ServiceHandler for DiskHost {
         if let DiskCommand::RequireTierEmpty(tier) = request {
             return vec![ResourceAccess::read(object("tier", tier.as_str()))];
         }
-        if let DiskCommand::InspectMany(ids)
-        | DiskCommand::SetIoMany(ids, _)
-        | DiskCommand::RemoveMany(ids) = request
-        {
-            return ids
-                .iter()
-                .map(|id| {
-                    let key = object("disk", id.as_str());
-                    if matches!(request, DiskCommand::InspectMany(_)) {
-                        ResourceAccess::read(key)
-                    } else {
-                        ResourceAccess::write(key)
-                    }
-                })
-                .collect();
-        }
-        let id = match request {
-            DiskCommand::RequireTierEmpty(_) => unreachable!(),
-            DiskCommand::Release { disk, .. } => disk,
-            DiskCommand::Inspect(id) => {
-                return vec![ResourceAccess::read(object("disk", id.as_str()))];
-            }
-            DiskCommand::InspectMany(_)
-            | DiskCommand::SetIoMany(_, _)
-            | DiskCommand::RemoveMany(_) => unreachable!(),
-            DiskCommand::Add(s) => &s.id,
-            DiskCommand::Open(id)
-            | DiskCommand::SetIo(id, _)
-            | DiskCommand::Allocate(id, _)
-            | DiskCommand::Remove(id) => id,
-            DiskCommand::RemoveEmpty(id) => id,
-        };
-        vec![ResourceAccess::write(object("disk", id.as_str()))]
+        // Includes the short read-model refresh before each command. Disjoint
+        // disk batches keep executing concurrently.
+        request
+            .disks()
+            .iter()
+            .map(|id| ResourceAccess::write(object("disk", id.as_str())))
+            .collect()
     }
 
     async fn execute(&self, request: Self::Request, ctx: ActivityContext) -> Outcome<Self::Reply> {

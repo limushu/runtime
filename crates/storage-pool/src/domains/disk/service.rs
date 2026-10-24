@@ -12,6 +12,10 @@ use tokio_util::sync::CancellationToken;
 use workflow_foundation::{Failure, Outcome};
 
 pub(crate) enum DiskCommand {
+    RequestShrink(Vec<DiskId>),
+    DisableAllocation(Vec<DiskId>),
+    RequireEmptyMany(Vec<DiskId>),
+    RemoveEmptyMany(Vec<DiskId>),
     RequireTierEmpty(crate::TierId),
     RemoveEmpty(DiskId),
     Release {
@@ -29,6 +33,28 @@ pub(crate) enum DiskCommand {
     Allocate(DiskId, VolumeId),
     /// Placeholder: remove membership only after VD confirms rebuild completion.
     Remove(DiskId),
+}
+impl DiskCommand {
+    pub fn disks(&self) -> Vec<DiskId> {
+        match self {
+            Self::RequestShrink(ids)
+            | Self::DisableAllocation(ids)
+            | Self::RequireEmptyMany(ids)
+            | Self::RemoveEmptyMany(ids)
+            | Self::InspectMany(ids)
+            | Self::RemoveMany(ids)
+            | Self::SetIoMany(ids, _) => ids.clone(),
+            Self::RequireTierEmpty(_) => vec![],
+            Self::Add(spec) => vec![spec.id.clone()],
+            Self::Release { disk, .. }
+            | Self::Inspect(disk)
+            | Self::RemoveEmpty(disk)
+            | Self::Open(disk)
+            | Self::SetIo(disk, _)
+            | Self::Allocate(disk, _)
+            | Self::Remove(disk) => vec![disk.clone()],
+        }
+    }
 }
 pub(crate) enum DiskReply {
     Checked,
@@ -76,15 +102,80 @@ impl DiskService {
     ) -> Outcome<DiskReply> {
         // Only short in-memory access uses Mutex. No guard crosses an await;
         // object conflicts are resolved by the Pool TaskCenter before execution.
-        match request {
-            DiskCommand::RequireTierEmpty(tier) => {
-                if self
+        if let Some(state) = self.metadata.disks(&self.pool).await? {
+            // Refresh only objects locked by this Activity. Independent disks may
+            // execute concurrently; a pool-wide cache replacement would lose updates.
+            let ids = request.disks();
+            let mut disks = self.disks.lock().unwrap();
+            let mut owners = self.owners.lock().unwrap();
+            for id in &ids {
+                disks.remove(id);
+            }
+            disks.extend(
+                state
                     .disks
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .any(|disk| disk.tier == tier)
-                {
+                    .into_iter()
+                    .filter(|d| ids.contains(&d.id))
+                    .map(|d| (d.id.clone(), d)),
+            );
+            owners.retain(|(disk, _), _| !ids.contains(disk));
+            owners.extend(
+                state
+                    .allocations
+                    .into_iter()
+                    .filter(|(disk, _, _)| ids.contains(disk))
+                    .map(|(disk, blk, volume)| ((disk, blk), volume)),
+            );
+            self.retired.lock().unwrap().extend(state.retired);
+        }
+        match request {
+            DiskCommand::RequestShrink(ids) => self.set_members(ids, true).await,
+            DiskCommand::DisableAllocation(ids) => self.set_members(ids, false).await,
+            DiskCommand::RequireEmptyMany(ids) => {
+                for id in ids {
+                    if !self.get(&id)?.allocated.is_empty() {
+                        return Err(reject("disk still has allocations"));
+                    }
+                }
+                Ok(DiskReply::Checked)
+            }
+            DiskCommand::RemoveEmptyMany(ids) => {
+                let mut members = Vec::new();
+                for id in &ids {
+                    if self.retired.lock().unwrap().contains(id) {
+                        continue;
+                    }
+                    let disk = self.get(id)?;
+                    if disk.io != IoState::Down || !disk.allocated.is_empty() {
+                        return Err(reject("disk must be down and have no allocations"));
+                    }
+                    members.push((id.clone(), disk.revision));
+                }
+                let present: Vec<_> = members.iter().map(|(id, _)| id.clone()).collect();
+                self.data_plane
+                    .close_disks(&self.pool, &present, cancel)
+                    .await
+                    .map_err(|e| {
+                        Failure::Uncertain(format!("batch disk close not confirmed: {e}"))
+                    })?;
+                if !members.is_empty() {
+                    self.metadata
+                        .commit(&self.pool, MetadataChange::RemoveDisks { disks: members })
+                        .await
+                        .map_err(|e| {
+                            Failure::Uncertain(format!(
+                                "disks closed but removal not confirmed: {e}"
+                            ))
+                        })?;
+                }
+                for id in ids {
+                    self.disks.lock().unwrap().remove(&id);
+                    self.retired.lock().unwrap().insert(id);
+                }
+                Ok(DiskReply::Checked)
+            }
+            DiskCommand::RequireTierEmpty(tier) => {
+                if self.read().await?.iter().any(|disk| disk.tier == tier) {
                     return Err(reject("tier still has member disks"));
                 }
                 Ok(DiskReply::Checked)
@@ -312,6 +403,44 @@ impl DiskService {
                 Ok(DiskReply::Allocated(receipt))
             }
         }
+    }
+    async fn set_members(&self, ids: Vec<DiskId>, intent: bool) -> Outcome<DiskReply> {
+        let mut members = ids
+            .iter()
+            .map(|id| self.get(id))
+            .collect::<Outcome<Vec<_>>>()?;
+        let disks = members.iter().map(|d| (d.id.clone(), d.revision)).collect();
+        let change = if intent {
+            MetadataChange::RequestShrink { disks }
+        } else {
+            MetadataChange::DisableAllocation { disks }
+        };
+        self.metadata.commit(&self.pool, change).await?;
+        for disk in &mut members {
+            if intent {
+                disk.shrink_requested = true;
+            } else {
+                disk.allocation = crate::AllocationState::Inactive;
+            }
+            disk.revision += 1;
+            self.disks
+                .lock()
+                .unwrap()
+                .insert(disk.id.clone(), disk.clone());
+        }
+        Ok(DiskReply::Disks(members))
+    }
+    pub async fn read(&self) -> Outcome<Vec<MemberDisk>> {
+        match self.metadata.disks(&self.pool).await? {
+            Some(state) => Ok(state.disks),
+            None => self.query(None),
+        }
+    }
+    pub async fn authoritative(&self) -> Outcome<DiskMetadata> {
+        self.metadata
+            .disks(&self.pool)
+            .await?
+            .ok_or_else(|| reject("shrink requires authoritative disk metadata reads"))
     }
     pub fn query(&self, id: Option<DiskId>) -> Outcome<Vec<MemberDisk>> {
         match id {

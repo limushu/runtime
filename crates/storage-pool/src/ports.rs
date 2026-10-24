@@ -32,6 +32,16 @@ pub enum MetadataChange {
         volume: VolumeId,
         blk: u32,
     },
+    /// Atomic batch: validate every revision before applying any member change.
+    RequestShrink {
+        disks: Vec<(DiskId, u64)>,
+    },
+    DisableAllocation {
+        disks: Vec<(DiskId, u64)>,
+    },
+    RemoveDisks {
+        disks: Vec<(DiskId, u64)>,
+    },
     AddDisk(MemberDisk),
     DiskIo {
         disk: DiskId,
@@ -50,12 +60,34 @@ pub enum MetadataChange {
     },
 }
 
+/// A consistent disk-domain read, including allocation owners and deletion receipts.
+#[derive(Debug, Clone, Default)]
+pub struct DiskMetadata {
+    pub disks: Vec<MemberDisk>,
+    pub allocations: Vec<(DiskId, u32, VolumeId)>,
+    pub retired: Vec<DiskId>,
+}
+#[derive(Debug, Clone, Default)]
+pub struct VdMetadata {
+    pub volumes: Vec<VirtualDisk>,
+    pub deleted: Vec<VirtualDisk>,
+}
+
 /// Ok means acknowledged commit. Known failure MUST mean not committed;
 /// ambiguous transport/commit outcomes MUST be Uncertain. No automatic retries.
 /// Production adapters must enforce revisions and fencing; memory is only a simulator.
 #[async_trait]
 pub trait MetadataStore: Send + Sync + 'static {
     async fn commit(&self, pool: &PoolId, change: MetadataChange) -> Outcome<()>;
+    /// Optional for legacy in-process adapters. Shrink requires both authoritative
+    /// reads: native migration must publish committed placement before settling.
+    /// Reads must be consistent and at least as fresh as acknowledged native writes.
+    async fn disks(&self, _pool: &PoolId) -> Outcome<Option<DiskMetadata>> {
+        Ok(None)
+    }
+    async fn volumes(&self, _pool: &PoolId) -> Outcome<Option<VdMetadata>> {
+        Ok(None)
+    }
 }
 
 /// An operation must return only after it is stable. Cancelled means stopped with
@@ -84,6 +116,22 @@ pub trait DataPlane: Send + Sync + 'static {
         Err(Failure::Rejected(
             "disk close is not supported by this data plane".into(),
         ))
+    }
+    /// One logical batch; adapters may override this with a native batch close.
+    /// Await every dispatched close, even when another disk fails.
+    async fn close_disks(
+        &self,
+        pool: &PoolId,
+        disks: &[DiskId],
+        cancel: &CancellationToken,
+    ) -> Outcome<()> {
+        let mut failure = None;
+        for disk in disks {
+            if let Err(error) = self.close_disk(pool, disk, cancel).await {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
     /// Ok confirms all volume access and outstanding IO have stopped.
     async fn delete_volume(

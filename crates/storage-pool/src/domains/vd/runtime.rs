@@ -3,7 +3,7 @@ use crate::support::object;
 use async_trait::async_trait;
 use workflow_foundation::{ActivityContext, Outcome, ResourceAccess, ServiceHandler};
 
-pub(crate) struct VdHost(pub VdService);
+pub(crate) struct VdHost(pub std::sync::Arc<VdService>);
 
 #[async_trait]
 impl ServiceHandler for VdHost {
@@ -13,6 +13,7 @@ impl ServiceHandler for VdHost {
     type View = Vec<VirtualDisk>;
     fn activity_name(request: &VdCommand) -> &'static str {
         match request {
+            VdCommand::RequireDisksUnreferenced(_) => "vd.require-disks-unreferenced",
             VdCommand::Delete(_) => "vd.delete",
             VdCommand::RequireDiskUnreferenced(_) => "vd.require-disk-unreferenced",
             VdCommand::RequireAbsent(_) => "vd.require-absent",
@@ -24,12 +25,7 @@ impl ServiceHandler for VdHost {
         }
     }
     fn resources(request: &VdCommand) -> Vec<ResourceAccess> {
-        if matches!(
-            request,
-            VdCommand::RequireAbsent(_) | VdCommand::RequireDiskUnreferenced(_)
-        ) {
-            return vec![ResourceAccess::read(object("vd", "reference-index"))];
-        }
+        let _ = request;
         // Protect the reverse-reference index including newly created VDs. A
         // fixed known set is safer than discovering/expanding locks during IO.
         vec![ResourceAccess::write(object("vd", "reference-index"))]

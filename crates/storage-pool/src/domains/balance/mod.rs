@@ -1,7 +1,9 @@
 //! Native balance boundary. A submission is one whole batch, not a disk-at-a-time loop.
+mod readiness;
 mod runtime;
 use crate::{DiskId, PoolId};
 use async_trait::async_trait;
+pub(crate) use readiness::evacuation_readiness;
 pub use runtime::{BalanceClient, BalanceHost};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +40,10 @@ pub trait BalanceBackend: Send + Sync + 'static {
 }
 
 /// The bridge owns C callback memory until completion guarantees it is no longer used.
+/// Before publishing any terminal result (including suspension/cancellation), all
+/// settled BG moves must be committed to the same MetadataStore read by Disk/VD:
+/// references, allocation bitmaps, owners and revisions must agree. A partial move
+/// with unknown commit status is Uncertain, not a safe suspension acknowledgment.
 /// Every result ends this invocation and releases its running resources. Suspended
 /// retains only checkpoint data. A late cancellation must preserve actual completion.
 #[async_trait]

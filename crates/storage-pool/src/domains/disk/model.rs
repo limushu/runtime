@@ -24,6 +24,8 @@ pub struct MemberDisk {
     pub capacity_blks: u32,
     pub io: IoState,
     pub allocation: AllocationState,
+    /// Persisted administrative intent; independent of a running task.
+    pub shrink_requested: bool,
     pub allocated: BTreeSet<u32>,
     pub revision: u64,
 }
@@ -64,6 +66,7 @@ impl MemberDisk {
             capacity_blks: spec.capacity_blks,
             io: IoState::Down,
             allocation: AllocationState::Active,
+            shrink_requested: false,
             allocated: BTreeSet::new(),
             revision: 0,
         })
