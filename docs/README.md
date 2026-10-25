@@ -3,17 +3,20 @@
 当前代码只有两个 workspace 成员，入口以本页和根 README 为准。
 
 - [当前架构与目录边界](architecture.md)
+- [主备切换：正式 Pool 入口、文件日志示例与验证](leader-handoff.md)
 - [PoolManager 当前实现与限制](pool-manager.md)
 - [PoolManager 接口、多索引与创建/删除设计](pool-manager-design.md)（含后续持久化目标）
 - [TaskCenter TUI：任务列表、Activity 时间线与历史](task-center-tui.md)（界面建议）
-- [最新架构六图导读：分层、执行、调度、暂停、恢复与观察](runtime-guide.md)
+- [架构六图导读（53fae88 历史快照）](runtime-guide.md)
 - [Runtime Lab 动态演示：请求流转、冲突排队与交接](diagrams/task-center-simulation/index.html)（离线教学模拟）
 - [动态演示范围、使用与验证](changes/2026-10-24-runtime-lab.md)
 - [Driver tick 分支与三任务死锁回归图示](changes/2026-10-24-driver-tick-views.md)
 - [持续等待、执行宿主与资源事件分派](changes/2026-10-24-runtime-awaits.md)
 - [旧版 TaskCenter 协作图（历史实现）](runtime-collaboration.md)
-- [TaskCenter 冲突规则开发说明](task-center.md)
-- [统一 Task 与暂停/恢复契约、验收记录](changes/2026-10-24-unified-task-controls.md)
+- [TaskCenter 单一规则与完整暂停链](task-center.md)
+- [current + queue 与不可中断步骤](changes/2026-10-25-task-queue.md)
+- [本轮简化规格与验证](changes/2026-10-24-simple-task-rules.md)
+- [统一 Task 与暂停/恢复历史验收记录](changes/2026-10-24-unified-task-controls.md)
 - [TaskCenter 重构规格与证据](changes/2026-10-15-task-center.md)
 - [构建与验证](verification.md)
 - [本次目录迁移规格与证据](changes/2026-10-15-workspace-layout.md)

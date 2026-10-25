@@ -1329,8 +1329,11 @@ async fn disk_online_then_disk_offline_then_node_offline_are_coordinated_without
     gate.wait().await;
     let disk_offline = pool.offline_disk(disk_id("d1")).await.unwrap();
     assert!(online.control.cancellation_requested());
+    let disconnect = Gate::new();
+    *plane.down.lock().unwrap() = Some((disk_id("d1"), disconnect.clone()));
     let mut node_offline = pool.offline_node(transition(2)).await.unwrap();
-    assert!(disk_offline.control.cancellation_requested());
+    assert!(!disk_offline.control.cancellation_requested());
+    assert!(!disk_offline.control.has_started());
     assert!(
         tokio::time::timeout(Duration::from_millis(20), node_offline.result())
             .await
@@ -1339,6 +1342,11 @@ async fn disk_online_then_disk_offline_then_node_offline_are_coordinated_without
     assert!(plane.batch_calls.lock().unwrap().is_empty());
     gate.open();
     assert_eq!(result(online).await, Err(Failure::Cancelled));
+    disconnect.wait().await;
+    assert!(disk_offline.control.has_started());
+    assert!(!node_offline.control.has_started());
+    assert!(plane.batch_calls.lock().unwrap().is_empty());
+    disconnect.open();
     assert_eq!(result(disk_offline).await, Err(Failure::Cancelled));
     assert!(
         matches!(result(node_offline).await, Err(Failure::Failed(message)) if message.contains("rebuild"))
@@ -1551,4 +1559,51 @@ fn vertical_modules_preserve_model_service_runtime_dependencies() {
     assert_eq!(center.matches("tokio::spawn(").count(), 1);
     assert!(center.contains("driver.tick()"));
     assert!(!center.contains("RuntimeHandle"));
+}
+
+#[tokio::test]
+async fn queued_node_offline_invalidates_old_connection_before_next_online_runs() {
+    let plane = Arc::new(ControlledPlane::default());
+    let (manager, pool) = fixture(Arc::new(MemoryMetadata::default()), plane.clone(), 2).await;
+    let opening = Gate::new();
+    *plane.open_gate.lock().unwrap() = Some(opening.clone());
+    let online_a = pool.online_node(transition(2)).await.unwrap();
+    opening.wait().await;
+    let closing = Gate::new();
+    *plane.down.lock().unwrap() = Some((disk_id("d1"), closing.clone()));
+    let offline_b = pool.offline_node(transition(3)).await.unwrap();
+    let online_c = pool.online_node(transition(4)).await.unwrap();
+    assert!(!offline_b.control.has_started());
+    assert!(!offline_b.control.cancellation_requested());
+    assert!(!online_c.control.has_started());
+    opening.open();
+    assert_eq!(result(online_a).await, Err(Failure::Cancelled));
+    closing.wait().await;
+    let node = pool
+        .nodes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == node_id("n1"))
+        .unwrap();
+    assert_eq!(node.observation, 3);
+    assert!(!node.connected);
+    assert!(
+        !node.loaded,
+        "the intermediate offline event must invalidate the old load"
+    );
+    assert!(!online_c.control.has_started());
+    closing.open();
+    assert_eq!(result(offline_b).await, Err(Failure::Cancelled));
+    let node = result(online_c).await.unwrap();
+    assert_eq!(node.observation, 4);
+    assert!(node.serving());
+    assert_eq!(
+        plane.batch_calls.lock().unwrap().as_slice(),
+        &[
+            (vec![disk_id("d1")], IoState::Down),
+            (vec![disk_id("d1")], IoState::Up),
+        ]
+    );
+    manager.shutdown().await.unwrap();
 }

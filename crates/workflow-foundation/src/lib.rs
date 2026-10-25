@@ -9,24 +9,25 @@ mod standalone;
 mod tasks;
 mod workflow;
 
+pub use driver::execution::Run;
+pub use driver::recovery::Restored;
 pub use driver::{ExecutionView, StartPermit, WorkflowDriver};
 pub use model::*;
-pub use service::{ActivityClient, ActivityContext, ServiceClient, ServiceHandler};
+pub use service::{ActivityClient, ActivityContext, ActivityExit, ServiceClient, ServiceHandler};
 pub use standalone::{RuntimeHandle, WorkflowRuntime};
 pub(crate) use tasks::TaskInfo;
 pub use tasks::{
-    ActivityHistory, ActivitySnapshot, ActivityState, Conflict, ConflictDecision, ConflictMatch,
-    TaskObserver, TaskProgress, TaskSnapshot,
+    ActivityHistory, ActivitySnapshot, ActivityState, TaskObserver, TaskProgress, TaskSnapshot,
 };
-pub use workflow::{Run, RunControl, Workflow, WorkflowContext};
+pub use workflow::{
+    ActivityCall, Dependencies, Readiness, RunCondition, Workflow, WorkflowContext,
+};
 
 mod control;
-pub use control::{
-    ActivityControl, ActivityExit, CancellationReason, ControlRequest, ControlToken, Readiness,
-    RunCondition,
-};
+pub use control::{CancellationReason, ControlRequest, ControlToken, RunControl};
 
 pub mod persistence;
-pub use persistence::{Dependencies, Persistence};
+pub use persistence::Persistence;
 
 pub mod scheduling;
+pub use scheduling::{Conflict, ConflictDecision, ConflictMatch};

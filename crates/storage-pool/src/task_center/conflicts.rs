@@ -1,4 +1,4 @@
-//! Default storage policy: admission conflicts and directional scheduling relations.
+//! Default storage rules: existing task A, incoming task B, one decision.
 //! Applications can inject another policy without changing the TaskCenter event loop.
 use super::*;
 
@@ -24,11 +24,32 @@ impl OperationKind {
     }
 }
 impl TaskCenter {
-    /// Read top to bottom: object relation, freshness, duplicates, named business cases.
+    /// Read top to bottom: shrink/topology, object scope, freshness, duplicates, replacement.
     /// Pure inspection; the actor applies decisions only after ALL conflicts are checked.
     pub fn conflict(incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
         use ConflictDecision::*;
         use OperationKind::*;
+        // These are business coordination rules, independent of per-Activity locks.
+        match (&existing.kind, &incoming.kind) {
+            (Shrink(_), Shrink(_)) => {
+                return conflict_result(
+                    Reject("pool already has an unfinished shrink task"),
+                    "single-shrink",
+                );
+            }
+            (Shrink(_), next) if next.topology() => {
+                return conflict_result(SuspendThenWait, "topology-stops-shrink");
+            }
+            (old, Shrink(_)) if old.topology() => {
+                return conflict_result(Wait, "shrink-waits-for-topology");
+            }
+            // Shrink is not a task-lifetime mutex against volume operations.
+            // Domain invariants and Activity resource claims protect their effects.
+            (Shrink(_), _) | (_, Shrink(_)) => {
+                return conflict_result(Independent, "shrink-and-ordinary-work");
+            }
+            _ => {}
+        }
         if !incoming.overlaps(existing) {
             return conflict_result(Independent, "disjoint");
         }
@@ -94,48 +115,7 @@ impl OperationKind {
     }
 }
 impl SchedulingPolicy<PoolOperation> for PoolSchedulingPolicy {
-    fn priority(&self, task: &PoolOperation) -> i32 {
-        if task.kind.topology() {
-            2
-        } else if matches!(task.kind, OperationKind::Shrink(_)) {
-            0
-        } else {
-            1
-        }
-    }
-    fn admission(&self, incoming: &PoolOperation, existing: &PoolOperation) -> Conflict {
-        if matches!(incoming.kind, OperationKind::Shrink(_))
-            && matches!(existing.kind, OperationKind::Shrink(_))
-        {
-            return conflict_result(
-                ConflictDecision::Reject("pool already has an unfinished shrink task"),
-                "single-shrink",
-            );
-        }
-        if matches!(incoming.kind, OperationKind::Shrink(_))
-            || matches!(existing.kind, OperationKind::Shrink(_))
-        {
-            return Conflict {
-                decision: ConflictDecision::Wait,
-                reason: "shrink-coordination",
-            };
-        }
+    fn on_task(&self, existing: &PoolOperation, incoming: &PoolOperation) -> Conflict {
         TaskCenter::conflict(incoming, existing)
-    }
-    fn relation(&self, task: &PoolOperation, other: &PoolOperation) -> Relation {
-        if matches!(task.kind, OperationKind::Shrink(_)) && other.kind.topology() {
-            return Relation::YieldTo("topology");
-        }
-        if matches!(other.kind, OperationKind::Shrink(_)) && task.kind.topology() {
-            return Relation::Independent;
-        }
-        if (matches!(task.kind, OperationKind::Shrink(_))
-            && matches!(other.kind, OperationKind::Shrink(_)))
-            || task.overlaps(other)
-        {
-            Relation::Exclusive
-        } else {
-            Relation::Independent
-        }
     }
 }

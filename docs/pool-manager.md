@@ -7,6 +7,8 @@ PoolManager 是可克隆的句柄目录；每个 Pool 保留自己的 TaskCenter
 
 - `create(CreatePool)` 创建本地 Pool；`create_pool(PoolId)` 是名称默认等于 ID 的便捷入口。
   当前创建只启动内存运行结构，没有外部初始化步骤，因此不生成虚假的初始化 Workflow。
+- `with_task_store(...).activate(PoolRecovery)` 是异步持久化启动入口，接主时恢复领域视图和任务。
+  配置存储后同步 create 旁路会拒绝。激活失败不发布句柄，降主用 demote 等待停稳。
 - `get(PoolSelector)` 支持类型化的 ID、UUID、名称；名称区分大小写。
 - `list()` 返回描述符；`PoolHandle::rename(name, expected_revision)` 原子更新名称索引和修订号。
 - UUID 与 ID 不复用；删除成功后名称可以复用。旧句柄仍绑定原来的 UUID 和实例。
@@ -55,6 +57,8 @@ Manager 汇总本池 Task 快照，选中任务可以订阅 observer；历史与
 ## 当前边界
 
 目录、身份墓碑、事件去重及审计历史都没有跨进程持久化。
-尚无 PoolCatalog、崩溃恢复、持久 RequestId 或完整状态事件日志。
+Task checkpoint 已接入正式 Pool 的恢复入口；尚无内置 PoolCatalog、选主算法、持久 RequestId 或完整状态事件日志。
+新主仍需从外部目录/拓扑权威来源提供 PoolRecovery，不能只靠任务日志恢复所有业务状态。
+运行说明及生产接入边界见 [主备切换](leader-handoff.md)。
 [设计草案](pool-manager-design.md) 中更完整的持久化契约仍是后续目标，不能当作现有 API。
 [TUI 建议](task-center-tui.md) 说明如何呈现当前接口及其限制。

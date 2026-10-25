@@ -1,5 +1,7 @@
-mod control;
+//! Business-facing Workflow contract and context: Activity calls and safe boundaries.
+//! Task execution and settlement live in driver/execution.rs; controls in control.rs.
 use crate::{
+    driver::execution::{Tracker, sync_controls},
     locks::{Broker, Kind, Permit},
     model::Scope,
     service::ActivityClient,
@@ -7,14 +9,51 @@ use crate::{
     *,
 };
 use async_trait::async_trait;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, future::BoxFuture};
 use std::{
-    panic::AssertUnwindSafe,
+    any::{Any, TypeId},
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
+
+/// Dependency binding is local to a host; clients and Futures are never serialized.
+#[derive(Clone, Default)]
+pub struct Dependencies(Arc<BTreeMap<TypeId, Arc<dyn Any + Send + Sync>>>);
+impl Dependencies {
+    pub fn with<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        Arc::make_mut(&mut self.0).insert(TypeId::of::<T>(), Arc::new(value));
+        self
+    }
+    pub fn get<T: Send + Sync + 'static>(&self) -> Outcome<Arc<T>> {
+        self.0
+            .get(&TypeId::of::<T>())
+            .cloned()
+            .and_then(|v| v.downcast().ok())
+            .ok_or_else(|| {
+                Failure::Rejected(format!(
+                    "missing workflow dependency {}",
+                    std::any::type_name::<T>()
+                ))
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    Blocked(String),
+}
+/// Business-defined, side-effect-free check. It can use stage state shared with run().
+#[async_trait]
+pub trait RunCondition: Send + Sync + 'static {
+    async fn check(&self) -> Outcome<Readiness>;
+}
 
 #[async_trait]
 pub trait Workflow: Send + 'static {
@@ -32,7 +71,9 @@ pub trait Workflow: Send + 'static {
     fn persistence(&self) -> Outcome<Persistence> {
         Ok(Persistence::Memory)
     }
-    /// Construct this same workflow definition on another host from durable business data.
+    /// Rebuild ONLY the execution body for a persisted Task, binding this host's clients.
+    /// Driver restores Task identity, control state and checkpoint separately; this
+    /// constructor must not start domain operations. Called during full preflight.
     fn restore(
         _record: &crate::persistence::SavedTask,
         _dependencies: &Dependencies,
@@ -50,293 +91,6 @@ pub trait Workflow: Send + 'static {
     async fn run(self, context: &mut WorkflowContext) -> Outcome<Self::Output>;
 }
 
-pub struct Run<T> {
-    pub control: RunControl,
-    result: oneshot::Receiver<Outcome<T>>,
-    consumed: bool,
-    accepted: watch::Receiver<Option<Outcome<()>>>,
-}
-impl<T> Run<T> {
-    pub fn id(&self) -> TaskId {
-        self.control.id
-    }
-    /// Confirms durable acceptance (or immediate in-memory registration). Driver owners
-    /// must keep polling tick() while waiting; application submit APIs await this for you.
-    pub async fn accepted(&mut self) -> Outcome<()> {
-        loop {
-            if let Some(result) = self.accepted.borrow_and_update().clone() {
-                return result;
-            }
-            self.accepted
-                .changed()
-                .await
-                .map_err(|_| Failure::Unavailable)?;
-        }
-    }
-    /// Cancellation-safe wait. Dropping the caller does not cancel the workflow.
-    pub async fn result(&mut self) -> Outcome<T> {
-        if self.consumed {
-            return Err(Failure::Rejected("result already consumed".into()));
-        }
-        let result = (&mut self.result)
-            .await
-            .unwrap_or_else(|_| Err(Failure::Uncertain("workflow host disappeared".into())));
-        self.consumed = true;
-        result
-    }
-}
-#[derive(Clone)]
-pub struct RunControl {
-    pub id: TaskId,
-    pub name: &'static str,
-    cancel: CancellationToken,
-    signals: mpsc::Sender<Signal>,
-    state: watch::Receiver<RunState>,
-    max_signal_bytes: usize,
-    controls: crate::control::Controls,
-    durable: bool,
-    acceptance: watch::Receiver<Option<Outcome<()>>>,
-    pub(crate) info: watch::Sender<TaskInfo>,
-    pub(crate) progress: watch::Receiver<TaskProgress>,
-    pub(crate) activities: watch::Receiver<ActivityHistory>,
-    pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
-}
-impl RunControl {
-    /// None while durable registration is pending. Not a workflow completion result.
-    pub fn acceptance_status(&self) -> Option<Outcome<()>> {
-        self.acceptance.borrow().clone()
-    }
-    /// Request a pause at the next safe boundary, not preemption of external IO.
-    pub fn suspend(&self) -> Outcome<()> {
-        self.set_suspended(true)
-    }
-    pub fn resume(&self) -> Outcome<()> {
-        self.set_suspended(false)
-    }
-    fn set_suspended(&self, value: bool) -> Outcome<()> {
-        if self.cancel.is_cancelled()
-            || matches!(self.state(), RunState::Completed | RunState::Failed(_))
-        {
-            return Err(Failure::Rejected("run is cancelled or terminal".into()));
-        }
-        self.controls.update(|reasons| {
-            if value {
-                reasons.insert("user".into());
-            } else {
-                reasons.remove("user");
-            }
-        });
-        Ok(())
-    }
-    pub fn set_blockers(&self, blockers: Vec<TaskId>) {
-        self.info.send_if_modified(|info| {
-            if info.blockers == blockers {
-                false
-            } else {
-                info.blockers = blockers;
-                true
-            }
-        });
-    }
-    pub fn explain(&self, conflicts: Vec<ConflictMatch>, blockers: Vec<TaskId>) {
-        self.info.send_modify(|info| {
-            info.conflicts = conflicts;
-            info.blockers = blockers;
-        });
-    }
-    pub fn progress(&self) -> TaskProgress {
-        self.progress.borrow().clone()
-    }
-    pub fn activities(&self) -> ActivityHistory {
-        let mut history = self.activities.borrow().clone();
-        if self.suspend_acknowledged() {
-            for e in &mut history.entries {
-                if e.state == ActivityState::Running {
-                    e.state = ActivityState::Suspended;
-                }
-            }
-        }
-        history
-    }
-    pub fn suspend_requested(&self) -> bool {
-        self.controls.tx.borrow().paused()
-    }
-    pub fn suspend_acknowledged(&self) -> bool {
-        !self.cancel.is_cancelled()
-            && !matches!(
-                self.state.borrow().clone(),
-                RunState::Completed | RunState::Failed(_)
-            )
-            && self.controls.acknowledged()
-    }
-    pub fn suspend_reasons(&self) -> std::collections::BTreeSet<String> {
-        self.controls.reasons()
-    }
-    pub fn set_policy_suspensions(&self, reasons: &std::collections::BTreeSet<String>) {
-        self.controls.update(|current| {
-            current.retain(|s| !s.starts_with("policy:"));
-            current.extend(reasons.iter().map(|s| format!("policy:{s}")));
-        });
-    }
-    pub fn recheck(&self) {
-        self.controls.recheck.notify_one();
-    }
-    /// Cancellation-safe wait for acknowledgement, not merely request delivery.
-    pub async fn wait_suspended(&self) -> Outcome<()> {
-        let mut state = self.state.clone();
-        let mut request = self.controls.tx.subscribe();
-        loop {
-            if self.cancel.is_cancelled() {
-                return Err(Failure::Cancelled);
-            }
-            if !request.borrow_and_update().paused() {
-                return Err(Failure::Rejected("pause request is not active".into()));
-            }
-            match state.borrow_and_update().clone() {
-                RunState::Suspended if self.suspend_acknowledged() => return Ok(()),
-                RunState::Completed | RunState::Failed(_) => {
-                    return Err(Failure::Rejected(
-                        "run ended before pause acknowledgement".into(),
-                    ));
-                }
-                _ => {}
-            }
-            tokio::select! {
-                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
-                _ = self.controls.changed.notified() => {},
-                changed = state.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-                changed = request.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-            }
-        }
-    }
-    pub fn cancel(&self) {
-        self.controls
-            .user_cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.controls.revoke();
-        if self.durable {
-            self.controls.tx.send_modify(|r| r.generation += 1);
-        } else {
-            self.cancel.cancel();
-        }
-    }
-    pub fn cancellation_requested(&self) -> bool {
-        self.cancel.is_cancelled()
-            || self
-                .controls
-                .user_cancelled
-                .load(std::sync::atomic::Ordering::SeqCst)
-    }
-    pub fn state(&self) -> RunState {
-        if self.suspend_acknowledged() {
-            RunState::Suspended
-        } else {
-            self.state.borrow().clone()
-        }
-    }
-    pub async fn changed(&mut self) -> Outcome<RunState> {
-        tokio::select! {
-            r = self.state.changed() => { r.map_err(|_| Failure::Unavailable)?; },
-            _ = self.controls.changed.notified() => {},
-        }
-        Ok(self.state())
-    }
-    pub async fn signal(&self, signal: Signal) -> Outcome<()> {
-        if signal.name.trim().is_empty()
-            || signal.name.len().saturating_add(signal.payload.len()) > self.max_signal_bytes
-        {
-            return Err(Failure::Rejected("invalid or oversized signal".into()));
-        }
-        self.signals
-            .send(signal)
-            .await
-            .map_err(|_| Failure::Unavailable)
-    }
-}
-
-#[derive(Default)]
-struct Tracking {
-    pending: usize,
-    uncertain: bool,
-}
-#[derive(Clone, Default)]
-pub(crate) struct Tracker {
-    state: Arc<Mutex<Tracking>>,
-    changed: Arc<Notify>,
-}
-impl Tracker {
-    fn mark_uncertain(&self) {
-        self.state.lock().unwrap().uncertain = true;
-    }
-    fn ready(&self) -> Outcome<()> {
-        let state = self.state.lock().unwrap();
-        if state.uncertain {
-            Err(Failure::Uncertain(
-                "earlier activity needs reconciliation".into(),
-            ))
-        } else if state.pending != 0 {
-            Err(Failure::Rejected(
-                "previous activity has not settled".into(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-    fn register(&self, permit: Permit, observation: ActivityObservation) -> ActivityGuard {
-        self.state.lock().unwrap().pending += 1;
-        ActivityGuard {
-            tracker: self.clone(),
-            permit,
-            uncertain: false,
-            observation,
-        }
-    }
-    async fn settle(&self, cancel: &CancellationToken) -> bool {
-        if self.state.lock().unwrap().pending != 0 {
-            cancel.cancel();
-        }
-        loop {
-            let changed = self.changed.notified();
-            {
-                let state = self.state.lock().unwrap();
-                if state.pending == 0 {
-                    return state.uncertain;
-                }
-            }
-            changed.await;
-        }
-    }
-}
-pub(crate) struct ActivityGuard {
-    tracker: Tracker,
-    permit: Permit,
-    uncertain: bool,
-    observation: ActivityObservation,
-}
-impl ActivityGuard {
-    pub fn started(&mut self) {
-        self.uncertain = true;
-        self.permit.started();
-        self.observation.started();
-    }
-    pub fn settled<T>(&mut self, result: &Outcome<T>) {
-        self.uncertain = result.as_ref().is_err_and(|e| e.uncertain());
-        self.permit.settled(result);
-        self.observation.settled(result);
-    }
-}
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        // Publish the final observation before waking a workflow settling its guards.
-        self.observation.abandon();
-        let mut state = self.tracker.state.lock().unwrap();
-        state.pending -= 1;
-        state.uncertain |= self.uncertain;
-        drop(state);
-        self.tracker.changed.notify_one();
-    }
-}
-
 /// Non-cloneable execution capability. All effects go through activity().
 pub struct WorkflowContext {
     pub(crate) id: TaskId,
@@ -344,23 +98,23 @@ pub struct WorkflowContext {
     pub(crate) pool: String,
     pub(crate) broker: Broker,
     pub(crate) cancel: CancellationToken,
-    signals: mpsc::Receiver<Signal>,
+    pub(crate) shutdown: CancellationToken,
+    pub(crate) signals: mpsc::Receiver<Signal>,
     // Accepted execution lifetime is independent of the last public Run handle.
-    _signal_sender: mpsc::Sender<Signal>,
-    state: watch::Sender<RunState>,
-    tracker: Tracker,
-    info: watch::Sender<TaskInfo>,
-    progress: watch::Sender<TaskProgress>,
-    activities: watch::Sender<ActivityHistory>,
-    activity_history: usize,
-    objects: Arc<Mutex<Vec<ObjectKey>>>,
-    next_activity: u64,
-    pause: watch::Receiver<ControlRequest>,
-    controls: crate::control::Controls,
-    continuation: Option<Arc<dyn RunCondition>>,
-    next_control: Option<Arc<dyn ActivityControl>>,
-    journal: Option<crate::persistence::Journal>,
-    restored_checkpoint: serde_json::Value,
+    pub(crate) _signal_sender: mpsc::Sender<Signal>,
+    pub(crate) state: watch::Sender<RunState>,
+    pub(crate) tracker: Tracker,
+    pub(crate) info: watch::Sender<TaskInfo>,
+    pub(crate) progress: watch::Sender<TaskProgress>,
+    pub(crate) activities: watch::Sender<ActivityHistory>,
+    pub(crate) activity_history: usize,
+    pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
+    pub(crate) next_activity: u64,
+    pub(crate) pause: watch::Receiver<ControlRequest>,
+    pub(crate) controls: crate::control::Controls,
+    pub(crate) continuation: Option<Arc<dyn RunCondition>>,
+    pub(crate) journal: Option<crate::persistence::Journal>,
+    pub(crate) restored_checkpoint: serde_json::Value,
 }
 impl WorkflowContext {
     pub fn id(&self) -> TaskId {
@@ -418,7 +172,7 @@ impl WorkflowContext {
         self.restored_checkpoint = value;
         Ok(())
     }
-    async fn persist_intent(&self) -> Outcome<()> {
+    pub(crate) async fn persist_intent(&self) -> Outcome<()> {
         sync_controls(&self.journal, &self.controls, &self.cancel).await
     }
     pub fn check_execution(&self) -> Outcome<()> {
@@ -437,6 +191,51 @@ impl WorkflowContext {
         self.state.send_replace(RunState::Running);
         Ok(())
     }
+    pub fn control(&self) -> ControlToken {
+        self.controls.token(self.cancel.clone())
+    }
+
+    async fn wait_for_readiness(&mut self, cancel: &CancellationToken) -> Outcome<()> {
+        let mut token = self.controls.token(cancel.clone());
+        loop {
+            self.persist_intent().await?;
+            if cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            let request = token.request();
+            if request.paused() {
+                if self.controls.acknowledge(request.generation, cancel) {
+                    self.state.send_replace(RunState::Suspended);
+                }
+                token.changed().await?;
+                continue;
+            }
+            self.controls.revoke();
+            let Some(check) = self.continuation.clone() else {
+                return Ok(());
+            };
+            let generation = request.generation;
+            let decision = tokio::select! {
+                biased;
+                r = token.changed() => { r?; continue; },
+                r = check.check() => r?,
+            };
+            if generation != token.request().generation {
+                continue;
+            }
+            match decision {
+                Readiness::Ready => return Ok(()),
+                Readiness::Blocked(reason) => {
+                    self.state.send_replace(RunState::WaitingConditions(reason));
+                    tokio::select! {
+                        r = token.changed() => { r?; },
+                        _ = self.controls.recheck.notified() => {},
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn next_signal(&mut self) -> Outcome<Signal> {
         loop {
             self.wait_until_runnable().await?;
@@ -466,7 +265,27 @@ impl WorkflowContext {
             }
         }
     }
-    pub async fn activity<
+    /// Configure a single invocation; ordinary `.activity(...).await` is unchanged.
+    pub fn activity<
+        'a,
+        R: Send + 'static,
+        P: Send + 'static,
+        Q: Send + 'static,
+        V: Send + 'static,
+    >(
+        &'a mut self,
+        service: &'a ActivityClient<R, P, Q, V>,
+        request: R,
+    ) -> ActivityCall<'a, R, P, Q, V> {
+        ActivityCall {
+            context: Some(self),
+            service,
+            request: Some(request),
+            uninterruptible: false,
+            future: None,
+        }
+    }
+    async fn execute_activity<
         R: Send + 'static,
         P: Send + 'static,
         Q: Send + 'static,
@@ -475,9 +294,20 @@ impl WorkflowContext {
         &mut self,
         service: &ActivityClient<R, P, Q, V>,
         request: R,
+        uninterruptible: bool,
     ) -> Outcome<P> {
-        let override_hook = self.next_control.take();
-        self.wait_until_runnable().await?;
+        if uninterruptible {
+            // Task control may already be requested. Mandatory work still runs;
+            // host shutdown/fencing and resource safety are never bypassed.
+            if self.scope.is_closed() {
+                return Err(Failure::Cancelled);
+            }
+            self.tracker.ready()?;
+            self.persist_intent().await?;
+            self.controls.revoke();
+        } else {
+            self.wait_until_runnable().await?;
+        }
         if !Arc::ptr_eq(&self.scope, &service.scope) {
             return Err(Failure::Rejected(
                 "service belongs to another Pool instance".into(),
@@ -498,6 +328,10 @@ impl WorkflowContext {
             resources.clone(),
         );
         let permit: Outcome<Permit> = async {
+            if uninterruptible {
+                self.state.send_replace(RunState::WaitingResources);
+                return self.broker.acquire(Kind::Activity, resources.clone(), &self.shutdown).await;
+            }
             loop {
                 self.wait_until_runnable().await?;
                 self.state.send_replace(RunState::WaitingResources);
@@ -525,353 +359,128 @@ impl WorkflowContext {
         observation.queued();
         let guard = self.tracker.register(permit, observation);
         self.state.send_replace(RunState::Activity(id));
-        let cancel = self.cancel.child_token();
-        let (hook_tx, hooks) = watch::channel(None);
+        let cancel = if uninterruptible {
+            self.shutdown.child_token()
+        } else {
+            self.cancel.child_token()
+        };
+        // Keep the detached request sender alive until the service reply. The
+        // domain must not see task pause/cancel through a second control path.
+        let protected_controls =
+            uninterruptible.then(|| crate::control::Controls::new(self.controls.wake.clone()));
+        let control = protected_controls
+            .as_ref()
+            .unwrap_or(&self.controls)
+            .token(cancel.clone());
         let operation = service.dispatch(
             request,
             ActivityContext {
                 id,
                 cancel: cancel.clone(),
-                control: self.controls.token(cancel.clone()),
-                hooks: hook_tx,
+                control,
                 progress: self.progress.clone(),
             },
             guard,
         );
-        let result = self
-            .drive_activity(id, cancel, hooks, override_hook, operation)
-            .await;
+        let result = if uninterruptible {
+            operation.await
+        } else {
+            self.drive_activity(cancel, operation).await
+        };
         self.state.send_replace(RunState::Running);
         result
     }
-}
-
-struct Completion<T> {
-    reply: Option<oneshot::Sender<Outcome<T>>>,
-    state: watch::Sender<RunState>,
-    accepted: watch::Sender<Option<Outcome<()>>>,
-}
-impl<T> Completion<T> {
-    fn finish(&mut self, result: Outcome<T>) {
-        self.accepted.send_if_modified(|accepted| {
-            if accepted.is_none() {
-                *accepted = Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
-                true
-            } else {
-                false
+    /// ActivityContext already carries the task's control token into the service.
+    /// This loop observes the request but never invokes domain-specific control hooks.
+    /// A pause is acknowledged only later, at wait_until_runnable(), after the
+    /// caller has consumed the business reply and saved its checkpoint.
+    async fn drive_activity<P>(
+        &mut self,
+        cancel: CancellationToken,
+        operation: impl std::future::Future<Output = Outcome<P>>,
+    ) -> Outcome<P> {
+        tokio::pin!(operation);
+        let mut token = self.controls.token(cancel.clone());
+        let mut failure = None;
+        let result = loop {
+            // Preserve a completed business result, even when control races it.
+            if let Some(result) = operation.as_mut().now_or_never() {
+                break result;
             }
-        });
-        self.state.send_replace(match &result {
-            Ok(_) => RunState::Completed,
-            Err(e) => RunState::Failed(e.clone()),
-        });
-        if let Some(reply) = self.reply.take() {
-            let _ = reply.send(result);
-        }
-    }
-}
-impl<T> Drop for Completion<T> {
-    fn drop(&mut self) {
-        if self.reply.is_some() {
-            self.finish(Err(Failure::Uncertain(
-                "workflow forcefully terminated".into(),
-            )));
-        }
-    }
-}
-
-pub(crate) struct ExecutionEnv {
-    pub id: TaskId,
-    pub wake: Arc<Notify>,
-    pub scope: Arc<Scope>,
-    pub pool: String,
-    pub broker: Broker,
-    pub cancel: CancellationToken,
-    pub config: Config,
-    pub start: Option<oneshot::Receiver<Outcome<()>>>,
-    pub journal: Option<crate::persistence::Journal>,
-    pub restored: Option<crate::persistence::SavedTask>,
-}
-pub(crate) fn execution<W: Workflow>(
-    workflow: W,
-    env: ExecutionEnv,
-) -> (
-    Run<W::Output>,
-    futures_util::future::BoxFuture<'static, TaskId>,
-) {
-    let ExecutionEnv {
-        id,
-        wake,
-        scope,
-        pool,
-        broker,
-        cancel,
-        config,
-        start,
-        journal,
-        restored,
-    } = env;
-    let (reply, result) = oneshot::channel();
-    let (accepted, accepted_rx) = watch::channel(None);
-    let (signals, signal_rx) = mpsc::channel(config.capacity);
-    let (state, state_rx) = watch::channel(RunState::WaitingObjects);
-    let controls = crate::control::Controls::new(wake);
-    if restored.as_ref().is_some_and(|r| r.user_paused) {
-        controls.update(|r| {
-            r.insert("user".into());
-        });
-    }
-    if restored.as_ref().is_some_and(|r| r.cancel_requested) {
-        controls
-            .user_cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        cancel.cancel();
-    }
-    let pause_rx = controls.tx.subscribe();
-    let info = watch::channel(TaskInfo::default()).0;
-    let (progress, progress_rx) = watch::channel(TaskProgress::default());
-    let (activities, activities_rx) = watch::channel(ActivityHistory::default());
-    let objects = Arc::new(Mutex::new(Vec::new()));
-    let control = RunControl {
-        id,
-        name: W::NAME,
-        cancel: cancel.clone(),
-        signals: signals.clone(),
-        state: state_rx,
-        max_signal_bytes: config.max_signal_bytes,
-        controls: controls.clone(),
-        durable: journal.is_some(),
-        acceptance: accepted_rx.clone(),
-        progress: progress_rx,
-        info: info.clone(),
-        activities: activities_rx,
-        objects: objects.clone(),
-    };
-    let mut completion = Completion {
-        reply: Some(reply),
-        state: state.clone(),
-        accepted: accepted.clone(),
-    };
-    let mut context = WorkflowContext {
-        id,
-        scope,
-        pool,
-        broker,
-        cancel,
-        signals: signal_rx,
-        _signal_sender: signals,
-        state,
-        tracker: Tracker::default(),
-        progress,
-        info,
-        activities,
-        activity_history: config.activity_history,
-        objects,
-        next_activity: 0,
-        pause: pause_rx,
-        controls,
-        continuation: None,
-        next_control: None,
-        journal,
-        restored_checkpoint: restored
-            .as_ref()
-            .map(|r| r.checkpoint.clone())
-            .unwrap_or_default(),
-    };
-    let future = Box::pin(async move {
-        // Include declaration/constructor panics in the workflow boundary.
-        let mut ownership = None;
-        let mut journal_started = restored.is_some();
-        let result = AssertUnwindSafe(async {
-            if restored.is_none() && let Some(journal) = &context.journal {
-                journal.create().await?;
-                journal_started = true;
+            if cancel.is_cancelled() {
+                // The service must settle its operation before resources can be released.
+                break operation.await;
             }
-            accepted.send_replace(Some(Ok(())));
-            context.controls.wake.notify_one();
-            context.continuation = workflow.run_condition();
-            context.report_details(
-                &restored
-                    .as_ref()
-                    .map(|r| Ok(r.details.clone()))
-                    .unwrap_or_else(|| workflow.details())?,
-            )?;
-            let declared = workflow.objects();
-            *context.objects.lock().unwrap() = declared.clone();
-            for object in &declared {
-                object.validate()?;
+            if let Err(error) = self.persist_intent().await {
+                failure = Some(Failure::Uncertain(format!(
+                    "control intent not persisted: {error}"
+                )));
+                self.tracker.mark_uncertain();
+                cancel.cancel();
+                continue;
             }
-            if let Some(start) = start {
-                // The application owns logical objects for a managed run.
-                tokio::pin!(start);
-                let mut requests = context.controls.tx.subscribe();
-                loop {
-                    context.persist_intent().await?;
-                    tokio::select! {
-                        biased;
-                        _ = context.cancel.cancelled() => return Err(Failure::Cancelled),
-                        _ = requests.changed() => {},
-                        allowed = &mut start => { allowed.unwrap_or(Err(Failure::Unavailable))?; break; },
-                    }
-                }
-            } else {
-                // Standalone runtime use retains low-level ownership mechanics.
-                let objects: Vec<_> = declared.into_iter().map(ResourceAccess::write).collect();
-                let mut requests = context.controls.tx.subscribe();
-                loop {
-                    context.persist_intent().await?;
-                    tokio::select! {
-                        biased;
-                        _ = context.cancel.cancelled() => return Err(Failure::Cancelled),
-                        _ = requests.changed() => {},
-                        permit = context.broker.acquire(Kind::Workflow, objects.clone(), &context.cancel) => {
-                            ownership = Some(permit?);
-                            break;
-                        }
-                    }
-                }
+            if token.request().paused() {
+                self.state.send_replace(RunState::Suspending);
             }
-            context.wait_until_runnable().await?;
-            let journal = context.journal.clone();
-            let controls = context.controls.clone();
-            let cancel = context.cancel.clone();
-            let mut requests = controls.tx.subscribe();
-            let body = workflow.run(&mut context);
-            tokio::pin!(body);
-            // Poll persistence alongside the body. Awaiting it inside a select branch
-            // can deadlock if the body owns the journal lock across a blocking write.
-            let updates_stop = CancellationToken::new();
-            let updates = async {
-                loop {
-                    sync_controls(&journal, &controls, &cancel).await?;
-                    tokio::select! {
-                        _ = updates_stop.cancelled() => return Ok::<(), Failure>(()),
-                        r = requests.changed() => r.map_err(|_| Failure::Unavailable)?,
-                    }
-                }
-            };
-            tokio::pin!(updates);
-            let mut control_error = None;
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut body => {
-                        // Finish a dispatched write before the final CAS update.
-                        updates_stop.cancel();
-                        if control_error.is_none() {
-                            control_error = updates.await.err().map(|error| Failure::Uncertain(
-                                format!("control intent not persisted: {error}")
-                            ));
-                        }
-                        break match control_error {
-                            Some(error) if !result.as_ref().is_err_and(|e| e.uncertain()) => Err(error),
-                            _ => result,
-                        };
-                    },
-                    result = &mut updates, if control_error.is_none() => {
-                        if let Err(error) = result {
-                            control_error = Some(Failure::Uncertain(format!("control intent not persisted: {error}")));
-                            cancel.cancel();
-                        }
-                    }
-                }
+            tokio::select! {
+                biased;
+                result = &mut operation => break result,
+                _ = token.changed() => {},
             }
-        })
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| Err(Failure::Uncertain("workflow panicked".into())));
-        context.signals.close();
-        context.state.send_replace(RunState::Settling);
-        let uncertain = context.tracker.settle(&context.cancel).await;
-        let mut result = if uncertain {
-            Err(Failure::Uncertain(
-                "activity outcome requires reconciliation".into(),
-            ))
+        };
+        self.controls.revoke();
+        if result.as_ref().is_err_and(Failure::uncertain) {
+            result
+        } else if let Some(error) = failure {
+            Err(error)
         } else {
             result
-        };
-        if let Some(journal) = &context.journal
-            && journal_started
-        {
-            let user_cancelled = context
-                .controls
-                .user_cancelled
-                .load(std::sync::atomic::Ordering::SeqCst);
-            let outcome = match &result {
-                Ok(_) => crate::persistence::StoredOutcome::Completed,
-                Err(Failure::Cancelled) if !user_cancelled => {
-                    crate::persistence::StoredOutcome::Pending
-                }
-                Err(Failure::Cancelled) => crate::persistence::StoredOutcome::Cancelled,
-                Err(Failure::Uncertain(e)) => {
-                    crate::persistence::StoredOutcome::NeedsCheck(e.clone())
-                }
-                Err(e) => crate::persistence::StoredOutcome::Failed(e.to_string()),
-            };
-            let details = context.info.borrow().details.clone();
-            let paused = context.controls.reasons().contains("user");
-            if let Err(error) = journal
-                .update(|r| {
-                    r.outcome = outcome;
-                    r.details = details;
-                    r.user_paused = paused;
-                    r.cancel_requested = user_cancelled;
-                })
-                .await
-            {
-                result = Err(Failure::Uncertain(format!(
-                    "task result not persisted: {error}"
-                )));
-            }
         }
-        if let Some(mut permit) = ownership {
-            permit.settled(&result);
-        }
-        completion.finish(result);
-        id
-    });
-    (
-        Run {
-            control,
-            result,
-            consumed: false,
-            accepted: accepted_rx,
-        },
-        future,
-    )
+    }
 }
 
-async fn sync_controls(
-    journal: &Option<crate::persistence::Journal>,
-    controls: &crate::control::Controls,
-    cancel: &CancellationToken,
-) -> Outcome<()> {
-    loop {
-        let request = controls.tx.borrow().clone();
-        let paused = request.suspend_reasons.contains("user");
-        let cancelled = controls
-            .user_cancelled
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if let Some(journal) = journal {
-            let changed = {
-                let r = journal.record.lock().await;
-                r.user_paused != paused || r.cancel_requested != cancelled
-            };
-            if changed {
-                journal
-                    .update(|r| {
-                        r.user_paused = paused;
-                        r.cancel_requested = cancelled;
-                    })
-                    .await?;
-            }
+/// Options for the existing Activity invocation, not a separate activity kind.
+/// It remains a Future, including when used in select!/timeout.
+#[must_use = "an Activity does nothing until awaited"]
+pub struct ActivityCall<'a, R, P, Q, V> {
+    context: Option<&'a mut WorkflowContext>,
+    service: &'a ActivityClient<R, P, Q, V>,
+    request: Option<R>,
+    uninterruptible: bool,
+    future: Option<BoxFuture<'a, Outcome<P>>>,
+}
+impl<R, P, Q, V> ActivityCall<'_, R, P, Q, V> {
+    /// Defer task cancellation and suspension through resource acquisition,
+    /// dispatch and the actual reply, even if already requested before dispatch.
+    /// Return the business result so the caller can save its checkpoint. The next
+    /// ordinary boundary observes the unchanged task control request.
+    /// Host shutdown, service failure and lost leadership are NOT masked.
+    pub fn uninterruptible(mut self) -> Self {
+        assert!(
+            self.future.is_none(),
+            "configure an Activity before polling it"
+        );
+        self.uninterruptible = true;
+        self
+    }
+}
+// The request moves into a separately pinned Future on the first poll. No field
+// borrows another field, and the boxed Future itself never moves after polling.
+impl<R, P, Q, V> Unpin for ActivityCall<'_, R, P, Q, V> {}
+impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static> Future
+    for ActivityCall<'_, R, P, Q, V>
+{
+    type Output = Outcome<P>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.future.is_none() {
+            let context = this.context.take().expect("Activity already started");
+            this.future = Some(Box::pin(context.execute_activity(
+                this.service,
+                this.request.take().unwrap(),
+                this.uninterruptible,
+            )));
         }
-        if request.generation != controls.tx.borrow().generation {
-            continue;
-        }
-        if cancelled {
-            cancel.cancel();
-        }
-        return Ok(());
+        this.future.as_mut().unwrap().as_mut().poll(cx)
     }
 }

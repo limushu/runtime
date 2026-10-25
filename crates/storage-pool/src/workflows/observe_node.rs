@@ -43,6 +43,7 @@ impl Workflow for ObserveNodeWorkflow {
                 connected: self.connected,
             },
         )
+        .uninterruptible()
         .await
     }
 }

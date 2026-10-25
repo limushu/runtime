@@ -2,12 +2,16 @@
 pub(crate) mod admin;
 mod fanout;
 mod identity;
+mod leadership;
 mod lifecycle;
+pub use leadership::PoolRecovery;
 mod ownership;
 mod pool_ops;
 pub use fanout::*;
 pub use identity::*;
-pub(crate) use ownership::{DiskRemoval, DiskReservation, NodeReservation, RemovalGuard};
+pub(crate) use ownership::{
+    DiskRemoval, DiskReservation, NodeClaim, NodeReservation, RemovalGuard, RemovalRecovery,
+};
 pub(crate) use pool_ops::PoolShared;
 
 use crate::{ports::*, support::reject, *};
@@ -27,6 +31,7 @@ pub(crate) struct Registry {
     pub names: BTreeMap<PoolName, PoolId>,
     pub disks: BTreeMap<DiskId, ownership::DiskOwnership>,
     pub stopped: bool,
+    pub activating: BTreeMap<PoolId, PoolDescriptor>,
     pub retired: BTreeMap<PoolId, PoolDescriptor>,
     pub history: VecDeque<Pool>,
     pub history_limit: usize,
@@ -36,11 +41,12 @@ pub(crate) struct Registry {
 #[derive(Clone)]
 pub struct PoolManager {
     pub(crate) registry: Arc<Mutex<Registry>>,
-    task_ids: TaskIds,
-    balance: Option<Arc<dyn crate::domains::balance::BalanceBackend>>,
-    config: Config,
-    metadata: Arc<dyn MetadataStore>,
-    data_plane: Arc<dyn DataPlane>,
+    pub(crate) task_ids: TaskIds,
+    pub(crate) balance: Option<Arc<dyn crate::domains::balance::BalanceBackend>>,
+    pub(crate) config: Config,
+    pub(crate) metadata: Arc<dyn MetadataStore>,
+    pub(crate) data_plane: Arc<dyn DataPlane>,
+    pub(crate) task_store: Option<Arc<dyn workflow_foundation::persistence::TaskStore>>,
     pub(crate) next_fanout: Arc<AtomicUsize>,
 }
 impl PoolManager {
@@ -56,6 +62,7 @@ impl PoolManager {
             })),
             task_ids: TaskIds::default(),
             balance: None,
+            task_store: None,
             config,
             metadata,
             data_plane,
@@ -75,12 +82,19 @@ impl PoolManager {
         self
     }
     pub fn create(&self, request: CreatePool) -> Outcome<PoolHandle> {
+        if self.task_store.is_some() {
+            return Err(reject("durable pools must use activate()"));
+        }
         // Construction is synchronous and does no external IO. Publish all indexes together.
         let mut registry = self.registry.lock().unwrap();
-        if registry.stopped {
+        if registry.stopped || !self.task_ids.active() {
             return Err(Failure::Unavailable);
         }
-        if registry.pools.contains_key(&request.id)
+        if registry
+            .activating
+            .values()
+            .any(|p| p.id == request.id || p.uuid == request.uuid || p.name == request.name)
+            || registry.pools.contains_key(&request.id)
             || registry.retired.contains_key(&request.id)
             || registry.uuids.contains_key(&request.uuid)
             || registry.names.contains_key(&request.name)
@@ -88,15 +102,7 @@ impl PoolManager {
             return Err(reject("pool id, UUID, or name already used"));
         }
         let descriptor = request.descriptor();
-        let pool = Pool::start(
-            descriptor.clone(),
-            self.config.clone(),
-            self.metadata.clone(),
-            self.data_plane.clone(),
-            Arc::downgrade(&self.registry),
-            self.task_ids.clone(),
-            self.balance.clone(),
-        )?;
+        let pool = Pool::start(descriptor.clone(), self)?;
         let handle = pool.handle();
         registry
             .uuids

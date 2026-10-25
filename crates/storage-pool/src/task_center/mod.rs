@@ -19,7 +19,7 @@ use workflow_foundation::{
 
 mod conflicts;
 pub use conflicts::PoolSchedulingPolicy;
-use workflow_foundation::scheduling::{self, Candidate, Relation, SchedulingPolicy};
+use workflow_foundation::scheduling::{self, Candidate, SchedulingPolicy};
 pub use workflow_foundation::{
     Conflict, ConflictDecision, ConflictMatch, TaskObserver, TaskSnapshot,
 };
@@ -90,7 +90,6 @@ struct Entry {
     control: RunControl,
     start: Option<StartPermit>,
     activated: bool,
-    replacements: Vec<TaskId>,
 }
 struct State {
     entries: BTreeMap<TaskId, Entry>,
@@ -118,10 +117,10 @@ impl State {
             }
         }
     }
-    fn inspect(&self, operation: &PoolOperation) -> Outcome<Vec<ConflictMatch>> {
+    fn check_submission(&self, operation: &PoolOperation) -> Outcome<Vec<ConflictMatch>> {
         let mut matches = Vec::new();
         for (id, entry) in &self.entries {
-            let conflict = self.policy.admission(operation, &entry.operation);
+            let conflict = self.policy.on_task(&entry.operation, operation);
             if let ConflictDecision::Reject(reason) = conflict.decision {
                 return Err(crate::support::reject(reason));
             }
@@ -145,17 +144,19 @@ impl State {
         let tasks: Vec<_> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.activated)
+            .filter(|(_, e)| !self.fenced(&e.operation))
             .map(|(id, e)| Candidate {
                 id: *id,
                 descriptor: &e.operation,
                 started: e.start.is_none(),
+                accepted: e.activated,
                 paused: e.control.suspend_acknowledged(),
             })
             .chain(self.fences.iter().map(|(id, op)| Candidate {
                 id: *id,
                 descriptor: op,
                 started: true,
+                accepted: true,
                 paused: false,
             }))
             .collect();
@@ -163,8 +164,9 @@ impl State {
     }
     fn fenced(&self, op: &PoolOperation) -> bool {
         self.fences.iter().any(|(_, fence)| {
-            self.policy.relation(op, fence) != Relation::Independent
-                || self.policy.relation(fence, op) != Relation::Independent
+            op.overlaps(fence)
+                || self.policy.on_task(fence, op).decision != ConflictDecision::Independent
+                || self.policy.on_task(op, fence).decision != ConflictDecision::Independent
         })
     }
     fn pump(&mut self) {
@@ -176,19 +178,17 @@ impl State {
             .map(|(id, _)| *id)
             .collect();
         for id in accepted {
-            let fenced = self.fenced(&self.entries[&id].operation);
-            let entry = self.entries.get_mut(&id).unwrap();
-            entry.activated = true;
-            let replacements = std::mem::take(&mut entry.replacements);
-            if !fenced {
-                for old in replacements {
-                    if let Some(old) = self.entries.get(&old) {
-                        old.control.cancel();
-                    }
-                }
-            }
+            self.entries.get_mut(&id).unwrap().activated = true;
         }
         let plan = self.plan();
+        for (_, current) in plan.cancellations {
+            if let Some(entry) = self.entries.get(&current)
+                && entry.control.has_started()
+                && !entry.control.cancellation_requested()
+            {
+                entry.control.cancel();
+            }
+        }
         for (id, reasons) in plan.pauses {
             if let Some(e) = self.entries.get(&id) {
                 e.control.set_policy_suspensions(&reasons);
@@ -252,7 +252,7 @@ impl TaskCenter {
         config: &Config,
         policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
     ) -> Self {
-        Self::build(driver, config, policy, vec![])
+        Self::build(driver, config, policy, vec![], Arc::default())
     }
     /// Called after domain restoration and Driver::restore. All claims are installed together.
     pub fn from_restored(
@@ -260,6 +260,15 @@ impl TaskCenter {
         config: &Config,
         policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
         restored: Vec<workflow_foundation::persistence::Restored>,
+    ) -> Outcome<Self> {
+        Self::from_restored_with_routing(driver, config, policy, restored, Arc::default())
+    }
+    pub(crate) fn from_restored_with_routing(
+        driver: WorkflowDriver,
+        config: &Config,
+        policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
+        restored: Vec<workflow_foundation::Restored>,
+        routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
     ) -> Outcome<Self> {
         let mut entries = vec![];
         for restored in restored {
@@ -273,16 +282,16 @@ impl TaskCenter {
                 control: restored.control,
                 start: Some(restored.start),
                 activated: true,
-                replacements: vec![],
             });
         }
-        Ok(Self::build(driver, config, policy, entries))
+        Ok(Self::build(driver, config, policy, entries, routing))
     }
     fn build(
         mut driver: WorkflowDriver,
         config: &Config,
         policy: Arc<dyn SchedulingPolicy<PoolOperation>>,
         restored: Vec<Entry>,
+        routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Submission>(config.capacity);
         let stop = CancellationToken::new();
@@ -328,7 +337,7 @@ impl TaskCenter {
                         state.reap();
                         let decision = if closed.load(Ordering::SeqCst) && !submission.administrative { Err(Failure::Unavailable) }
                             else if state.entries.len() >= limit { Err(Failure::Busy) }
-                            else { state.inspect(&submission.operation) };
+                            else { state.check_submission(&submission.operation) };
                         let matches = match decision {
                             Ok(matches) => matches,
                             Err(error) => { (submission.accept)(Err(error)); continue; }
@@ -338,15 +347,13 @@ impl TaskCenter {
                         if let Some(accepted) = (submission.accept)(Ok(&mut driver)) {
                             state.reap();
                             let id = accepted.control.id;
-                            accepted.control.explain(matches.clone(), vec![]);
+                            accepted.control.explain(matches, vec![]);
                             state.entries.insert(id, Entry {
                                 operation: submission.operation,
                                 control: accepted.control,
                                 start: Some(accepted.start),
                                 activated: false,
-                                replacements: matches.iter()
-                                    .filter(|m| m.conflict.decision == ConflictDecision::CancelThenWait)
-                                    .map(|m| m.existing).collect(),
+
                             });
                             state.reap();
                             state.pump();
@@ -365,7 +372,7 @@ impl TaskCenter {
             execution,
             failure,
             tx,
-            routing: Arc::default(),
+            routing,
             scheduling,
             stop,
             lifecycle,

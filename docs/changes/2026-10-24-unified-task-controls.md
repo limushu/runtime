@@ -1,5 +1,7 @@
 # 统一 Task、可选持久化与协作式暂停
 
+> 历史实现记录。当前规则和暂停机制已简化，见 [本轮变更](2026-10-24-simple-task-rules.md)；本文中的 relation/priority 与保留调用 hook 不再是当前接口。
+
 实现分支：`codex/storage-workflow-development`，基于 `654e3ce` 重做，未移植旧实验实现。
 
 ## 需求与验收标准

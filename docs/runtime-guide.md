@@ -1,6 +1,8 @@
-# 最新架构运行导读：统一 Task、调度与恢复
+# 运行图导读：统一 Task、调度与恢复（53fae88 快照）
 
-**想观察请求实际流转、冲突排队、暂停与交接：先打开 [Runtime Lab 动态演示](diagrams/task-center-simulation/index.html)。**
+**这些图保留 53fae88 的两种暂停与 priority/relation 机制；当前代码已经简化为单一规则和停稳返回，详见 [当前控制链](task-center.md)。**
+
+**想回看当时的请求流转：打开 [Runtime Lab 动态演示](diagrams/task-center-simulation/index.html)。**
 
 [打开交互导读](diagrams/unified-task-guide/index.html)：六图翻页、运行步骤高亮、组件职责查询、缩放与打印，离线可用。
 

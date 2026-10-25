@@ -305,7 +305,7 @@ impl PoolWorkflow for Work {
 }
 
 #[tokio::test]
-async fn topo_waits_for_native_stop_then_resumes_same_task_without_fifo_cycle() {
+async fn topo_waits_for_native_stop_and_explicit_volume_rule_without_fifo_cycle() {
     let mut f = Fixture::new().await;
     let mut shrink = f.submit().await;
     let first = f.call().await;
@@ -321,7 +321,8 @@ async fn topo_waits_for_native_stop_then_resumes_same_task_without_fifo_cycle() 
     })
     .await;
 
-    // Regression: shrink -> topo -> queued volume -> shrink previously deadlocked.
+    // Ordinary volume work is independent of shrink, even on the same declared disk.
+    // Only its explicit conflict with the incoming topology creates a wait.
     let (volume_tx, mut volume_started) = mpsc::unbounded_channel();
     let mut volume = f
         .center
@@ -331,6 +332,7 @@ async fn topo_waits_for_native_stop_then_resumes_same_task_without_fifo_cycle() 
         })
         .await
         .unwrap();
+    bounded(volume_started.recv()).await.unwrap();
     let (topo_tx, mut topo_started) = mpsc::unbounded_channel();
     let mut topo = f
         .center
@@ -348,8 +350,18 @@ async fn topo_waits_for_native_stop_then_resumes_same_task_without_fifo_cycle() 
     );
     assert!(!shrink.control.suspend_acknowledged());
     first.suspended(3);
+    bounded(shrink.control.wait_suspended()).await.unwrap();
+    assert!(
+        topo_started.try_recv().is_err(),
+        "topology must still wait for volume work"
+    );
+    volume
+        .control
+        .signal(Signal::new("finish", ""))
+        .await
+        .unwrap();
+    bounded(volume.result()).await.unwrap();
     bounded(topo_started.recv()).await.unwrap();
-    assert!(volume_started.try_recv().is_err());
     assert_eq!(
         f.center.task(shrink.id()).unwrap().details["migration"]["progress"]["completed"],
         3
@@ -387,13 +399,6 @@ async fn topo_waits_for_native_stop_then_resumes_same_task_without_fifo_cycle() 
     assert_eq!(second.request.checkpoint.resume["cursor"], 3);
     second.completed(&f.storage);
     bounded(shrink.result()).await.unwrap();
-    bounded(volume_started.recv()).await.unwrap();
-    volume
-        .control
-        .signal(Signal::new("finish", ""))
-        .await
-        .unwrap();
-    bounded(volume.result()).await.unwrap();
     assert_eq!(intent_count(&f.storage), 1);
     assert_eq!(
         f.storage

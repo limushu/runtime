@@ -1,12 +1,13 @@
 //! Execution mechanics. WorkflowDriver is polled by its owner; it never spawns itself.
 //! WorkflowRuntime is a standalone convenience host, not used inside storage Pool.
-mod recovery;
+pub(crate) mod execution;
+pub(crate) mod recovery;
 use crate::{
+    driver::execution::{ExecutionEnv, execution},
     locks::{Broker, Event, LockTable},
     model::Scope,
     service::{self, ServiceOwner},
     tasks::TaskRegistry,
-    workflow::{ExecutionEnv, execution},
     *,
 };
 use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -88,7 +89,7 @@ pub struct WorkflowDriver {
     ids: TaskIds,
     pool_uuid: u128,
     store: Option<Arc<dyn crate::persistence::TaskStore>>,
-    definitions: std::collections::BTreeMap<String, crate::persistence::Restore>,
+    definitions: std::collections::BTreeMap<String, recovery::Definition>,
     recovery_ready: bool,
     broker: Broker,
     events: mpsc::UnboundedReceiver<Event>,
@@ -203,7 +204,7 @@ impl WorkflowDriver {
     ) -> Outcome<(Run<W::Output>, StartPermit)> {
         let (tx, rx) = oneshot::channel();
         Ok((
-            self.enqueue_with(workflow, Some(rx), metadata, None)?,
+            self.enqueue_with(workflow, Some(rx), metadata)?,
             StartPermit(tx),
         ))
     }
@@ -212,45 +213,29 @@ impl WorkflowDriver {
         workflow: W,
         start: Option<oneshot::Receiver<Outcome<()>>>,
     ) -> Outcome<Run<W::Output>> {
-        self.enqueue_with(workflow, start, serde_json::Value::Null, None)
+        self.enqueue_with(workflow, start, serde_json::Value::Null)
     }
     fn enqueue_with<W: Workflow>(
         &mut self,
         workflow: W,
         start: Option<oneshot::Receiver<Outcome<()>>>,
         metadata: serde_json::Value,
-        restored: Option<crate::persistence::SavedTask>,
     ) -> Outcome<Run<W::Output>> {
-        if self.view.scope.is_closed() {
-            return Err(Failure::Unavailable);
-        }
+        self.check_registration()?;
         if W::NAME.trim().is_empty() {
             return Err(Failure::Rejected("workflow name must be nonempty".into()));
         }
         if self.running.len() >= self.config.max_workflows {
             return Err(Failure::Busy);
         }
-        if !self.ids.active() {
-            return Err(Failure::Unavailable);
-        }
-        if !self.recovery_ready && restored.is_none() {
+        if !self.recovery_ready {
             return Err(Failure::Rejected(
                 "recover stored tasks before admitting work".into(),
             ));
         }
-        let id = match &restored {
-            Some(record) => record.id,
-            None => self.ids.allocate(self.pool_uuid, W::NAME)?,
-        };
+        let id = self.ids.allocate(self.pool_uuid, W::NAME)?;
         let journal = match workflow.persistence()? {
-            Persistence::Memory => {
-                if restored.is_some() {
-                    return Err(Failure::Rejected(
-                        "restored workflow lost persistence declaration".into(),
-                    ));
-                }
-                None
-            }
+            Persistence::Memory => None,
             Persistence::Durable { version, input } => {
                 if version == 0 {
                     return Err(Failure::Rejected("invalid workflow schema version".into()));
@@ -260,51 +245,67 @@ impl WorkflowDriver {
                         "persistent workflow requires configured store and leader epoch".into(),
                     )
                 })?;
-                let record = restored
-                    .clone()
-                    .unwrap_or_else(|| crate::persistence::SavedTask {
-                        id,
-                        version,
-                        input,
-                        checkpoint: serde_json::Value::Null,
-                        objects: workflow.objects(),
-                        metadata,
-                        details: serde_json::Value::Null,
-                        revision: 0,
-                        owner_epoch: self.ids.epoch(),
-                        user_paused: false,
-                        cancel_requested: false,
-                        outcome: crate::persistence::StoredOutcome::Pending,
-                    });
+                let record = crate::persistence::SavedTask {
+                    id,
+                    version,
+                    input,
+                    checkpoint: serde_json::Value::Null,
+                    objects: workflow.objects(),
+                    metadata,
+                    details: serde_json::Value::Null,
+                    revision: 0,
+                    owner_epoch: self.ids.epoch(),
+                    user_paused: false,
+                    cancel_requested: false,
+                    outcome: crate::persistence::StoredOutcome::Pending,
+                };
                 Some(crate::persistence::Journal {
                     record: Arc::new(tokio::sync::Mutex::new(record)),
                     store,
                 })
             }
         };
-        let (run, future) = execution(
-            workflow,
-            ExecutionEnv {
-                id,
-                wake: self.wake.clone(),
-                scope: self.view.scope.clone(),
-                pool: self.pool.clone(),
-                broker: self.broker.clone(),
-                cancel: self.stop.child_token(),
-                config: self.config.clone(),
-                start,
-                journal,
-                restored,
-            },
-        );
+        let (run, future) = execution(workflow, self.execution_env(id, start, journal, None));
+        self.register_execution(run.control.clone(), future);
+        self.publish();
+        Ok(run)
+    }
+    // Recovery calls this again after storage IO, before publishing any Task.
+    fn check_registration(&self) -> Outcome<()> {
+        if self.view.scope.is_closed() || !self.ids.active() {
+            return Err(Failure::Unavailable);
+        }
+        Ok(())
+    }
+    fn execution_env(
+        &self,
+        id: TaskId,
+        start: Option<oneshot::Receiver<Outcome<()>>>,
+        journal: Option<crate::persistence::Journal>,
+        restored: Option<crate::persistence::SavedTask>,
+    ) -> ExecutionEnv {
+        ExecutionEnv {
+            id,
+            wake: self.wake.clone(),
+            scope: self.view.scope.clone(),
+            pool: self.pool.clone(),
+            broker: self.broker.clone(),
+            cancel: self.stop.child_token(),
+            shutdown: self.stop.clone(),
+            config: self.config.clone(),
+            start,
+            journal,
+            restored,
+        }
+    }
+    // No Workflow callbacks or fallible validation after registration begins.
+    fn register_execution(&mut self, control: RunControl, future: BoxFuture<'static, TaskId>) {
         self.view
             .tasks
             .lock()
             .unwrap()
-            .insert(self.pool.clone(), run.control.clone());
+            .insert(self.pool.clone(), control);
         self.running.push(future);
-        self.publish();
-        Ok(run)
     }
     fn publish(&self) {
         let (waiting, held, fenced) = self.table.counts();

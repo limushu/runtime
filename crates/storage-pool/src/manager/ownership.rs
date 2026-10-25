@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::Weak;
+use std::{collections::BTreeSet, sync::Weak};
 
 enum RemovalKind {
     Node(NodeId),
@@ -276,6 +276,37 @@ impl PoolHandle {
         Ok(DiskRemoval {
             shared: self.shared.clone(),
             routing: self.task_center.disk_directory(),
+            disks: disks.to_vec(),
+            guards: disks
+                .iter()
+                .map(|id| RemovalGuard::disk(self.shared.clone(), id.clone()))
+                .collect(),
+        })
+    }
+}
+
+/// Local Pool indexes needed by a reconstructed shrink execution.
+#[derive(Clone)]
+pub(crate) struct RemovalRecovery {
+    pub shared: Arc<PoolShared>,
+    pub routing: Arc<Mutex<BTreeMap<DiskId, DiskSpec>>>,
+    pub retired: BTreeSet<DiskId>,
+}
+impl RemovalRecovery {
+    pub fn reserve(&self, disks: &[DiskId]) -> Outcome<DiskRemoval> {
+        let routing = self.routing.lock().unwrap();
+        let mut retiring = self.shared.retiring_disks.lock().unwrap();
+        for disk in disks {
+            if (!routing.contains_key(disk) && !self.retired.contains(disk))
+                || retiring.contains(disk)
+            {
+                return Err(reject("invalid or duplicate recovered disk removal"));
+            }
+        }
+        retiring.extend(disks.iter().cloned());
+        Ok(DiskRemoval {
+            shared: self.shared.clone(),
+            routing: self.routing.clone(),
             disks: disks.to_vec(),
             guards: disks
                 .iter()

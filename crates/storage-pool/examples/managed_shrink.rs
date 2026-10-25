@@ -1,4 +1,4 @@
-//! Framework acceptance demo, not physical disk evacuation. Both modes use ordinary
+//! Framework acceptance demo, not physical disk evacuation. Stop-and-return uses ordinary
 //! Activity calls and the same TaskCenter. Existing storage workflows are unchanged.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -8,13 +8,11 @@ use std::sync::{
 };
 use std::time::Duration;
 use storage_pool::{task_center::*, *};
-use tokio::sync::{Notify, watch};
 use workflow_foundation::{persistence::*, *};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Input {
     disk: String,
-    stop_returns: bool,
 }
 #[derive(Serialize)]
 struct Details {
@@ -34,33 +32,8 @@ impl RunCondition for Conditions {
     }
 }
 
-// A domain operation's short control commands are independent of its long wait.
-// pause() confirms a safe chunk boundary; it does not mean the whole migration finished.
-struct MigrationOperation {
-    pause: AtomicBool,
-    parked: watch::Sender<bool>,
-    changed: Notify,
-}
-#[async_trait]
-impl ActivityControl for MigrationOperation {
-    async fn suspend(&self) -> Outcome<()> {
-        let mut parked = self.parked.subscribe();
-        self.pause.store(true, Ordering::SeqCst);
-        self.changed.notify_one();
-        while !*parked.borrow_and_update() {
-            parked.changed().await.map_err(|_| Failure::Unavailable)?;
-        }
-        Ok(())
-    }
-    async fn resume(&self) -> Outcome<()> {
-        self.pause.store(false, Ordering::SeqCst);
-        self.changed.notify_one();
-        Ok(())
-    }
-}
 struct Migrate {
     cursor: u64,
-    stop_returns: bool,
 }
 struct Migration;
 #[async_trait]
@@ -73,34 +46,17 @@ impl ServiceHandler for Migration {
         vec![]
     }
     async fn execute(&self, request: Migrate, ctx: ActivityContext) -> Outcome<u64> {
-        let operation = Arc::new(MigrationOperation {
-            pause: AtomicBool::new(false),
-            parked: watch::channel(false).0,
-            changed: Notify::new(),
-        });
-        if !request.stop_returns {
-            ctx.register_control(operation.clone())?;
-        }
         let mut token = ctx.control();
         let mut cursor = request.cursor;
         while cursor < 10 {
-            if request.stop_returns && token.request().paused() {
+            if token.request().paused() {
                 return Ok(cursor);
             }
-            if operation.pause.load(Ordering::SeqCst) {
-                operation.parked.send_replace(true);
-                tokio::select! { _ = operation.changed.notified() => {}, r = token.changed() => { r?; } }
-                continue;
-            }
-            operation.parked.send_replace(false);
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(25)) => { cursor += 1; },
-                _ = operation.changed.notified() => {},
                 r = token.changed() => { r?; },
             }
         }
-        // Completion racing a suspend is also safely settled.
-        operation.parked.send_replace(true);
         Ok(cursor)
     }
     fn query(&self, _: ()) -> Outcome<()> {
@@ -143,13 +99,7 @@ impl Workflow for Shrink {
         let mut cursor = ctx.restored_checkpoint().as_u64().unwrap_or(0);
         while cursor < 10 {
             cursor = ctx
-                .activity(
-                    &self.services.migration,
-                    Migrate {
-                        cursor,
-                        stop_returns: self.input.stop_returns,
-                    },
-                )
+                .activity(&self.services.migration, Migrate { cursor })
                 .await?;
             ctx.report_details(&Details {
                 disk: self.input.disk.clone(),
@@ -157,9 +107,10 @@ impl Workflow for Shrink {
                 total: 10,
             })?;
             ctx.save_checkpoint(&cursor).await?;
-            // Retained calls arrive here when complete. Stopping calls may return a
-            // partial result; persist it BEFORE acknowledging the task's safe pause.
-            ctx.wait_until_runnable().await?;
+            // Save the returned cursor before acknowledging the task's pause.
+            if cursor < 10 {
+                ctx.wait_until_runnable().await?;
+            }
         }
         Ok(())
     }
@@ -189,11 +140,10 @@ impl PoolWorkflow for Topology {
         }
     }
 }
-async fn example(stop_returns: bool, ids: TaskIds) -> Outcome<()> {
+async fn example(ids: TaskIds) -> Outcome<()> {
     let config = Config::default();
     // The application has acquired/fenced leadership before supplying this epoch.
-    let mut driver = WorkflowDriver::new("pool", config.clone())?
-        .with_task_ids(if stop_returns { 2 } else { 1 }, ids)?;
+    let mut driver = WorkflowDriver::new("pool", config.clone())?.with_task_ids(1, ids)?;
     let services = Services {
         migration: driver.register("migration", Migration)?,
         conditions: Arc::new(Conditions(AtomicBool::new(true))),
@@ -209,7 +159,6 @@ async fn example(stop_returns: bool, ids: TaskIds) -> Outcome<()> {
         .submit(Shrink {
             input: Input {
                 disk: "disk-a".into(),
-                stop_returns,
             },
             services: services.clone(),
         })
@@ -223,7 +172,7 @@ async fn example(stop_returns: bool, ids: TaskIds) -> Outcome<()> {
         control.changed().await?;
     }
     println!(
-        "{} stop_returns={stop_returns}: {:?}",
+        "{} stop-and-return: {:?}",
         run.id(),
         center.task(run.id())?.state
     );
@@ -240,10 +189,7 @@ async fn example(stop_returns: bool, ids: TaskIds) -> Outcome<()> {
 #[tokio::main]
 async fn main() -> Outcome<()> {
     let ids = TaskIds::for_leader(42)?;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        example(false, ids.clone()).await?;
-        example(true, ids).await
-    })
-    .await
-    .map_err(|_| Failure::Failed("demo timed out".into()))?
+    tokio::time::timeout(Duration::from_secs(10), async { example(ids).await })
+        .await
+        .map_err(|_| Failure::Failed("demo timed out".into()))?
 }

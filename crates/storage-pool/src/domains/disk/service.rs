@@ -87,6 +87,15 @@ impl DiskService {
             data_plane,
         }
     }
+    pub(crate) fn restore(&self, state: DiskMetadata) {
+        *self.disks.lock().unwrap() = state.disks.into_iter().map(|d| (d.id.clone(), d)).collect();
+        *self.owners.lock().unwrap() = state
+            .allocations
+            .into_iter()
+            .map(|(d, b, v)| ((d, b), v))
+            .collect();
+        *self.retired.lock().unwrap() = state.retired.into_iter().collect();
+    }
     fn get(&self, id: &DiskId) -> Outcome<MemberDisk> {
         self.disks
             .lock()

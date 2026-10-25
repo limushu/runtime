@@ -1,7 +1,7 @@
-use crate::{ports::*, support::reject, task_center::TaskCenter, workflows::*, *};
+use crate::{support::reject, task_center::TaskCenter, workflows::*, *};
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 use workflow_foundation::{RuntimeSnapshot, TaskId, WorkflowDriver};
 
@@ -10,27 +10,63 @@ pub struct Pool {
     handle: PoolHandle,
 }
 impl Pool {
-    pub(crate) fn start(
+    pub(crate) fn start(descriptor: PoolDescriptor, manager: &PoolManager) -> Outcome<Self> {
+        Self::prepare(descriptor, manager, None)?.finish(None)
+    }
+    pub(crate) fn prepare(
         descriptor: PoolDescriptor,
-        config: Config,
-        metadata: Arc<dyn MetadataStore>,
-        data_plane: Arc<dyn DataPlane>,
-        registry: Weak<Mutex<crate::manager::Registry>>,
-        task_ids: TaskIds,
-        balance: Option<Arc<dyn crate::domains::balance::BalanceBackend>>,
-    ) -> Outcome<Self> {
+        manager: &PoolManager,
+        snapshot: Option<crate::domain_clients::DomainSnapshot>,
+    ) -> Outcome<PreparedPool> {
         let id = descriptor.id.clone();
-        let mut driver = WorkflowDriver::new(id.as_str(), config.clone())?;
+        let mut driver = WorkflowDriver::new(id.as_str(), manager.config.clone())?;
         let uuid = descriptor
             .uuid
             .to_string()
             .parse::<uuid::Uuid>()
             .map_err(|e| reject(e.to_string()))?;
-        driver = driver.with_task_ids(uuid.as_u128(), task_ids)?;
-        let domains = Domains::register(&mut driver, id.clone(), metadata, data_plane, balance)?;
+        driver = driver.with_task_ids(uuid.as_u128(), manager.task_ids.clone())?;
         let shared = Arc::new(crate::manager::PoolShared::new(
-            descriptor, registry, &config,
+            descriptor,
+            Arc::downgrade(&manager.registry),
+            &manager.config,
         ));
+        let routing = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+        if let Some(snapshot) = &snapshot {
+            for node in &snapshot.nodes {
+                shared.nodes.lock().unwrap().insert(node.id.clone());
+                shared.node_claims.lock().unwrap().insert(
+                    node.id.clone(),
+                    crate::manager::NodeClaim {
+                        confirmed: true,
+                        ..Default::default()
+                    },
+                );
+                shared.serial.fetch_max(
+                    node.observation.saturating_add(1),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            for disk in &snapshot.disks.disks {
+                routing.lock().unwrap().insert(
+                    disk.id.clone(),
+                    DiskSpec {
+                        id: disk.id.clone(),
+                        node: disk.node.clone(),
+                        tier: disk.tier.clone(),
+                        capacity_blks: disk.capacity_blks,
+                    },
+                );
+            }
+        }
+        let domains = Domains::register_with_snapshot(
+            &mut driver,
+            id,
+            manager.metadata.clone(),
+            manager.data_plane.clone(),
+            manager.balance.clone(),
+            snapshot,
+        )?;
         let admin = driver.register(
             "pool",
             crate::manager::admin::AdminHost {
@@ -38,20 +74,56 @@ impl Pool {
                 domains: domains.clone(),
             },
         )?;
-        let handle = PoolHandle {
-            id,
-            task_center: TaskCenter::start(driver, &config),
+        Ok(PreparedPool {
+            driver,
             domains,
             shared,
             admin,
-        };
-        Ok(Self { handle })
+            routing,
+            config: manager.config.clone(),
+            durable: manager.task_store.is_some(),
+        })
     }
     pub fn handle(&self) -> PoolHandle {
         self.handle.clone()
     }
     pub async fn shutdown(&mut self) -> Outcome<()> {
         self.handle.shutdown().await
+    }
+}
+
+pub(crate) struct PreparedPool {
+    pub driver: WorkflowDriver,
+    pub domains: Domains,
+    pub shared: Arc<crate::manager::PoolShared>,
+    pub routing: Arc<Mutex<std::collections::BTreeMap<DiskId, DiskSpec>>>,
+    admin: crate::manager::admin::AdminClient,
+    config: Config,
+    durable: bool,
+}
+impl PreparedPool {
+    pub fn finish(self, restored: Option<Vec<workflow_foundation::Restored>>) -> Outcome<Pool> {
+        let task_center = match restored {
+            Some(tasks) => TaskCenter::from_restored_with_routing(
+                self.driver,
+                &self.config,
+                Arc::new(crate::task_center::PoolSchedulingPolicy),
+                tasks,
+                self.routing,
+            )?,
+            None => TaskCenter::start(self.driver, &self.config),
+        };
+        let id = self.shared.descriptor.lock().unwrap().id.clone();
+        Ok(Pool {
+            handle: PoolHandle {
+                id,
+                task_center,
+                domains: self.domains,
+                shared: self.shared,
+                admin: self.admin,
+                durable: self.durable,
+            },
+        })
     }
 }
 
@@ -63,15 +135,19 @@ pub struct PoolHandle {
     pub(crate) domains: Domains,
     pub(crate) shared: Arc<crate::manager::PoolShared>,
     pub(crate) admin: crate::manager::admin::AdminClient,
+    durable: bool,
 }
 impl PoolHandle {
     pub async fn shrink(&self, request: ShrinkRequest) -> Outcome<Run<()>> {
         self.descriptor().active()?;
         let request = ShrinkRequest::new(request.disks)?;
         let membership = self.reserve_removal(&request.disks)?;
-        self.task_center
-            .submit(ShrinkWorkflow::new(request, self.domains.clone())?.with_membership(membership))
-            .await
+        let mut workflow =
+            ShrinkWorkflow::new(request, self.domains.clone())?.with_membership(membership);
+        if self.durable {
+            workflow = workflow.durable();
+        }
+        self.task_center.submit(workflow).await
     }
     /// A caller can query by pool without saving a TaskId. Includes uncertain tasks
     /// which still fence the pool's shrink slot and require reconciliation.

@@ -135,6 +135,41 @@ impl ShrinkWorkflow {
         );
         self.save(ctx, progress).await
     }
+    /// One business step, including explicit stop/checkpoint/re-admission boundaries.
+    /// Activity never retains a suspended execution, and the framework never retries it.
+    async fn migrate_to_completion(
+        &self,
+        ctx: &mut WorkflowContext,
+        progress: &mut ShrinkProgress,
+    ) -> Outcome<MigrationProgress> {
+        loop {
+            let exit = ctx
+                .activity(
+                    self.domains
+                        .balance
+                        .as_ref()
+                        .expect("validated at construction"),
+                    crate::domains::balance::Migrate {
+                        pool: self.domains.pool.clone(),
+                        task_id: ctx.id(),
+                        disks: self.request.disks.clone(),
+                        checkpoint: progress.migration.clone(),
+                    },
+                )
+                .await?;
+            match exit {
+                ActivityExit::Completed(done) => return Ok(done),
+                ActivityExit::Suspended(checkpoint) => {
+                    // 1. The domain has stopped. 2. Save continuation data.
+                    // 3. Acknowledge Task suspension and wait for re-admission.
+                    progress.migration = checkpoint;
+                    self.save(ctx, progress).await?;
+                    ctx.wait_until_runnable().await?;
+                }
+            }
+        }
+    }
+
     async fn execute(&self, ctx: &mut WorkflowContext) -> Outcome<()> {
         use ShrinkStage::*;
         let mut progress: ShrinkProgress = if ctx.restored_checkpoint().is_null() {
@@ -165,34 +200,9 @@ impl ShrinkWorkflow {
                     self.advance(ctx, &mut progress, Migrate).await?;
                 }
                 Migrate => {
-                    let exit = ctx
-                        .activity(
-                            self.domains
-                                .balance
-                                .as_ref()
-                                .expect("validated at construction"),
-                            crate::domains::balance::Migrate {
-                                pool: self.domains.pool.clone(),
-                                task_id: ctx.id(),
-                                disks: disks.clone(),
-                                checkpoint: progress.migration.clone(),
-                            },
-                        )
-                        .await?;
-                    match exit {
-                        ActivityExit::Completed(done) => {
-                            progress.migration.progress = done;
-                            self.advance(ctx, &mut progress, VerifyEvacuated).await?;
-                        }
-                        ActivityExit::Suspended(checkpoint) => {
-                            // The native invocation has ended. Persist BEFORE acknowledging
-                            // suspension and yielding to topology; resume creates a new Activity.
-                            // Keep the Migrate stage for the next iteration.
-                            progress.migration = checkpoint;
-                            self.save(ctx, &progress).await?;
-                            ctx.wait_until_runnable().await?;
-                        }
-                    }
+                    progress.migration.progress =
+                        self.migrate_to_completion(ctx, &mut progress).await?;
+                    self.advance(ctx, &mut progress, VerifyEvacuated).await?;
                 }
                 VerifyEvacuated => {
                     ctx.activity(
@@ -277,7 +287,10 @@ impl Workflow for ShrinkWorkflow {
         if domains.pool != input.pool {
             return Err(reject("shrink recovery belongs to another pool"));
         }
-        let workflow = Self::new(input.request, domains)?.durable();
+        let mut workflow = Self::new(input.request, domains)?.durable();
+        if let Ok(membership) = dependencies.get::<crate::manager::RemovalRecovery>() {
+            workflow.membership = Some(membership.reserve(&workflow.request.disks)?);
+        }
         if !record.checkpoint.is_null() {
             let saved: ShrinkProgress = serde_json::from_value(record.checkpoint.clone())
                 .map_err(|e| reject(e.to_string()))?;

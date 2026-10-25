@@ -99,7 +99,7 @@ impl Signal {
 pub enum RunState {
     WaitingObjects,
     Running,
-    /// Acknowledged safe pause, including an in-flight operation that has stopped.
+    /// Acknowledged safe pause after in-flight activities have settled.
     Suspended,
     Suspending,
     WaitingConditions(String),

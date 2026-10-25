@@ -1,45 +1,34 @@
+//! Restore persisted Tasks. Read restore() first: load -> prepare -> claim -> register.
+//! Workflow::restore only rebuilds an execution body during prepare; Task identity,
+//! owner, control state, checkpoint and the scheduling start gate belong to this path.
 use super::*;
-use crate::persistence::{self, Dependencies, Restored, StoredOutcome, TaskStore};
+use crate::persistence::{self, SavedTask, StoredOutcome, TaskStore};
 
 impl WorkflowDriver {
-    /// Define construction once for this workflow type, not a separate recovery workflow.
-    pub fn define<W: Workflow>(&mut self, dependencies: Dependencies) -> Outcome<()> {
-        if self.definitions.contains_key(W::NAME) {
-            return Err(Failure::Rejected("workflow already defined".into()));
+    /// Recover the same Tasks, without executing their business logic.
+    /// Every record is checked before any ownership write; every ownership write
+    /// must succeed before any Task is registered. The owner opens start gates later.
+    pub async fn restore(&mut self) -> Outcome<Vec<Restored>> {
+        if self.recovery_ready || !self.running.is_empty() {
+            return Err(Failure::Rejected(
+                "restore is only valid on a fresh durable host".into(),
+            ));
         }
-        self.definitions.insert(
-            W::NAME.into(),
-            Arc::new(move |record| {
-                let workflow = W::restore(record, &dependencies)?;
-                if workflow.objects() != record.objects || record.id.business() != W::NAME {
-                    return Err(Failure::Rejected(
-                        "restoration changed workflow identity or claims".into(),
-                    ));
-                }
-                match workflow.persistence()? {
-                    Persistence::Durable { version, input }
-                        if version == record.version && input == record.input => {}
-                    _ => {
-                        return Err(Failure::Rejected(
-                            "restoration changed durable input/version".into(),
-                        ));
-                    }
-                }
-                Ok(Box::new(move |driver, record| {
-                    let (tx, rx) = oneshot::channel();
-                    let run = driver.enqueue_with(
-                        workflow,
-                        Some(rx),
-                        record.metadata.clone(),
-                        Some(record),
-                    )?;
-                    Ok((run.control, StartPermit(tx)))
-                }))
-            }),
-        );
-        Ok(())
+        self.check_registration()?;
+        let store = self.store.clone().ok_or(Failure::Unavailable)?;
+
+        let records = self.load_pending_tasks(&store).await?;
+        let mut tasks = self.prepare_tasks(records)?;
+        self.claim_tasks(&store, &mut tasks).await?;
+        self.check_registration()?;
+        let restored = self.register_restored_tasks(tasks, store);
+
+        self.recovery_ready = true;
+        Ok(restored)
     }
-    /// Call after external leader fencing and before accepting tasks.
+
+    /// Configure Task storage after external leader fencing, before accepting work.
+    /// claim() fences task-record writes; it does not fence external domain effects.
     pub async fn enable_persistence(&mut self, store: Arc<dyn TaskStore>) -> Outcome<()> {
         if self.ids.epoch() == 0 || !self.running.is_empty() || self.store.is_some() {
             return Err(Failure::Rejected(
@@ -54,64 +43,167 @@ impl WorkflowDriver {
         self.store = Some(store);
         Ok(())
     }
-    /// Preflight EVERY pending task before starting any. Unknown versions/uncertain tasks
-    /// fail closed; their claims must not silently disappear. No operation is replayed here.
-    pub async fn restore(&mut self) -> Outcome<Vec<Restored>> {
-        if self.recovery_ready || !self.running.is_empty() {
-            return Err(Failure::Rejected(
-                "restore is only valid on a fresh durable host".into(),
-            ));
+
+    /// Register how to rebuild this Task's execution body and bind local clients.
+    /// No records are read and no Workflow is constructed until restore().
+    pub fn define<W: Workflow>(&mut self, dependencies: Dependencies) -> Outcome<()> {
+        if self.definitions.contains_key(W::NAME) {
+            return Err(Failure::Rejected("workflow already defined".into()));
         }
-        let store = self.store.clone().ok_or(Failure::Unavailable)?;
+        self.definitions.insert(
+            W::NAME.into(),
+            Arc::new(move |task| prepare_execution::<W>(task, &dependencies)),
+        );
+        Ok(())
+    }
+
+    async fn load_pending_tasks(&mut self, store: &Arc<dyn TaskStore>) -> Outcome<Vec<SavedTask>> {
         let backend = store.clone();
         let pool = self.pool_uuid;
         let mut records = persistence::blocking(move || backend.list(pool)).await?;
-        records.retain(|r| {
+        records.retain(|task| {
             matches!(
-                r.outcome,
+                task.outcome,
                 StoredOutcome::Pending | StoredOutcome::NeedsCheck(_)
             )
         });
-        records.sort_by_key(|r| r.id);
+        records.sort_by_key(|task| task.id);
         if records.len() > self.config.max_workflows {
             return Err(Failure::Busy);
         }
-        let mut prepared = Vec::new();
-        for record in records {
-            if record.cancel_requested || matches!(record.outcome, StoredOutcome::NeedsCheck(_)) {
+        Ok(records)
+    }
+
+    fn prepare_tasks(&self, records: Vec<SavedTask>) -> Outcome<Vec<PreparedRestore>> {
+        let mut tasks = Vec::with_capacity(records.len());
+        for task in records {
+            if task.cancel_requested || matches!(task.outcome, StoredOutcome::NeedsCheck(_)) {
                 return Err(Failure::Rejected(format!(
                     "task {} requires reconciliation",
-                    record.id
+                    task.id
                 )));
             }
-            let definition = self.definitions.get(record.id.business()).ok_or_else(|| {
-                Failure::Rejected(format!("undefined workflow {}", record.id.business()))
+            let definition = self.definitions.get(task.id.business()).ok_or_else(|| {
+                Failure::Rejected(format!("undefined workflow {}", task.id.business()))
             })?;
-            prepared.push((definition(&record)?, record));
+            tasks.push(definition(task)?);
         }
-        let mut claimed = Vec::new();
-        for (construct, mut record) in prepared {
-            let previous = record.revision;
-            record.revision = record
+        Ok(tasks)
+    }
+
+    async fn claim_tasks(
+        &mut self,
+        store: &Arc<dyn TaskStore>,
+        tasks: &mut [PreparedRestore],
+    ) -> Outcome<()> {
+        for prepared in tasks {
+            let task = &mut prepared.record;
+            let previous = task.revision;
+            task.revision = task
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| Failure::Rejected("task revision exhausted".into()))?;
-            record.owner_epoch = self.ids.epoch();
+            task.owner_epoch = self.ids.epoch();
             let backend = store.clone();
-            let saved = record.clone();
+            let saved = task.clone();
             persistence::blocking(move || backend.save(saved, Some(previous))).await?;
-            claimed.push((construct, record));
         }
-        let mut restored = Vec::new();
-        for (construct, record) in claimed {
-            let (control, start) = construct(self, record.clone())?;
-            restored.push(Restored {
-                record,
-                control,
-                start,
-            });
-        }
-        self.recovery_ready = true;
-        Ok(restored)
+        // These are individual CAS writes, not a batch transaction. A failed write
+        // leaves admission closed and registers no Tasks. A retry reloads the store.
+        Ok(())
     }
+
+    fn register_restored_tasks(
+        &mut self,
+        tasks: Vec<PreparedRestore>,
+        store: Arc<dyn TaskStore>,
+    ) -> Vec<Restored> {
+        // Build every inert Future before exposing any Task. Construction performs
+        // no user callbacks, validation or IO; registration below cannot return Err.
+        let executions: Vec<_> = tasks
+            .into_iter()
+            .map(|prepared| (prepared.build_execution)(self, prepared.record, store.clone()))
+            .collect();
+        let mut restored = Vec::with_capacity(executions.len());
+        for (task, future) in executions {
+            self.register_execution(task.control.clone(), future);
+            restored.push(task);
+        }
+        self.publish();
+        restored
+    }
+}
+
+// Type erasure is confined here: stored Tasks may have different Workflow types.
+// This is temporary recovery data, not another Task identity or runtime manager.
+pub(super) type Definition = Arc<dyn Fn(SavedTask) -> Outcome<PreparedRestore> + Send + Sync>;
+type BuildExecution = Box<
+    dyn FnOnce(
+            &WorkflowDriver,
+            SavedTask,
+            Arc<dyn TaskStore>,
+        ) -> (Restored, BoxFuture<'static, TaskId>)
+        + Send,
+>;
+pub(super) struct PreparedRestore {
+    record: SavedTask,
+    build_execution: BuildExecution,
+}
+
+fn prepare_execution<W: Workflow>(
+    task: SavedTask,
+    dependencies: &Dependencies,
+) -> Outcome<PreparedRestore> {
+    if task.version == 0 || task.revision == u64::MAX {
+        return Err(Failure::Rejected(
+            "invalid schema version or exhausted task revision".into(),
+        ));
+    }
+    for object in &task.objects {
+        object.validate()?;
+    }
+    let workflow = W::restore(&task, dependencies)?;
+    if workflow.objects() != task.objects || task.id.business() != W::NAME {
+        return Err(Failure::Rejected(
+            "restoration changed workflow identity or claims".into(),
+        ));
+    }
+    match workflow.persistence()? {
+        Persistence::Durable { version, input }
+            if version == task.version && input == task.input => {}
+        _ => {
+            return Err(Failure::Rejected(
+                "restoration changed durable input/version".into(),
+            ));
+        }
+    }
+    Ok(PreparedRestore {
+        record: task,
+        build_execution: Box::new(move |driver, record, store| {
+            let (tx, rx) = oneshot::channel();
+            let journal = persistence::Journal {
+                record: Arc::new(tokio::sync::Mutex::new(record.clone())),
+                store,
+            };
+            let env =
+                driver.execution_env(record.id, Some(rx), Some(journal), Some(record.clone()));
+            let (run, future) = execution(workflow, env);
+            (
+                Restored {
+                    record,
+                    control: run.control,
+                    start: StartPermit(tx),
+                },
+                future,
+            )
+        }),
+    })
+}
+
+/// Handoff receipt: the original task control plus its scheduling metadata and start gate.
+/// The owner installs ALL claims before opening ANY of these gates.
+pub struct Restored {
+    pub record: SavedTask,
+    pub control: RunControl,
+    pub start: StartPermit,
 }

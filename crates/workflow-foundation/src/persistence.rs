@@ -1,9 +1,8 @@
 //! Storage representation of the same Task, not another task manager.
-use crate::*;
+use crate::{Failure, ObjectKey, Outcome, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    any::{Any, TypeId},
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
@@ -30,28 +29,6 @@ impl Persistence {
         })
     }
 }
-/// Dependency binding is local to a host; clients and Futures are never serialized.
-#[derive(Clone, Default)]
-pub struct Dependencies(Arc<BTreeMap<TypeId, Arc<dyn Any + Send + Sync>>>);
-impl Dependencies {
-    pub fn with<T: Send + Sync + 'static>(mut self, value: T) -> Self {
-        Arc::make_mut(&mut self.0).insert(TypeId::of::<T>(), Arc::new(value));
-        self
-    }
-    pub fn get<T: Send + Sync + 'static>(&self) -> Outcome<Arc<T>> {
-        self.0
-            .get(&TypeId::of::<T>())
-            .cloned()
-            .and_then(|v| v.downcast().ok())
-            .ok_or_else(|| {
-                Failure::Rejected(format!(
-                    "missing workflow dependency {}",
-                    std::any::type_name::<T>()
-                ))
-            })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StoredOutcome {
     Pending,
@@ -166,25 +143,9 @@ impl Journal {
     }
 }
 
-pub(crate) type Restore = Arc<
-    dyn Fn(
-            &SavedTask,
-        ) -> Outcome<
-            Box<
-                dyn FnOnce(&mut WorkflowDriver, SavedTask) -> Outcome<(RunControl, StartPermit)>
-                    + Send,
-            >,
-        > + Send
-        + Sync,
->;
-
-/// Handoff receipt: the original task control plus its scheduling metadata and start gate.
-/// The owner installs ALL claims before opening ANY of these gates.
-pub struct Restored {
-    pub record: SavedTask,
-    pub control: RunControl,
-    pub start: StartPermit,
-}
+// Compatibility exports; implementation belongs to execution, not storage.
+pub use crate::driver::recovery::Restored;
+pub use crate::workflow::Dependencies;
 
 mod file;
 pub use file::FileTaskStore;

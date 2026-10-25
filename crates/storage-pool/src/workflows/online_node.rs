@@ -44,6 +44,7 @@ impl Workflow for OnlineNodeWorkflow {
                     connected: true,
                 },
             )
+            .uninterruptible()
             .await?;
         if node.observation != self.request.sequence || !node.connected {
             return Err(reject("node online superseded by newer observation"));

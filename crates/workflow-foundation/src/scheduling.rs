@@ -1,65 +1,137 @@
-//! Pure scheduling relations. No knowledge of pools, migration or topology.
-use crate::*;
+//! Apply one directional business rule: existing task A, incoming task B.
+//! No inferred reverse relation, numeric priority or implicit object conflicts.
+use crate::TaskId;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Relation {
+/// Business-neutral scheduling explanation, shared by every observation entry point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictDecision {
     Independent,
-    Exclusive,
-    YieldTo(&'static str),
+    Wait,
+    CancelThenWait,
+    /// Request a safe stop of the existing task; admit the incoming task after ACK.
+    SuspendThenWait,
+    Reject(&'static str),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub decision: ConflictDecision,
+    pub reason: &'static str,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictMatch {
+    pub existing: TaskId,
+    pub conflict: Conflict,
 }
 pub trait SchedulingPolicy<D>: Send + Sync + 'static {
-    fn admission(&self, incoming: &D, existing: &D) -> Conflict;
-    fn relation(&self, task: &D, other: &D) -> Relation;
-    /// Queued precedence; equal priorities preserve FIFO. Yield targets should
-    /// outrank the tasks yielding to them and intervening queued competitors.
-    fn priority(&self, _task: &D) -> i32 {
-        0
-    }
+    /// Pure decision, used both before acceptance and while waiting.
+    /// The owner checks ALL existing tasks before applying any side effects.
+    fn on_task(&self, existing: &D, incoming: &D) -> Conflict;
 }
 pub struct Candidate<'a, D> {
     pub id: TaskId,
     pub descriptor: &'a D,
     pub started: bool,
+    /// Durable registration has succeeded; an unaccepted queue entry cannot act.
+    pub accepted: bool,
     pub paused: bool,
 }
 #[derive(Default)]
 pub struct Plan {
+    /// (queue head, current task). Applied only after current enters its body.
+    pub cancellations: Vec<(TaskId, TaskId)>,
     pub pauses: BTreeMap<TaskId, BTreeSet<String>>,
     pub blockers: BTreeMap<TaskId, Vec<TaskId>>,
     pub ready: Vec<TaskId>,
 }
-/// Equal priority uses input FIFO order. Yield is directional; policies must not introduce cycles.
-/// Apply pause requests, then recompute with fresh ACKs before opening start gates.
+/// Derive current + queue from explicit conflict rules and creation order.
+/// Only the first conflicting successor may influence a current task. Later
+/// tasks wait behind that head; independent work remains independently runnable.
+/// Requests affecting multiple objects must reach the head on all of them first.
 pub fn plan<D: 'static>(policy: &dyn SchedulingPolicy<D>, tasks: &[Candidate<'_, D>]) -> Plan {
+    let mut tasks: Vec<_> = tasks.iter().collect();
+    tasks.sort_by_key(|task| task.id);
     let mut result = Plan::default();
-    for (index, task) in tasks.iter().enumerate() {
-        let pauses = result.pauses.entry(task.id).or_default();
-        let blockers = result.blockers.entry(task.id).or_default();
-        for (other_index, other) in tasks.iter().enumerate() {
-            if index == other_index {
-                continue;
-            }
-            let relation = policy.relation(task.descriptor, other.descriptor);
-            let reverse = policy.relation(other.descriptor, task.descriptor);
-            let blocked = if let Relation::YieldTo(reason) = relation {
-                pauses.insert(format!("{}:{reason}", other.id));
-                true
-            } else if matches!(reverse, Relation::YieldTo(_)) {
-                other.started && !other.paused
-            } else if relation == Relation::Exclusive || reverse == Relation::Exclusive {
-                let before = policy.priority(other.descriptor) > policy.priority(task.descriptor)
-                    || (policy.priority(other.descriptor) == policy.priority(task.descriptor)
-                        && other_index < index);
-                other.started || (!task.started && before)
-            } else {
-                false
-            };
-            if blocked {
-                blockers.push(other.id);
+    let mut heads = vec![None; tasks.len()];
+    let mut rules = BTreeMap::new();
+    for (i, existing) in tasks.iter().enumerate() {
+        result.pauses.insert(existing.id, BTreeSet::new());
+        result.blockers.insert(existing.id, vec![]);
+        for (j, incoming) in tasks.iter().enumerate().skip(i + 1) {
+            let rule = policy.on_task(existing.descriptor, incoming.descriptor);
+            if rule.decision != ConflictDecision::Independent {
+                heads[i].get_or_insert(j);
+                rules.insert((i, j), rule);
             }
         }
-        if !task.started && blockers.is_empty() {
+    }
+    // A task behind another queued task cannot send control to any current.
+    let mut at_head: Vec<_> = tasks.iter().map(|t| t.accepted).collect();
+    for &(i, j) in rules.keys() {
+        let head = heads[i].unwrap();
+        if !tasks[i].started
+            || (head != j && (!tasks[head].started || !rules.contains_key(&(head, j))))
+        {
+            at_head[j] = false;
+        }
+    }
+    for (&(i, j), rule) in &rules {
+        let existing = tasks[i];
+        let incoming = tasks[j];
+        let head = heads[i].unwrap();
+        if head != j {
+            // If the head also conflicts directly, that rule already determines
+            // whether to wait for its end or its pause ACK.
+            if !rules.contains_key(&(head, j)) {
+                result
+                    .blockers
+                    .get_mut(&incoming.id)
+                    .unwrap()
+                    .push(tasks[head].id);
+            }
+            continue;
+        }
+        match rule.decision {
+            ConflictDecision::SuspendThenWait if existing.started && at_head[j] => {
+                result
+                    .pauses
+                    .get_mut(&existing.id)
+                    .unwrap()
+                    .insert(format!("{}:{}", incoming.id, rule.reason));
+                result
+                    .blockers
+                    .get_mut(&existing.id)
+                    .unwrap()
+                    .push(incoming.id);
+                if !existing.paused {
+                    result
+                        .blockers
+                        .get_mut(&incoming.id)
+                        .unwrap()
+                        .push(existing.id);
+                }
+            }
+            _ => {
+                result
+                    .blockers
+                    .get_mut(&incoming.id)
+                    .unwrap()
+                    .push(existing.id);
+                if rule.decision == ConflictDecision::CancelThenWait
+                    && existing.started
+                    && at_head[j]
+                {
+                    result.cancellations.push((incoming.id, existing.id));
+                }
+            }
+        }
+    }
+    for blockers in result.blockers.values_mut() {
+        blockers.sort();
+        blockers.dedup();
+    }
+    for task in tasks {
+        if task.accepted && !task.started && result.blockers[&task.id].is_empty() {
             result.ready.push(task.id);
         }
     }

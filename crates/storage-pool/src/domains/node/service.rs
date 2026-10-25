@@ -41,6 +41,9 @@ impl NodeService {
             data_plane,
         }
     }
+    pub(crate) fn restore(&self, nodes: Vec<PoolNode>) {
+        *self.nodes.lock().unwrap() = nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
+    }
     fn get(&self, id: &NodeId) -> Outcome<PoolNode> {
         self.nodes
             .lock()

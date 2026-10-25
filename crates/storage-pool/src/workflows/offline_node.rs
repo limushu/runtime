@@ -44,6 +44,7 @@ impl Workflow for OfflineNodeWorkflow {
                     connected: false,
                 },
             )
+            .uninterruptible()
             .await?;
         if node.observation != self.request.sequence || node.connected {
             return Err(reject("node offline superseded by newer observation"));
@@ -54,17 +55,20 @@ impl Workflow for OfflineNodeWorkflow {
                 &self.domains.disk,
                 DiskCommand::InspectMany(self.specs.into_iter().map(|s| s.id).collect()),
             )
+            .uninterruptible()
             .await?,
         )?;
         let ids: Vec<_> = disks.into_iter().map(|d| d.id).collect();
         ctx.report_progress("invalidate-replicas", 2, Some(7));
         ctx.activity(&self.domains.vd, VdCommand::InvalidateMany(ids.clone()))
+            .uninterruptible()
             .await?;
         ctx.report_progress("close-disk-io", 3, Some(7));
         ctx.activity(
             &self.domains.disk,
             DiskCommand::SetIoMany(ids.clone(), IoState::Down),
         )
+        .uninterruptible()
         .await?;
         ctx.report_progress("wait-rebuild", 4, Some(7));
         ctx.activity(&self.domains.vd, VdCommand::WaitRebuildMany(ids.clone()))

@@ -35,15 +35,18 @@ impl Workflow for OfflineDiskWorkflow {
     async fn run(self, ctx: &mut WorkflowContext) -> Outcome<MemberDisk> {
         ctx.report_progress(Self::NAME, 0, None);
         ctx.activity(&self.domains.disk, DiskCommand::Inspect(self.id.clone()))
+            .uninterruptible()
             .await?;
         // Conservative validity transition first: cancellation may leave an Up
         // disk with Invalid data, never a fake successful repair or freed BLKs.
         ctx.activity(&self.domains.vd, VdCommand::Invalidate(self.id.clone()))
+            .uninterruptible()
             .await?;
         ctx.activity(
             &self.domains.disk,
             DiskCommand::SetIo(self.id.clone(), IoState::Down),
         )
+        .uninterruptible()
         .await?;
         // Skeleton only: the VD domain will wait for rebuild and confirm that
         // committed BG mappings no longer reference this member disk.

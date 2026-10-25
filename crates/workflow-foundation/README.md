@@ -5,6 +5,37 @@
 
 ## 主要类型
 
+先按职责读源码，公开类型名称和调用方式保持不变：
+
+| 文件 | 负责什么 | 阅读入口 |
+| --- | --- | --- |
+| `identity.rs` | 同一个 Task 的身份、轮次和流水 | TaskId / TaskIds |
+| `tasks.rs` | 任务观测、订阅和索引；引用调度解释 | TaskSnapshot / TaskObserver / TaskRegistry |
+| `scheduling.rs` | 规则契约和调度计算 | ConflictDecision / SchedulingPolicy / plan |
+| `control.rs` | Task 控制端：请求、token、确认 | RunControl → Controls / ControlToken |
+| `workflow.rs` | 业务契约、依赖绑定和上下文，等待安全边界及 Activity 结果 | Workflow / Dependencies / WorkflowContext |
+| `service.rs` | 领域调用契约和服务宿主 | ActivityContext / ActivityExit / ServiceHandler |
+| `driver.rs` | 注册与轮询执行体，处理完成和资源事件 | enqueue_with / tick |
+| `driver/execution.rs` | 单个 Task 的执行包装：创建句柄、等待启动、控制落盘、运行、收尾和终态落盘 | Run / execution / sync_controls |
+| `driver/recovery.rs` | 从存储恢复 Task，保持原 ID，暂不放行业务执行 | restore → load_pending_tasks → prepare_tasks → claim_tasks → register_restored_tasks |
+| `persistence.rs` | Task 存储结构、后端契约和日志写入 | SavedTask / TaskStore / Journal |
+| `persistence/file.rs` | 文件存储后端 | FileTaskStore |
+| `locks.rs` | 资源申请、排队、释放和不确定结果隔离 | Broker / LockTable / Permit |
+| `standalone.rs` | 可选的独立事件循环宿主 | WorkflowRuntime / RuntimeHandle |
+| `model.rs` | 公共值类型、错误、状态和配置 | ObjectKey / Outcome / RunState / Config |
+
+恢复的 `prepare_tasks` 调用 `Workflow::restore` 重建执行体并检查身份、对象和输入。
+全部检查通过才逐条接管记录；全部接管成功才注册 Task，调用方随后重建调度关系并打开 start gate。
+接管完成后再次检查宿主有效性，批量构造尚未执行的 Future，再登记任务。
+登记阶段没有存储 IO、Workflow 回调或返回错误的校验，不会因重新调用 persistence() 而留下半批任务。
+记录接管是逐条 CAS，不是批量事务；写入中途失败时不注册任务，重试重新读取记录。
+Task 注册后立即可查询保存的 details、objects 和用户暂停请求，无需等待第一次 tick。
+暂停确认必须由新执行体到达安全边界后重新产生，不能从旧宿主复制。
+
+`Restored` 定义在恢复模块中，表示恢复后的句柄和启动许可。`Dependencies` 定义在 Workflow 契约旁。
+两者均从 crate 根导出，原 `persistence::Restored` / `persistence::Dependencies` 路径保留为兼容重导出。
+这些私有执行模块共同实现同一个 Driver，不会创建额外任务管理器或事件循环。
+
 | 类型 | 含义 |
 | --- | --- |
 | WorkflowDriver | 嵌入调用方事件循环的被动执行驱动，不 spawn、不自带提交队列 |
@@ -61,9 +92,9 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 - Uncertain/panic 会保留步骤资源隔离，不能被 Workflow 忽略成成功。单纯被隔离的后继
   返回 Rejected，避免扩大隔离。在 defer 模式下，应用负责 Workflow 级对象隔离。
 - ActivityContext 是适配层执行上下文，不应进入纯领域对象。
-- suspend 在 Activity/Signal/Timer 或 wait_until_runnable 边界确认；Activity 可以注册可选的停稳控制适配器，
-  在原调用保持等待时确认暂停。没有该适配器时等待动作返回，再由 Workflow 到达安全边界。
-  不抢占外部 IO，暂停不会回滚步骤。
+- suspend 在安全边界确认：在途 Activity 必须先停稳返回，Workflow 消费结果并保存必要检查点，
+  然后在 Activity/Signal/Timer 或 wait_until_runnable 入口确认暂停。
+  服务通过请求携带的 token 协作收尾，不抢占外部 IO，暂停不会回滚步骤。
   排队准入期间还不能即时确认 Suspended。取消/关闭可以直接唤醒暂停。
 - client 绑定 Runtime 实例，即使 Pool 名称相同也不能跨实例执行 Activity。
 - shutdown 拒绝新工作、请求取消、等待停稳、关闭服务；等待可取消后重试。
@@ -86,7 +117,7 @@ let mut observer = client.observe_task(id)?;
 let updated = observer.changed().await?; // Activity 更新也会唤醒，不依赖 Workflow 状态变化
 ```
 
-状态为 `WaitingResources -> Queued -> Running / Suspended -> Completed / Failed(Failure)`。
+状态为 `WaitingResources -> Queued -> Running -> Completed / Failed(Failure)`。
 `Queued` 包含等待服务邮箱容量；取消、拒绝、服务不可用可以在实际开始前结束，
 此时 `started_at` 为 None。取消请求不会提前标记完成；调用方丢弃 Activity 等待 Future 后，
 记录仍由服务端实际执行更新。handler panic 或执行中强制终止记录为 Uncertain，不能误报成功。
@@ -125,20 +156,26 @@ TaskIds::for_leader(epoch) 接收选主系统的持久化递增轮次，同一�
 with_task_ids(pool_uuid, ids) 绑定不可变池 UUID。失主调用 ids.revoke() 停止新分配并协作取消旧执行。
 默认兼容模式 epoch=0，仅限本地，不承诺跨重启单调；恢复任务保持旧 TaskId，更新 owner_epoch。
 
-## 在已有 Activity 上选择暂停方式
+## Task 暂停与 Activity 停稳返回
 
-1. 保留调用：ActivityContext::register_control 或 ctx.set_activity_control 为下一次 activity
-   提供 ActivityControl。suspend 必须等到领域动作实际停稳才返回；原 activity.await 仍等待业务结果。
-   Workflow::run_condition 检查满足后才调用 resume。不同 Workflow 可选择不同领域命令。
-2. 返回进度：服务读取 ActivityContext::control()，停稳后返回自己的类型化部分结果。
-   原 activity.await 返回该结果；Workflow 保存 checkpoint，再调用 wait_until_runnable 确认整个 Task 暂停。
-   恢复并通过 run_condition 后发起下一次普通 activity，TaskId 不变。
+控制 token 随 ActivityContext 交给服务；服务观察 `control()`，停稳后返回自己的类型化结果。
+原 activity.await 返回该结果；Workflow 保存 checkpoint，再调用 wait_until_runnable 确认 Task 暂停。
+恢复并通过 RunCondition 后，Workflow 显式发起下一次普通 Activity，TaskId 不变。
+必做步骤可使用 `ctx.activity(&client, request).uninterruptible().await`。它从资源获取到真实回复
+屏蔽 Task 取消/暂停（包括调用前已请求的取消），返回业务结果后由下一普通边界处理控制请求。
+宿主关闭/失主、服务关闭和资源隔离不被屏蔽；不提供自动重试或跨崩溃 exactly-once。
+`RunControl::has_started()` 表示 Driver 已进入 Workflow 业务体，调度器在此前不会因后继替换取消它。
+没有 ActivityControl hook、Activity 暂停实例或第二种 Activity。
+`ActivityExit::Suspended` 是安全结束的一次调用的结果，不是 ActivityState；历史记录为 Completed。
+暂停与完成竞态时保留实际结果；取消也必须等在途业务收尾。
+
+完整请求链与代码入口见 [TaskCenter 控制说明](../../docs/task-center.md)。
 
 RunCondition 返回 Blocked 时状态为 WaitingConditions；条件变化后调用 RunControl::recheck 或观察句柄的
 recheck(id)，不自动忙轮询。guard 必须只读且允许取消，不能承担远端提交。
 suspend/resume/cancel 是请求；暂停确认需 wait_suspended，取消确认需等待终态。
 ControlToken::cancellation_reason 区分用户 Requested 与宿主/主轮次撤销 Interrupted。
-完整的安全、恢复边界和示例见 [规格](../../docs/changes/2026-10-24-unified-task-controls.md)。
+完整的控制、恢复边界和示例见 [当前规格](../../docs/changes/2026-10-24-simple-task-rules.md)。
 
 ## 验证
 

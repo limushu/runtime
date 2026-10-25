@@ -29,6 +29,9 @@ impl TierService {
             deleted: Mutex::default(),
         }
     }
+    pub(crate) fn restore(&self, tiers: Vec<Tier>) {
+        *self.tiers.lock().unwrap() = tiers.into_iter().map(|t| (t.id.clone(), t)).collect();
+    }
     pub async fn execute(&self, request: TierCommand) -> Outcome<TierReply> {
         match request {
             TierCommand::Create(id) => {

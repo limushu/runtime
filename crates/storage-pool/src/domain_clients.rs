@@ -22,6 +22,13 @@ use crate::{
 use std::sync::Arc;
 use workflow_foundation::{ActivityClient, WorkflowDriver};
 
+pub(crate) struct DomainSnapshot {
+    pub nodes: Vec<PoolNode>,
+    pub tiers: Vec<Tier>,
+    pub disks: DiskMetadata,
+    pub volumes: VdMetadata,
+}
+
 #[derive(Clone)]
 pub struct Domains {
     pub(crate) pool: PoolId,
@@ -43,6 +50,16 @@ impl Domains {
         data_plane: Arc<dyn DataPlane>,
         balance: Option<Arc<dyn BalanceBackend>>,
     ) -> Outcome<Self> {
+        Self::register_with_snapshot(driver, pool, metadata, data_plane, balance, None)
+    }
+    pub(crate) fn register_with_snapshot(
+        driver: &mut WorkflowDriver,
+        pool: PoolId,
+        metadata: Arc<dyn MetadataStore>,
+        data_plane: Arc<dyn DataPlane>,
+        balance: Option<Arc<dyn BalanceBackend>>,
+        snapshot: Option<DomainSnapshot>,
+    ) -> Outcome<Self> {
         let disk_state = Arc::new(DiskService::new(
             pool.clone(),
             metadata.clone(),
@@ -53,10 +70,18 @@ impl Domains {
             metadata.clone(),
             data_plane.clone(),
         ));
+        let node = NodeService::new(pool.clone(), data_plane);
+        let tier = TierService::new(pool.clone(), metadata);
+        if let Some(snapshot) = snapshot {
+            disk_state.restore(snapshot.disks);
+            vd_state.restore(snapshot.volumes);
+            node.restore(snapshot.nodes);
+            tier.restore(snapshot.tiers);
+        }
         Ok(Self {
-            tier: driver.register("tier", TierHost(TierService::new(pool.clone(), metadata)))?,
+            tier: driver.register("tier", TierHost(tier))?,
             disk: driver.register("disk", DiskHost(disk_state.clone()))?,
-            node: driver.register("node", NodeHost(NodeService::new(pool.clone(), data_plane)))?,
+            node: driver.register("node", NodeHost(node))?,
             vd: driver.register("vd", VdHost(vd_state.clone()))?,
             balance: balance
                 .map(|backend| driver.register("balance", BalanceHost(backend)))

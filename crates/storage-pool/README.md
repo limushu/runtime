@@ -9,6 +9,7 @@
 | --- | --- |
 | [pool.rs](src/pool.rs) | 组合根、Pool 生命周期、对外业务入口 |
 | [manager](src/manager/mod.rs) | 多索引句柄目录、公平扇出与逐池汇聚；业务由 Pool 推进 |
+| [leadership.rs](src/manager/leadership.rs) | 注入 TaskStore、接主激活、恢复领域和成员索引、失主停稳 |
 | [task_center](src/task_center/mod.rs) | 协调状态、队列、占用和交接 |
 | [conflicts.rs](src/task_center/conflicts.rs) | 单一业务冲突判断入口 |
 | [workflows](src/workflows/mod.rs) | 完整业务流程，读写步骤均经 Activity |
@@ -38,6 +39,10 @@ model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的
 
 ## 使用与观察
 
+需要主备切换时，通过 `with_task_ids`、`with_task_store` 和异步 `activate(PoolRecovery)` 启动；
+该入口的 `pool.shrink()` 自动持久化。降主使用 `manager.demote()`，新宿主以更新轮次重新激活。
+完整运行示例和边界见 [主备切换](../../docs/leader-handoff.md)。下面的 create_pool 示例保留内存模式。
+
 ```rust,ignore
 let manager = PoolManager::new(config, metadata, data_plane);
 let pool = manager.create_pool(PoolId::new("pool-a")?)?;
@@ -62,7 +67,7 @@ execution() 提供 Runtime 执行计数。TaskId 包含创建轮次、池 UUID�
 PoolManager::with_task_ids 注入同一主共享的分配器；默认本地模式不承诺跨重启有序。
 普通历史按 Config::task_history 有界保留，Uncertain 保留；observer 不因历史淘汰失效。
 用户暂停与策略暂停分别记录，blockers 表示实时等待者；details 由 Workflow 自定义。
-基础库支持可选 checkpoint 恢复，现有存储业务默认仍为 Memory。
+未配置持久化的默认路径仍为 Memory；通过 activate 启动的持久化 Pool，其缩容任务使用 checkpoint 恢复。
 
 规则扩展见 [TaskCenter 开发说明](../../docs/task-center.md)。TaskCenter::with_policy 接受
 SchedulingPolicy<PoolOperation>；默认 PoolSchedulingPolicy 提供 topo 优先于缩容的停稳交接。
@@ -78,8 +83,10 @@ cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example task_center
 cargo run --locked -p storage-pool --example shrink_commands
 cargo run --locked -p storage-pool --example managed_shrink
+cargo run --locked -p storage-pool --example leader_handoff
 ```
 
 shrink_commands 是执行控制示例，不代表生产缩容已实现。DESIGN.md 仅保留阶段性历史。
-managed_shrink 演示两种暂停契约、恢复前检查、统一 Task 观测与 Workflow 自声明持久化；
+managed_shrink 演示 token 停稳返回契约、恢复前检查、统一 Task 观测与 Workflow 自声明持久化；
 使用内存后端及模拟迁移，不包含真实的数据迁移、成员移除或 PoolManager 持久化装配。
+leader_handoff 使用文件 TaskStore 和正式 PoolManager 入口，覆盖接主、降主、暂停保持、重新准入及成员清理。

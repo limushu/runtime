@@ -53,6 +53,18 @@ impl VdService {
             data_plane,
         }
     }
+    pub(crate) fn restore(&self, state: VdMetadata) {
+        *self.volumes.lock().unwrap() = state
+            .volumes
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
+        *self.deleted.lock().unwrap() = state
+            .deleted
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
+    }
     pub async fn execute(
         &self,
         request: VdCommand,

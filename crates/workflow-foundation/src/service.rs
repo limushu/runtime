@@ -1,4 +1,4 @@
-use crate::{model::Scope, workflow::ActivityGuard, *};
+use crate::{driver::execution::ActivityGuard, model::Scope, *};
 use async_trait::async_trait;
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{panic::AssertUnwindSafe, sync::Arc};
@@ -7,6 +7,15 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+
+/// Completed finishes the business step. Suspended ends this invocation after
+/// actual effects and callback lifetimes have settled, retaining only resumable
+/// data. Cancellation uses Err(Failure::Cancelled), never Suspended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityExit<T, C> {
+    Completed(T),
+    Suspended(C),
+}
 
 /// Runtime adapter protocol, not a DDD domain service. Business capabilities live behind it.
 #[async_trait]
@@ -31,7 +40,6 @@ pub struct ActivityContext {
     pub id: ActivityId,
     pub(crate) cancel: CancellationToken,
     pub(crate) control: ControlToken,
-    pub(crate) hooks: watch::Sender<Option<Arc<dyn ActivityControl>>>,
     pub(crate) progress: watch::Sender<TaskProgress>,
 }
 impl ActivityContext {
@@ -51,27 +59,6 @@ impl ActivityContext {
     pub fn control(&self) -> ControlToken {
         self.control.clone()
     }
-    /// Optional support for retaining this same ordinary activity during a pause.
-    pub fn register_control(&self, adapter: Arc<dyn ActivityControl>) -> Outcome<()> {
-        let mut duplicate = false;
-        self.hooks.send_if_modified(|slot| {
-            if slot.is_some() {
-                duplicate = true;
-                false
-            } else {
-                *slot = Some(adapter);
-                true
-            }
-        });
-        if duplicate {
-            Err(Failure::Rejected(
-                "activity control already registered".into(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancel
     }

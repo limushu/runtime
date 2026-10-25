@@ -10,17 +10,6 @@ async fn bounded<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("stalled scheduler")
 }
 struct Pause(mpsc::UnboundedSender<oneshot::Sender<()>>);
-#[async_trait]
-impl ActivityControl for Pause {
-    async fn suspend(&self) -> Outcome<()> {
-        let (tx, rx) = oneshot::channel();
-        self.0.send(tx).unwrap();
-        rx.await.map_err(|_| Failure::Unavailable)
-    }
-    async fn resume(&self) -> Outcome<()> {
-        Ok(())
-    }
-}
 struct Worker {
     started: mpsc::UnboundedSender<(String, oneshot::Sender<()>)>,
     pause: Arc<Pause>,
@@ -28,19 +17,34 @@ struct Worker {
 #[async_trait]
 impl ServiceHandler for Worker {
     type Request = String;
-    type Reply = ();
+    type Reply = ActivityExit<(), ()>;
     type Query = ();
     type View = ();
     fn resources(_: &String) -> Vec<ResourceAccess> {
         vec![]
     }
-    async fn execute(&self, name: String, ctx: ActivityContext) -> Outcome<()> {
-        if name == "scan" {
-            ctx.register_control(self.pause.clone())?;
-        }
+    async fn execute(&self, name: String, ctx: ActivityContext) -> Outcome<Self::Reply> {
         let (tx, rx) = oneshot::channel();
-        self.started.send((name, tx)).unwrap();
-        tokio::select! { _ = ctx.cancellation().cancelled() => Err(Failure::Cancelled), r = rx => r.map_err(|_| Failure::Unavailable) }
+        self.started.send((name.clone(), tx)).unwrap();
+        let mut control = ctx.control();
+        tokio::pin!(rx);
+        loop {
+            if control.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            if name == "scan" && control.request().paused() {
+                let (tx, ack) = oneshot::channel();
+                self.pause.0.send(tx).unwrap();
+                return tokio::select! {
+                    _ = control.cancelled() => Err(Failure::Cancelled),
+                    r = ack => { r.map_err(|_| Failure::Unavailable)?; Ok(ActivityExit::Suspended(())) },
+                };
+            }
+            tokio::select! {
+                _ = control.changed() => {},
+                r = &mut rx => { r.map_err(|_| Failure::Unavailable)?; return Ok(ActivityExit::Completed(())); }
+            }
+        }
     }
     fn query(&self, _: ()) -> Outcome<()> {
         Ok(())
@@ -62,7 +66,12 @@ impl Workflow for Work {
         }
     }
     async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
-        ctx.activity(&self.client, self.name).await
+        loop {
+            match ctx.activity(&self.client, self.name.clone()).await? {
+                ActivityExit::Completed(()) => return Ok(()),
+                ActivityExit::Suspended(()) => ctx.wait_until_runnable().await?,
+            }
+        }
     }
 }
 
@@ -80,14 +89,11 @@ impl workflow_foundation::persistence::TaskStore for RejectWrites {
 }
 struct Replace;
 impl SchedulingPolicy<PoolOperation> for Replace {
-    fn admission(&self, _: &PoolOperation, _: &PoolOperation) -> Conflict {
+    fn on_task(&self, _: &PoolOperation, _: &PoolOperation) -> Conflict {
         Conflict {
             decision: ConflictDecision::CancelThenWait,
             reason: "replacement",
         }
-    }
-    fn relation(&self, _: &PoolOperation, _: &PoolOperation) -> Relation {
-        Relation::Exclusive
     }
 }
 #[tokio::test]
@@ -148,19 +154,21 @@ impl PoolWorkflow for Work {
 }
 struct Policy;
 impl SchedulingPolicy<PoolOperation> for Policy {
-    fn admission(&self, _: &PoolOperation, _: &PoolOperation) -> Conflict {
-        Conflict {
-            decision: ConflictDecision::Wait,
-            reason: "custom",
-        }
-    }
-    fn relation(&self, task: &PoolOperation, other: &PoolOperation) -> Relation {
-        if task.kind == OperationKind::Custom("scan".into())
-            && other.kind == OperationKind::Custom("maintenance".into())
+    fn on_task(&self, existing: &PoolOperation, incoming: &PoolOperation) -> Conflict {
+        let decision = if existing.kind == OperationKind::Custom("scan".into())
+            && incoming.kind == OperationKind::Custom("maintenance".into())
         {
-            Relation::YieldTo("maintenance")
+            ConflictDecision::SuspendThenWait
+        } else if existing.kind == OperationKind::Custom("maintenance".into())
+            && incoming.kind == OperationKind::Custom("scan".into())
+        {
+            ConflictDecision::Wait
         } else {
-            Relation::Independent
+            ConflictDecision::Independent
+        };
+        Conflict {
+            decision,
+            reason: "maintenance",
         }
     }
 }
@@ -187,7 +195,7 @@ async fn policy_waits_for_real_ack_exposes_live_blockers_and_preserves_user_paus
         })
         .await
         .unwrap();
-    let (name, finish_scan) = bounded(events.recv()).await.unwrap();
+    let (name, _first_scan) = bounded(events.recv()).await.unwrap();
     assert_eq!(name, "scan");
     let mut maintenance = center
         .submit(Work {
@@ -217,6 +225,145 @@ async fn policy_waits_for_real_ack_exposes_live_blockers_and_preserves_user_paus
     })
     .await;
     scan.control.resume().unwrap();
+    let (name, finish_scan) = bounded(events.recv()).await.unwrap();
+    assert_eq!(name, "scan");
+    finish_scan.send(()).unwrap();
+    bounded(scan.result()).await.unwrap();
+    center.shutdown().await.unwrap();
+}
+
+struct Veto;
+impl SchedulingPolicy<PoolOperation> for Veto {
+    fn on_task(&self, existing: &PoolOperation, incoming: &PoolOperation) -> Conflict {
+        if existing.kind == OperationKind::Custom("guard".into())
+            && incoming.kind == OperationKind::Custom("maintenance".into())
+        {
+            Conflict {
+                decision: ConflictDecision::Reject("guard refuses maintenance"),
+                reason: "guard",
+            }
+        } else {
+            Policy.on_task(existing, incoming)
+        }
+    }
+}
+#[tokio::test]
+async fn rejection_by_one_task_does_not_suspend_another() {
+    let (started, mut events) = mpsc::unbounded_channel();
+    let (pauses, mut ack) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let mut driver = WorkflowDriver::new("pool", config.clone()).unwrap();
+    let client = driver
+        .register(
+            "worker",
+            Worker {
+                started,
+                pause: Arc::new(Pause(pauses)),
+            },
+        )
+        .unwrap();
+    let center = TaskCenter::with_policy(driver, &config, Arc::new(Veto));
+    let mut scan = center
+        .submit(Work {
+            name: "scan".into(),
+            client: client.clone(),
+        })
+        .await
+        .unwrap();
+    let (_, finish_scan) = bounded(events.recv()).await.unwrap();
+    let mut guard = center
+        .submit(Work {
+            name: "guard".into(),
+            client: client.clone(),
+        })
+        .await
+        .unwrap();
+    let (_, finish_guard) = bounded(events.recv()).await.unwrap();
+    assert!(
+        center
+            .submit(Work {
+                name: "maintenance".into(),
+                client
+            })
+            .await
+            .is_err()
+    );
+    assert!(!scan.control.suspend_requested());
+    assert!(ack.try_recv().is_err());
+    finish_scan.send(()).unwrap();
+    finish_guard.send(()).unwrap();
+    bounded(scan.result()).await.unwrap();
+    bounded(guard.result()).await.unwrap();
+    center.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn only_queue_head_owns_pause_and_next_head_takes_over_without_resuming_scan() {
+    let (started, mut events) = mpsc::unbounded_channel();
+    let (pauses, mut ack) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let mut driver = WorkflowDriver::new("pool", config.clone()).unwrap();
+    let client = driver
+        .register(
+            "worker",
+            Worker {
+                started,
+                pause: Arc::new(Pause(pauses)),
+            },
+        )
+        .unwrap();
+    let center = TaskCenter::with_policy(driver, &config, Arc::new(Policy));
+    let mut scan = center
+        .submit(Work {
+            name: "scan".into(),
+            client: client.clone(),
+        })
+        .await
+        .unwrap();
+    let (_, _old_call) = bounded(events.recv()).await.unwrap();
+    let mut first = center
+        .submit(Work {
+            name: "maintenance".into(),
+            client: client.clone(),
+        })
+        .await
+        .unwrap();
+    let stopping = bounded(ack.recv()).await.unwrap();
+    let mut second = center
+        .submit(Work {
+            name: "maintenance".into(),
+            client,
+        })
+        .await
+        .unwrap();
+    assert!(events.try_recv().is_err());
+    stopping.send(()).unwrap();
+    let (_, finish_one) = bounded(events.recv()).await.unwrap();
+    assert!(
+        events.try_recv().is_err(),
+        "second maintenance stays behind the head"
+    );
+    assert_eq!(scan.control.suspend_reasons().len(), 1);
+    assert_eq!(center.task(second.id()).unwrap().blockers, vec![first.id()]);
+    finish_one.send(()).unwrap();
+    let (name, finish_two) = bounded(events.recv()).await.unwrap();
+    assert_eq!(
+        name, "maintenance",
+        "scan must not restart between queue heads"
+    );
+    assert_eq!(scan.control.suspend_reasons().len(), 1);
+    assert!(
+        !scan
+            .control
+            .suspend_reasons()
+            .iter()
+            .any(|r| r.contains(&first.id().to_string()))
+    );
+    finish_two.send(()).unwrap();
+    bounded(first.result()).await.unwrap();
+    bounded(second.result()).await.unwrap();
+    let (name, finish_scan) = bounded(events.recv()).await.unwrap();
+    assert_eq!(name, "scan");
     finish_scan.send(()).unwrap();
     bounded(scan.result()).await.unwrap();
     center.shutdown().await.unwrap();

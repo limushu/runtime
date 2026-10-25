@@ -10,7 +10,6 @@ pub enum ActivityState {
     /// Includes waiting for space in the service mailbox.
     Queued,
     Running,
-    Suspended,
     Completed,
     Failed(Failure),
 }
@@ -272,24 +271,6 @@ impl TaskRegistry {
     }
 }
 
-/// Business-neutral scheduling explanation, shared by every observation entry point.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictDecision {
-    Independent,
-    Wait,
-    CancelThenWait,
-    Reject(&'static str),
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Conflict {
-    pub decision: ConflictDecision,
-    pub reason: &'static str,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConflictMatch {
-    pub existing: TaskId,
-    pub conflict: Conflict,
-}
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskInfo {
     pub details: serde_json::Value,

@@ -1,20 +1,181 @@
-//! Cooperative controls for existing activities. A notification is never a safe-stop ACK.
+//! Task control: requests (RunControl), delivery (ControlToken), confirmation
+//! (Controls). Driver execution persists control intent before cancellation delivery.
+//! WorkflowContext in workflow.rs consumes Activity replies and acknowledges a
+//! pause at wait_until_runnable, after business checkpoint handling has finished.
 use crate::*;
-use async_trait::async_trait;
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-/// Completed finishes the business step. Suspended ends this invocation after
-/// actual effects and callback lifetimes have settled, retaining only resumable
-/// data. Cancellation uses Err(Failure::Cancelled), never Suspended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivityExit<T, C> {
-    Completed(T),
-    Suspended(C),
+#[derive(Clone)]
+pub struct RunControl {
+    pub id: TaskId,
+    pub name: &'static str,
+    pub(crate) cancel: CancellationToken,
+    pub(crate) signals: mpsc::Sender<Signal>,
+    pub(crate) state: watch::Receiver<RunState>,
+    pub(crate) max_signal_bytes: usize,
+    pub(crate) controls: crate::control::Controls,
+    pub(crate) durable: bool,
+    pub(crate) acceptance: watch::Receiver<Option<Outcome<()>>>,
+    pub(crate) info: watch::Sender<TaskInfo>,
+    pub(crate) progress: watch::Receiver<TaskProgress>,
+    pub(crate) activities: watch::Receiver<ActivityHistory>,
+    pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
+}
+impl RunControl {
+    /// None while durable registration is pending. Not a workflow completion result.
+    pub fn acceptance_status(&self) -> Option<Outcome<()>> {
+        self.acceptance.borrow().clone()
+    }
+    /// Request a pause at the next safe boundary, not preemption of external IO.
+    pub fn suspend(&self) -> Outcome<()> {
+        self.set_suspended(true)
+    }
+    pub fn resume(&self) -> Outcome<()> {
+        self.set_suspended(false)
+    }
+    fn set_suspended(&self, value: bool) -> Outcome<()> {
+        if self.cancel.is_cancelled()
+            || matches!(self.state(), RunState::Completed | RunState::Failed(_))
+        {
+            return Err(Failure::Rejected("run is cancelled or terminal".into()));
+        }
+        self.controls.update(|reasons| {
+            if value {
+                reasons.insert("user".into());
+            } else {
+                reasons.remove("user");
+            }
+        });
+        Ok(())
+    }
+    pub fn set_blockers(&self, blockers: Vec<TaskId>) {
+        self.info.send_if_modified(|info| {
+            if info.blockers == blockers {
+                false
+            } else {
+                info.blockers = blockers;
+                true
+            }
+        });
+    }
+    pub fn explain(&self, conflicts: Vec<ConflictMatch>, blockers: Vec<TaskId>) {
+        self.info.send_modify(|info| {
+            info.conflicts = conflicts;
+            info.blockers = blockers;
+        });
+    }
+    pub fn progress(&self) -> TaskProgress {
+        self.progress.borrow().clone()
+    }
+    pub fn activities(&self) -> ActivityHistory {
+        self.activities.borrow().clone()
+    }
+    pub fn suspend_requested(&self) -> bool {
+        self.controls.tx.borrow().paused()
+    }
+    pub fn suspend_acknowledged(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && !matches!(
+                self.state.borrow().clone(),
+                RunState::Completed | RunState::Failed(_)
+            )
+            && self.controls.acknowledged()
+    }
+    pub fn suspend_reasons(&self) -> std::collections::BTreeSet<String> {
+        self.controls.reasons()
+    }
+    pub fn set_policy_suspensions(&self, reasons: &std::collections::BTreeSet<String>) {
+        self.controls.update(|current| {
+            current.retain(|s| !s.starts_with("policy:"));
+            current.extend(reasons.iter().map(|s| format!("policy:{s}")));
+        });
+    }
+    pub fn recheck(&self) {
+        self.controls.recheck.notify_one();
+    }
+    /// Cancellation-safe wait for acknowledgement, not merely request delivery.
+    pub async fn wait_suspended(&self) -> Outcome<()> {
+        let mut state = self.state.clone();
+        let mut request = self.controls.tx.subscribe();
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            if !request.borrow_and_update().paused() {
+                return Err(Failure::Rejected("pause request is not active".into()));
+            }
+            match state.borrow_and_update().clone() {
+                RunState::Suspended if self.suspend_acknowledged() => return Ok(()),
+                RunState::Completed | RunState::Failed(_) => {
+                    return Err(Failure::Rejected(
+                        "run ended before pause acknowledgement".into(),
+                    ));
+                }
+                _ => {}
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
+                _ = self.controls.changed.notified() => {},
+                changed = state.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+                changed = request.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
+            }
+        }
+    }
+    pub fn cancel(&self) {
+        self.controls
+            .user_cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.controls.revoke();
+        if self.durable {
+            self.controls.tx.send_modify(|r| r.generation += 1);
+        } else {
+            self.cancel.cancel();
+        }
+    }
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancel.is_cancelled()
+            || self
+                .controls
+                .user_cancelled
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// True only after the Workflow body has been entered, not merely released
+    /// from its queue. Schedulers must not replace a task before this boundary.
+    pub fn has_started(&self) -> bool {
+        self.controls
+            .entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn state(&self) -> RunState {
+        if self.suspend_acknowledged() {
+            RunState::Suspended
+        } else {
+            self.state.borrow().clone()
+        }
+    }
+    pub async fn changed(&mut self) -> Outcome<RunState> {
+        tokio::select! {
+            r = self.state.changed() => { r.map_err(|_| Failure::Unavailable)?; },
+            _ = self.controls.changed.notified() => {},
+        }
+        Ok(self.state())
+    }
+    pub async fn signal(&self, signal: Signal) -> Outcome<()> {
+        if signal.name.trim().is_empty()
+            || signal.name.len().saturating_add(signal.payload.len()) > self.max_signal_bytes
+        {
+            return Err(Failure::Rejected("invalid or oversized signal".into()));
+        }
+        self.signals
+            .send(signal)
+            .await
+            .map_err(|_| Failure::Unavailable)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,25 +187,6 @@ impl ControlRequest {
     pub fn paused(&self) -> bool {
         !self.suspend_reasons.is_empty()
     }
-}
-
-/// Optional adapter for an operation which remains pending while safely stopped.
-/// These methods issue and await domain commands; the framework knows no domain commands.
-#[async_trait]
-pub trait ActivityControl: Send + Sync + 'static {
-    async fn suspend(&self) -> Outcome<()>;
-    async fn resume(&self) -> Outcome<()>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Readiness {
-    Ready,
-    Blocked(String),
-}
-/// Business-defined, side-effect-free check. It can use stage state shared with run().
-#[async_trait]
-pub trait RunCondition: Send + Sync + 'static {
-    async fn check(&self) -> Outcome<Readiness>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +240,7 @@ pub(crate) struct Controls {
     pub changed: Arc<Notify>,
     pub recheck: Arc<Notify>,
     pub user_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub entered: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Controls {
     pub fn new(wake: Arc<Notify>) -> Self {
@@ -108,6 +251,7 @@ impl Controls {
             changed: Arc::default(),
             recheck: Arc::default(),
             user_cancelled: Arc::default(),
+            entered: Arc::default(),
         }
     }
     pub fn token(&self, cancel: CancellationToken) -> ControlToken {

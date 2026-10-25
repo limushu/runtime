@@ -13,6 +13,7 @@
 
 主流程用 `loop + match progress.stage` 穷举全部阶段，每轮处理一个阶段。
 从检查点恢复时直接进入保存的阶段；新增阶段需要补齐对应的 `match` 分支。
+Migrate 阶段调用 `migrate_to_completion`，由这个具名业务方法显式处理停稳返回与续作。
 
 | 当前阶段 | 动作或结果 | 下一阶段 |
 | --- | --- | --- |
@@ -76,9 +77,9 @@ let task = pool.current_shrink(); // 不要求 REST 客户端保存 TaskId
 普通 topo 先于排队的缩容；在途缩容先实际停稳、保存检查点、确认挂起，topo 才能开始。
 用户挂起与每个 topo 原因分别维护。topo 完成仅移除自己的原因。
 
-默认策略的排队优先级为 topo > 其他操作 > shrink，同级 FIFO。运行中的资源占用仍须等待
-实际结束或允许的 YieldTo 停稳交接。这个排序修正了旧版本的 shrink → topo → volume → shrink 等待环。
-自定义 SchedulingPolicy 的 YieldTo 与 priority 必须保持一致，不自动消解任意自定义策略的环。
+默认策略只有 `on_task(existing, incoming)`：已有拓扑则新缩容等待；已有缩容则新拓扑请求暂停并等实际确认。
+缩容与普通卷操作允许并行；没有以对象重叠推导出的全流程互斥，也没有数值 priority。
+普通卷操作和拓扑有明确冲突时，拓扑仍等待卷操作结束。完整规则见 [TaskCenter](task-center.md)。
 
 ## 控制语义
 
@@ -101,7 +102,8 @@ ActivityExit::Suspended(MigrationCheckpoint)
 - Err(Failure::Cancelled) 表示取消后已停稳。取消后的 Task 是终态，不能 resume，也不进入自动恢复。
 - 取消不撤销已经迁移的数据，也不自动恢复目标盘分配。重新开放分配需要显式管理决策。
 - 当前 Activity 历史中的 Completed 表示调用已经结束。整个迁移步骤是否完成由 ActivityExit 及 WF 阶段表达。
-- 基础框架仍支持 ActivityControl 的“保留调用”模式；新 ShrinkWorkflow 采用“停稳返回”模式。
+- 暂停只有 token 停稳返回路径；不再提供 ActivityControl hook 或保留 Activity 执行实例。
+- `migrate_to_completion` 明确表达调用、保存检查点、等待恢复和再调用；外层阶段 match 保持简短。
 
 ## C 包装层
 
@@ -123,17 +125,18 @@ Future 或进程内句柄。恢复信息可以引用 C 侧持久化的业务状�
 
 ## 可选持久化
 
-PoolManager 的快捷创建入口仍使用内存任务。持久化组合根使用已有的 Driver 接口：
+PoolManager 的快捷 create/create_pool 入口保留内存模式。正式持久化入口完成领域视图、成员索引、
+Driver 和 TaskCenter 的统一装配，PoolHandle::shrink 自动声明 Durable：
 
 ```rust,ignore
-let mut driver = WorkflowDriver::new(pool_id.as_str(), config.clone())?
-    .with_task_ids(pool_uuid, TaskIds::for_leader(leader_epoch)?)?;
-let domains = Domains::register(&mut driver, pool_id, metadata, data_plane, Some(balance))?;
-driver.define::<ShrinkWorkflow>(Dependencies::default().with(domains.clone()))?;
-driver.enable_persistence(task_store).await?;
-let restored = driver.restore().await?;
-let center = TaskCenter::from_restored(driver, &config, Arc::new(PoolSchedulingPolicy), restored)?;
-let run = center.submit(ShrinkWorkflow::new(request, domains)?.durable()).await?;
+let manager = PoolManager::new(config, metadata, data_plane)
+    .with_task_ids(TaskIds::for_leader(leader_epoch)?)
+    .with_task_store(task_store)
+    .with_balance(balance);
+let pool = manager.activate(recovery).await?;
+let run = pool.shrink(request).await?;
+// 失去主身份，等待在途效果停稳：
+manager.demote().await?;
 ```
 
 TaskStore 可替换为自己的 KV 实现，须提供已有接口要求的持久提交、owner epoch fencing 和 revision CAS。
@@ -142,11 +145,13 @@ TaskStore 可替换为自己的 KV 实现，须提供已有接口要求的持久
 检查点写失败按 Uncertain 隔离，不当作普通失败释放占用。用户暂停状态恢复后继续保持暂停。
 
 此变更没有实现全量 Activity 历史归档。TaskStore 中的任务续作记录与长期审计查询是不同能力。
+文件日志重开、同一 TaskId 接管、用户暂停保持和重新准入的完整例子见 [主备切换](leader-handoff.md)。
 
 ## 演示与验证
 
 ```sh
 cargo run --locked -p storage-pool --example shrink_workflow
+cargo run --locked -p storage-pool --example leader_handoff
 cargo test --locked -p storage-pool --test shrink_workflow
 ```
 

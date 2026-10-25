@@ -12,6 +12,7 @@ cargo run --locked -p storage-pool --example pool_lifecycle
 cargo run --locked -p storage-pool --example shrink_commands
 cargo run --locked -p storage-pool --example task_center
 cargo run --locked -p storage-pool --example managed_shrink
+cargo run --locked -p storage-pool --example leader_handoff
 ```
 
 PowerShell 可执行 `./scripts/verify.ps1`，依次检查格式、测试、文档测试和 Clippy。
