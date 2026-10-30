@@ -1,4 +1,5 @@
 //! Business-free execution mechanics; applications can drive workflows in their own event loop.
+mod activity;
 mod driver;
 mod identity;
 pub use identity::{TaskId, TaskIds};
@@ -9,6 +10,7 @@ mod standalone;
 mod tasks;
 mod workflow;
 
+pub use activity::{Activity, ActivityAction, ActivityScope};
 pub use driver::execution::Run;
 pub use driver::recovery::Restored;
 pub use driver::{ExecutionView, StartPermit, WorkflowDriver};

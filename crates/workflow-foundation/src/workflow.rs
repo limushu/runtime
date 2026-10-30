@@ -281,6 +281,7 @@ impl WorkflowContext {
             context: Some(self),
             service,
             request: Some(request),
+            name: None,
             uninterruptible: false,
             future: None,
         }
@@ -295,7 +296,11 @@ impl WorkflowContext {
         service: &ActivityClient<R, P, Q, V>,
         request: R,
         uninterruptible: bool,
+        name: Option<&'static str>,
     ) -> Outcome<P> {
+        if name.is_some_and(|name| name.trim().is_empty() || name.len() > 256) {
+            return Err(Failure::Rejected("invalid Activity name".into()));
+        }
         if uninterruptible {
             // Task control may already be requested. Mandatory work still runs;
             // host shutdown/fencing and resource safety are never bypassed.
@@ -324,7 +329,7 @@ impl WorkflowContext {
             self.activity_history,
             id,
             service.name.to_string(),
-            (service.activity_name)(&request),
+            name.unwrap_or_else(|| (service.activity_name)(&request)),
             resources.clone(),
         );
         let permit: Outcome<Permit> = async {
@@ -446,10 +451,20 @@ pub struct ActivityCall<'a, R, P, Q, V> {
     context: Option<&'a mut WorkflowContext>,
     service: &'a ActivityClient<R, P, Q, V>,
     request: Option<R>,
+    name: Option<&'static str>,
     uninterruptible: bool,
     future: Option<BoxFuture<'a, Outcome<P>>>,
 }
 impl<R, P, Q, V> ActivityCall<'_, R, P, Q, V> {
+    /// Override the observation label for this service invocation.
+    pub fn name(mut self, name: &'static str) -> Self {
+        assert!(
+            self.future.is_none(),
+            "configure an Activity before polling it"
+        );
+        self.name = Some(name);
+        self
+    }
     /// Defer task cancellation and suspension through resource acquisition,
     /// dispatch and the actual reply, even if already requested before dispatch.
     /// Return the business result so the caller can save its checkpoint. The next
@@ -479,6 +494,7 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
                 this.service,
                 this.request.take().unwrap(),
                 this.uninterruptible,
+                this.name,
             )));
         }
         this.future.as_mut().unwrap().as_mut().poll(cx)

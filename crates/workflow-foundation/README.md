@@ -84,6 +84,56 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 多资源原子取得、读共享/写独占、冲突等待者 FIFO。不支持并行 Activity 或动态扩展流程对象。
 跨服务的同一资源必须使用同一个 key；框架不会推断业务拓扑。
 
+### 可选的 Activity trait
+
+需要解释业务结果、重试或停稳后续作时，实现 `Activity`，WF 只等待最终结果：
+
+```rust,ignore
+let migrated = ctx.run_activity(MigrateDisks { balance, cursor: 0 }).await?;
+// 只有迁移完成才进入下一步。
+```
+
+步骤提供 `name()`、`execute()` 和 `handle()`。例如均衡服务返回完成或停稳游标：
+
+```rust,ignore
+#[async_trait]
+impl Activity for MigrateDisks {
+    type Reply = ActivityExit<u64, u64>;
+    type Output = u64;
+    fn name(&self) -> &'static str { "shrink.migrate-disks" }
+
+    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
+        scope.call(&self.balance, self.cursor).await
+    }
+    fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<u64>> {
+        Ok(match result? {
+            ActivityExit::Completed(count) => ActivityAction::Continue(count),
+            ActivityExit::Suspended(cursor) => {
+                self.cursor = cursor;
+                ActivityAction::Suspend
+            }
+        })
+    }
+}
+```
+
+`Continue(value)` 返回最终结果；`Retry(delay)` 通过现有 `ctx.sleep()` 等待并重试；
+`Suspend` 通过现有准入边界等待恢复；`Cancel` 终结 Task。重试条件和次数上限由
+`handle()` 根据业务结果及实例字段决定，框架不默认重试错误。`execute()` 返回的
+Cancelled/Uncertain 不进入 handler；handler 主动返回 Cancelled 等价于 Cancel。
+
+暂停和重试保留同一个实例，WF 停在同一个 await。`Suspend` 用于响应 Task 的暂停，
+不代表主动设置一个新的暂停原因；恢复总会重新检查 Workflow 的 RunCondition。
+延迟期间的暂停、取消也复用现有控制机制。在途服务必须真正停稳，框架不丢弃其 Future 来模拟暂停。
+
+外部副作用通过 `scope.call()` 执行；本地长循环通过 `scope.control()` 协作响应控制。
+每次服务调用沿用已有资源锁和 Activity 记录，自动使用 trait 的步骤名；多次调用不构成
+一个原子的资源事务，重试、暂停期间不保留已结束调用的锁。`scope.report_progress()` 使用同一步骤名。
+
+这层只保存进程内状态，不提供 Activity checkpoint、函数适配器或新的历史存储。
+现有 `ctx.activity()` 及缩容 Workflow 的显式持久化路径继续保留。
+可运行的迁移、暂停、重试测试见 [activity_trait.rs](tests/activity_trait.rs)。
+
 ## 控制与安全语义
 
 - 丢弃 Run 或 result 等待者不会取消已接收执行。signal 使用有界缓冲，timer 使用单调时钟。
@@ -124,7 +174,8 @@ let updated = observer.changed().await?; // Activity 更新也会唤醒，不依
 
 `ServiceHandler::activity_name(&request)` 可返回稳定步骤名；默认使用 handler 类型名，
 无须修改已有实现。名称不包含请求/回复载荷。存储适配器按命令命名，例如 `disk.open`。
-循环中的同名步骤通过调用序号区分；失败后显式再次调用也有新序号，框架不自动重试。
+循环中的同名步骤通过调用序号区分；再次调用也有新序号。直接调用不自动重试，
+trait 路径仅在 handler 返回 `Retry` 时重试。
 
 `Config::activity_history` 默认每 task 保留最近 1024 条，必须大于零。
 `activities.total` 是累计调用数，`activities.omitted` 明确给出因上限淘汰的条数；当前在途步骤始终保留。
