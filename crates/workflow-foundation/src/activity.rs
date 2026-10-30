@@ -63,7 +63,7 @@ impl WorkflowContext {
     /// to the Workflow. Local step state is not a persistent checkpoint.
     pub async fn run_activity<A: Activity>(&mut self, mut step: A) -> Outcome<A::Output> {
         let name = step.name();
-        if name.trim().is_empty() || name.len() > 256 {
+        if name.chars().all(char::is_whitespace) || name.len() > 256 {
             return Err(Failure::Rejected("invalid Activity name".into()));
         }
         loop {

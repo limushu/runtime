@@ -129,7 +129,10 @@ impl WorkflowContext {
     /// Observational only. Invalid/oversized reports are ignored, never failing business work.
     pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
         let stage = stage.into();
-        if stage.trim().is_empty() || stage.len() > 256 || total.is_some_and(|t| completed > t) {
+        if stage.chars().all(char::is_whitespace)
+            || stage.len() > 256
+            || total.is_some_and(|t| completed > t)
+        {
             return;
         }
         self.progress.send_replace(TaskProgress {
@@ -283,6 +286,7 @@ impl WorkflowContext {
             request: Some(request),
             name: None,
             uninterruptible: false,
+            configuration_error: false,
             future: None,
         }
     }
@@ -298,7 +302,7 @@ impl WorkflowContext {
         uninterruptible: bool,
         name: Option<&'static str>,
     ) -> Outcome<P> {
-        if name.is_some_and(|name| name.trim().is_empty() || name.len() > 256) {
+        if name.is_some_and(|name| name.chars().all(char::is_whitespace) || name.len() > 256) {
             return Err(Failure::Rejected("invalid Activity name".into()));
         }
         if uninterruptible {
@@ -329,7 +333,10 @@ impl WorkflowContext {
             self.activity_history,
             id,
             service.name.to_string(),
-            name.unwrap_or_else(|| (service.activity_name)(&request)),
+            match name {
+                Some(name) => name,
+                None => (service.activity_name)(&request),
+            },
             resources.clone(),
         );
         let permit: Outcome<Permit> = async {
@@ -373,10 +380,11 @@ impl WorkflowContext {
         // domain must not see task pause/cancel through a second control path.
         let protected_controls =
             uninterruptible.then(|| crate::control::Controls::new(self.controls.wake.clone()));
-        let control = protected_controls
-            .as_ref()
-            .unwrap_or(&self.controls)
-            .token(cancel.clone());
+        let control = match &protected_controls {
+            Some(controls) => controls,
+            None => &self.controls,
+        }
+        .token(cancel.clone());
         let operation = service.dispatch(
             request,
             ActivityContext {
@@ -446,6 +454,8 @@ impl WorkflowContext {
 
 /// Options for the existing Activity invocation, not a separate activity kind.
 /// It remains a Future, including when used in select!/timeout.
+/// Configuring after the first poll returns Rejected on the next poll; any
+/// already dispatched work remains protected by its existing service guard.
 #[must_use = "an Activity does nothing until awaited"]
 pub struct ActivityCall<'a, R, P, Q, V> {
     context: Option<&'a mut WorkflowContext>,
@@ -453,15 +463,13 @@ pub struct ActivityCall<'a, R, P, Q, V> {
     request: Option<R>,
     name: Option<&'static str>,
     uninterruptible: bool,
+    configuration_error: bool,
     future: Option<BoxFuture<'a, Outcome<P>>>,
 }
 impl<R, P, Q, V> ActivityCall<'_, R, P, Q, V> {
     /// Override the observation label for this service invocation.
     pub fn name(mut self, name: &'static str) -> Self {
-        assert!(
-            self.future.is_none(),
-            "configure an Activity before polling it"
-        );
+        self.configuration_error |= self.context.is_none();
         self.name = Some(name);
         self
     }
@@ -471,10 +479,7 @@ impl<R, P, Q, V> ActivityCall<'_, R, P, Q, V> {
     /// ordinary boundary observes the unchanged task control request.
     /// Host shutdown, service failure and lost leadership are NOT masked.
     pub fn uninterruptible(mut self) -> Self {
-        assert!(
-            self.future.is_none(),
-            "configure an Activity before polling it"
-        );
+        self.configuration_error |= self.context.is_none();
         self.uninterruptible = true;
         self
     }
@@ -488,15 +493,31 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
     type Output = Outcome<P>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if this.configuration_error {
+            return Poll::Ready(Err(Failure::Rejected(
+                "configure an Activity before polling it".into(),
+            )));
+        }
         if this.future.is_none() {
-            let context = this.context.take().expect("Activity already started");
+            let (Some(context), Some(request)) = (this.context.take(), this.request.take()) else {
+                return Poll::Ready(Err(Failure::Rejected("Activity already consumed".into())));
+            };
             this.future = Some(Box::pin(context.execute_activity(
                 this.service,
-                this.request.take().unwrap(),
+                request,
                 this.uninterruptible,
                 this.name,
             )));
         }
-        this.future.as_mut().unwrap().as_mut().poll(cx)
+        match &mut this.future {
+            Some(future) => {
+                let result = future.as_mut().poll(cx);
+                if result.is_ready() {
+                    this.future = None;
+                }
+                result
+            }
+            None => Poll::Ready(Err(Failure::Rejected("Activity is not initialized".into()))),
+        }
     }
 }

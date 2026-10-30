@@ -399,3 +399,93 @@ async fn abandoned_trait_waiter_keeps_native_operation_and_lease_until_settled()
     finish(&mut other).await.unwrap();
     runtime.shutdown().await.unwrap();
 }
+
+struct Reconfigure {
+    client: ServiceClient<Probe>,
+    change: Arc<Semaphore>,
+    settled: Arc<Semaphore>,
+    protect: bool,
+}
+#[async_trait]
+impl Workflow for Reconfigure {
+    type Output = usize;
+    const NAME: &'static str = "reconfigure.activity";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<usize> {
+        let mut call = ctx.activity(
+            &self.client,
+            Work::write("native", "disk")
+                .gated(&self.settled)
+                .behavior(Behavior::CancelThenSettle),
+        );
+        tokio::select! {
+            result = &mut call => return result,
+            _ = self.change.acquire() => {},
+        }
+        if self.protect {
+            call.uninterruptible().await
+        } else {
+            call.name("too-late").await
+        }
+    }
+}
+
+#[tokio::test]
+async fn late_configuration_returns_error_and_still_waits_for_native_settlement() {
+    for protect in [false, true] {
+        let (mut runtime, client, mut entered) = setup();
+        let change = Arc::new(Semaphore::new(0));
+        let settled = Arc::new(Semaphore::new(0));
+        let mut run = runtime
+            .submit(Reconfigure {
+                client: client.clone(),
+                change: change.clone(),
+                settled: settled.clone(),
+                protect,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next(&mut entered).await, "native");
+        change.add_permits(1);
+        assert_eq!(next(&mut entered).await, "cancel-observed");
+        let mut other = runtime
+            .submit(Call::new(&client, Work::write("other", "disk")))
+            .await
+            .unwrap();
+        state(&other.control, RunState::WaitingResources).await;
+        assert!(entered.try_recv().is_err());
+        settled.add_permits(1);
+        assert_eq!(
+            finish(&mut run).await,
+            Err(Failure::Rejected(
+                "configure an Activity before polling it".into()
+            ))
+        );
+        assert_eq!(next(&mut entered).await, "other");
+        finish(&mut other).await.unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+struct Repoll(ServiceClient<Probe>);
+#[async_trait]
+impl Workflow for Repoll {
+    type Output = usize;
+    const NAME: &'static str = "repoll.activity";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<usize> {
+        let mut call = ctx.activity(&self.0, Work::write("once", "disk"));
+        (&mut call).await?;
+        (&mut call).await
+    }
+}
+#[tokio::test]
+async fn consumed_call_returns_error_without_reexecuting_or_panicking() {
+    let (mut runtime, client, mut entered) = setup();
+    let mut run = runtime.submit(Repoll(client)).await.unwrap();
+    assert_eq!(
+        finish(&mut run).await,
+        Err(Failure::Rejected("Activity already consumed".into()))
+    );
+    assert_eq!(next(&mut entered).await, "once");
+    assert!(entered.try_recv().is_err());
+    runtime.shutdown().await.unwrap();
+}
