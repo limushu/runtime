@@ -19,13 +19,6 @@ pub struct ActivitySnapshot {
     pub id: ActivityId,
     pub service: String,
     pub name: &'static str,
-    pub description: Option<String>,
-    /// Actual attempts in this invocation, including the first execution.
-    pub attempts: u32,
-    pub last_error: Option<Failure>,
-    /// Why the result handler requested its most recent retry, including Ok replies.
-    pub retry_reason: Option<String>,
-    pub retry_at: Option<SystemTime>,
     pub resources: Vec<ResourceAccess>,
     pub state: ActivityState,
     pub created_at: SystemTime,
@@ -57,7 +50,6 @@ impl ActivityObservation {
         id: ActivityId,
         service: String,
         name: &'static str,
-        description: Option<String>,
         resources: Vec<ResourceAccess>,
     ) -> Self {
         history.send_modify(|history| {
@@ -70,11 +62,6 @@ impl ActivityObservation {
                 id,
                 service,
                 name,
-                description,
-                attempts: 0,
-                last_error: None,
-                retry_reason: None,
-                retry_at: None,
                 resources,
                 state: ActivityState::WaitingResources,
                 created_at: SystemTime::now(),
@@ -102,7 +89,6 @@ impl ActivityObservation {
         self.update(|entry| {
             entry.started_at = Some(SystemTime::now());
             entry.state = ActivityState::Running;
-            entry.attempts = 1;
         });
     }
     pub fn settled<T>(&mut self, result: &Outcome<T>) {
@@ -112,7 +98,6 @@ impl ActivityObservation {
                 Err(error) => ActivityState::Failed(error.clone()),
             };
             entry.finished_at = Some(SystemTime::now());
-            entry.retry_at = None;
         });
         self.finished = true;
     }
@@ -127,7 +112,6 @@ impl ActivityObservation {
                 Failure::Cancelled
             });
             entry.finished_at = Some(SystemTime::now());
-            entry.retry_at = None;
         });
         self.finished = true;
     }
@@ -138,7 +122,7 @@ impl Drop for ActivityObservation {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskProgress {
     pub stage: Option<String>,
     pub completed: u64,

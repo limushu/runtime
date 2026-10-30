@@ -85,6 +85,7 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
     pool.suspend(id)?;
     pool.wait_suspended(id).await?;
     let snapshot = pool.recovery_snapshot().await?;
+    let pool_uuid = id.pool;
     let copied = pool.task(id)?.details["migration"]["progress"]["completed"].clone();
     assert!(copied.as_u64().unwrap() >= 2);
     println!("[2] Task {id} paused after real migration settlement; saved progress={copied}");
@@ -95,7 +96,7 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
             .await
             .is_err()
     );
-    let old_record = store.get(id)?.expect("shrink record");
+    let old_record = store.list(pool_uuid)?.remove(0);
     assert_eq!(old_record.outcome, StoredOutcome::Pending);
     assert!(old_record.user_paused);
     println!(
@@ -142,7 +143,7 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
         pool.task(id)?.details["migration"]["progress"]["completed"],
         copied
     );
-    assert_eq!(pool.history_task(id).await?.owner_epoch, 12);
+    assert_eq!(store.list(pool_uuid)?[0].owner_epoch, 12);
     let mut stale = old_record.clone();
     stale.revision += 1;
     assert!(store.save(stale, Some(old_record.revision)).is_err());
@@ -163,10 +164,7 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
     online.result().await?;
     pool.recheck_task(id)?;
     wait_for(&pool, id, |s| s.state == RunState::Completed).await?;
-    assert_eq!(
-        pool.history_task(id).await?.outcome,
-        StoredOutcome::Completed
-    );
+    assert_eq!(store.list(pool_uuid)?[0].outcome, StoredOutcome::Completed);
     assert_eq!(pool.disks().await?.len(), 2);
     assert_eq!(balance.submissions(), 2);
     // Recovered Pool ownership/routing must be cleaned too, not only metadata.

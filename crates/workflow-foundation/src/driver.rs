@@ -24,46 +24,8 @@ pub struct ExecutionView {
     pub(crate) scope: Arc<Scope>,
     state: watch::Receiver<RuntimeSnapshot>,
     tasks: Arc<Mutex<TaskRegistry>>,
-    history: Arc<Mutex<Option<HistoryStore>>>,
-}
-#[derive(Clone)]
-struct HistoryStore {
-    pool: u128,
-    store: Arc<dyn crate::persistence::TaskStore>,
 }
 impl ExecutionView {
-    /// Read persisted summaries, including tasks from earlier leaders. These
-    /// records are not installed into the execution or scheduling registries.
-    pub async fn history(
-        &self,
-        query: crate::persistence::TaskQuery,
-    ) -> Outcome<crate::persistence::TaskPage> {
-        let history = self
-            .history
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| Failure::Rejected("TaskStore is not configured".into()))?;
-        query.validate(history.pool)?;
-        crate::persistence::blocking(move || history.store.query(history.pool, &query)).await
-    }
-    pub async fn history_task(&self, id: TaskId) -> Outcome<crate::persistence::SavedTask> {
-        let history = self
-            .history
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| Failure::Rejected("TaskStore is not configured".into()))?;
-        if id.pool != history.pool {
-            return Err(Failure::Rejected("task belongs to another Pool".into()));
-        }
-        crate::persistence::blocking(move || {
-            history.store.get(id).and_then(|task| {
-                task.ok_or_else(|| Failure::Rejected("unknown task history id".into()))
-            })
-        })
-        .await
-    }
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.tasks.lock().unwrap().snapshots()
     }
@@ -159,7 +121,6 @@ impl WorkflowDriver {
             scope,
             state: receiver,
             tasks: Arc::new(Mutex::new(TaskRegistry::new(config.task_history))),
-            history: Arc::default(),
         };
         let (broker, events) = Broker::new();
         Ok(Self {
@@ -187,7 +148,7 @@ impl WorkflowDriver {
     /// Bind the immutable pool UUID and the allocator supplied by the election authority.
     /// Configure before registering work; ownership/fencing remains the host's responsibility.
     pub fn with_task_ids(mut self, pool_uuid: u128, ids: TaskIds) -> Outcome<Self> {
-        if pool_uuid == 0 || !self.running.is_empty() || self.store.is_some() {
+        if pool_uuid == 0 || !self.running.is_empty() {
             return Err(Failure::Rejected(
                 "invalid task identity configuration".into(),
             ));
@@ -273,57 +234,36 @@ impl WorkflowDriver {
             ));
         }
         let id = self.ids.allocate(self.pool_uuid, W::NAME)?;
-        let policy = workflow.persistence()?;
-        let record_history = matches!(policy, Persistence::History) && self.config.record_history;
-        let recovery = match policy {
+        let journal = match workflow.persistence()? {
+            Persistence::Memory => None,
             Persistence::Durable { version, input } => {
                 if version == 0 {
                     return Err(Failure::Rejected("invalid workflow schema version".into()));
                 }
-                if self.store.is_none() {
-                    return Err(Failure::Rejected(
+                let store = self.store.clone().ok_or_else(|| {
+                    Failure::Rejected(
                         "persistent workflow requires configured store and leader epoch".into(),
-                    ));
-                }
-                Some((version, input))
+                    )
+                })?;
+                let record = crate::persistence::SavedTask {
+                    id,
+                    version,
+                    input,
+                    checkpoint: serde_json::Value::Null,
+                    objects: workflow.objects(),
+                    metadata,
+                    details: serde_json::Value::Null,
+                    revision: 0,
+                    owner_epoch: self.ids.epoch(),
+                    user_paused: false,
+                    cancel_requested: false,
+                    outcome: crate::persistence::StoredOutcome::Pending,
+                };
+                Some(crate::persistence::Journal {
+                    record: Arc::new(tokio::sync::Mutex::new(record)),
+                    store,
+                })
             }
-            _ => None,
-        };
-        let journal = if let Some(store) = self
-            .store
-            .clone()
-            .filter(|_| recovery.is_some() || record_history)
-        {
-            let recoverable = recovery.is_some();
-            let (version, input) = recovery.unwrap_or((0, serde_json::Value::Null));
-            let now = std::time::SystemTime::now();
-            let record = crate::persistence::SavedTask {
-                id,
-                recoverable,
-                observation: crate::persistence::TaskObservation {
-                    created_at: Some(now),
-                    updated_at: Some(now),
-                    state: Some(RunState::WaitingObjects),
-                    ..Default::default()
-                },
-                version,
-                input,
-                checkpoint: serde_json::Value::Null,
-                objects: workflow.objects(),
-                metadata,
-                details: serde_json::Value::Null,
-                revision: 0,
-                owner_epoch: self.ids.epoch(),
-                user_paused: false,
-                cancel_requested: false,
-                outcome: crate::persistence::StoredOutcome::Pending,
-            };
-            Some(crate::persistence::Journal {
-                record: Arc::new(tokio::sync::Mutex::new(record)),
-                store,
-            })
-        } else {
-            None
         };
         let (run, future) = execution(workflow, self.execution_env(id, start, journal, None));
         self.register_execution(run.control.clone(), future);

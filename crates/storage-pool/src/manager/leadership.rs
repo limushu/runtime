@@ -77,7 +77,7 @@ impl Drop for Activation {
 }
 
 impl PoolManager {
-    /// Inject the TaskStore adapter for task history and optional continuation.
+    /// Inject the real TaskStore adapter before activating any durable pools.
     pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         self.task_store = Some(store);
         self

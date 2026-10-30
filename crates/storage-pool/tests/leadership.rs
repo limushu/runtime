@@ -86,60 +86,6 @@ fn empty(name: &str) -> PoolRecovery {
         PoolName::new(name).unwrap(),
     ))
 }
-
-#[tokio::test]
-async fn ordinary_pool_task_history_is_queryable_after_leadership_change_without_scheduling_it() {
-    let metadata = Arc::new(MemoryMetadata::default());
-    let store = Arc::new(MemoryTaskStore::default());
-    let primary = manager(metadata.clone(), store.clone(), 1);
-    let pool = primary.activate(empty("history")).await.unwrap();
-    let tier = TierId::new("tier").unwrap();
-    let mut create = pool.create_tier(tier.clone()).await.unwrap();
-    let id = create.id();
-    create.result().await.unwrap();
-    let before = pool.history_task(id).await.unwrap();
-    assert!(!before.recoverable);
-    assert_eq!(before.outcome, StoredOutcome::Completed);
-    assert!(before.metadata["kind"].get("CreateTier").is_some());
-    let snapshot = pool.recovery_snapshot().await.unwrap();
-    primary.demote().await.unwrap();
-
-    let standby = manager(metadata, store, 2);
-    let recovered = standby.activate(snapshot).await.unwrap();
-    assert!(recovered.tasks().is_empty());
-    assert_eq!(recovered.scheduling().queued, 0);
-    assert_eq!(recovered.scheduling().running, 0);
-    let after = recovered.history_task(id).await.unwrap();
-    assert_eq!(after.observation, before.observation);
-    assert_eq!(after.id, id);
-    assert!(recovered.resume(id).is_err());
-    recovered
-        .delete_tier(tier)
-        .await
-        .unwrap()
-        .result()
-        .await
-        .unwrap();
-    let page = recovered
-        .history(TaskQuery {
-            business: Some(id.business().into()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(page.tasks.len(), 1);
-    assert_eq!(page.tasks[0].id, id);
-    assert_eq!(
-        recovered
-            .history(TaskQuery::default())
-            .await
-            .unwrap()
-            .tasks
-            .len(),
-        2
-    );
-    standby.demote().await.unwrap();
-}
 async fn wait_for(pool: &PoolHandle, id: TaskId, predicate: impl Fn(&TaskSnapshot) -> bool) {
     let mut observer = pool.observe_task(id).unwrap();
     tokio::time::timeout(Duration::from_secs(6), async {
@@ -221,7 +167,7 @@ async fn demoting_active_migration_restores_same_task_without_user_resume() {
     .await;
     primary.demote().await.unwrap();
     assert_eq!(run.result().await, Err(Failure::Cancelled));
-    let saved = store.get(id).unwrap().unwrap();
+    let saved = store.list(id.pool).unwrap().remove(0);
     assert_eq!(saved.outcome, StoredOutcome::Pending);
     assert!(!saved.user_paused && !saved.cancel_requested);
     assert!(
@@ -235,9 +181,9 @@ async fn demoting_active_migration_restores_same_task_without_user_resume() {
     assert_eq!(recovered.nodes().await.unwrap().len(), 4);
     assert_eq!(recovered.tiers().await.unwrap().len(), 1);
     wait_for(&recovered, id, |t| t.state == RunState::Completed).await;
-    assert_eq!(store.get(id).unwrap().unwrap().owner_epoch, 21);
+    assert_eq!(store.list(id.pool).unwrap()[0].owner_epoch, 21);
     assert_eq!(
-        store.get(id).unwrap().unwrap().outcome,
+        store.list(id.pool).unwrap()[0].outcome,
         StoredOutcome::Completed
     );
     // Pool-level removal gates, routing and global disk ownership are restored too.

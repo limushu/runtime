@@ -274,7 +274,7 @@ impl Workflow for ShrinkWorkflow {
                 },
             )
         } else {
-            Ok(Persistence::History)
+            Ok(Persistence::Memory)
         }
     }
     fn restore(record: &SavedTask, dependencies: &Dependencies) -> Outcome<Self> {
