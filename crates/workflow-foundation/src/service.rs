@@ -41,19 +41,32 @@ pub struct ActivityContext {
     pub(crate) cancel: CancellationToken,
     pub(crate) control: ControlToken,
     pub(crate) progress: watch::Sender<TaskProgress>,
+    pub(crate) activity_progress: Option<(watch::Sender<ActivityHistory>, ActivityId)>,
+    pub(crate) _protected_controls: Option<crate::control::Controls>,
 }
 impl ActivityContext {
     /// Live task progress from a long domain operation; reporting has no business effects.
     pub fn report_progress(&self, stage: impl Into<String>, completed: u64, total: Option<u64>) {
         let stage = stage.into();
-        if stage.trim().is_empty() || stage.len() > 256 || total.is_some_and(|n| completed > n) {
+        if stage.chars().all(char::is_whitespace)
+            || stage.len() > 256
+            || total.is_some_and(|n| completed > n)
+        {
             return;
         }
-        self.progress.send_replace(TaskProgress {
+        let progress = TaskProgress {
             stage: Some(stage),
             completed,
             total,
-        });
+        };
+        self.progress.send_replace(progress.clone());
+        if let Some((history, id)) = &self.activity_progress {
+            history.send_modify(|history| {
+                if let Some(entry) = history.entries.iter_mut().find(|entry| entry.id == *id) {
+                    entry.progress = progress;
+                }
+            });
+        }
     }
     /// A stopping-return service can watch this token and return its normal typed partial result.
     pub fn control(&self) -> ControlToken {
@@ -117,7 +130,7 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
             .send(Message::Query { query, reply })
             .await
             .map_err(|_| Failure::Unavailable)?;
-        response.await.unwrap_or(Err(Failure::Unavailable))
+        response.await.map_err(|_| Failure::Unavailable)?
     }
     /// Independent service shutdown; in-flight work is cancelled and awaited.
     pub async fn shutdown(&self) -> Outcome<()> {
@@ -154,7 +167,7 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
         }
         response
             .await
-            .unwrap_or_else(|_| Err(Failure::Uncertain("activity response lost".into())))
+            .map_err(|_| Failure::Uncertain("activity response lost".into()))?
     }
 }
 
@@ -246,7 +259,7 @@ pub(crate) fn spawn<S: ServiceHandler>(
                     None => { closing = true; stop_task.cancel(); }
                     Some(Message::Query { query, reply }) => {
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| service.query(query)))
-                            .unwrap_or_else(|_| Err(Failure::Uncertain("query panicked".into())));
+                            .map_err(|_| Failure::Uncertain("query panicked".into())).and_then(|result| result);
                         let _ = reply.send(result);
                     }
                     Some(Message::Execute { request, context, mut guard, reply }) => {
@@ -254,6 +267,9 @@ pub(crate) fn spawn<S: ServiceHandler>(
                         running.push(Box::pin(async move {
                             let result = if context.cancel.is_cancelled() || stop.is_cancelled() { Err(Failure::Cancelled) } else {
                                 guard.started();
+                                // The adapter may drop its context after cloning the token.
+                                // Keep protected controls alive through actual settlement.
+                                let _protected_controls = context._protected_controls.clone();
                                 let cancel = context.cancel.clone();
                                 let operation = AssertUnwindSafe(async move { service.execute(request, *context).await }).catch_unwind();
                                 tokio::pin!(operation);
@@ -262,7 +278,7 @@ pub(crate) fn spawn<S: ServiceHandler>(
                                     result = &mut operation => result,
                                     _ = stop.cancelled() => { cancel.cancel(); operation.await },
                                 };
-                                result.unwrap_or_else(|_| Err(Failure::Uncertain("activity panicked".into())))
+                                result.map_err(|_| Failure::Uncertain("activity panicked".into())).and_then(|result| result)
                             };
                             guard.settled(&result); drop(guard);
                             let _ = reply.send(result);

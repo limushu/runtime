@@ -84,55 +84,93 @@ Activity 资源由运行时统一读写保护，持有到实际动作停稳；�
 多资源原子取得、读共享/写独占、冲突等待者 FIFO。不支持并行 Activity 或动态扩展流程对象。
 跨服务的同一资源必须使用同一个 key；框架不会推断业务拓扑。
 
-### 可选的 Activity trait
+### Activity：业务步骤与执行策略
 
-需要解释业务结果、重试或停稳后续作时，实现 `Activity`，WF 只等待最终结果：
+WF 只等待最终业务结果，重试和挂起不会返回到 WF 外层：
 
 ```rust,ignore
 let migrated = ctx.run_activity(MigrateDisks { balance, cursor: 0 }).await?;
-// 只有迁移完成才进入下一步。
+// 迁移完成后，才进入后续步骤。
 ```
 
-步骤提供 `name()`、`execute()` 和 `handle()`。例如均衡服务返回完成或停稳游标：
+Activity 提供 `name()`、可选 `description()`、`retry_policy()`、`execute()` 和 `handle()`。
+`execute` 负责一次执行，`handle` 解释已停稳的业务回复；框架负责调度决定、观测和控制。
 
 ```rust,ignore
 #[async_trait]
 impl Activity for MigrateDisks {
-    type Reply = ActivityExit<u64, u64>;
+    type Reply = MigrationReply;
     type Output = u64;
     fn name(&self) -> &'static str { "shrink.migrate-disks" }
-
+    fn description(&self) -> Option<&str> { Some("迁移待移除磁盘上的数据") }
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::exponential(3, Duration::from_millis(100), Duration::from_secs(2))
+    }
     async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
         scope.call(&self.balance, self.cursor).await
     }
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<u64>> {
         Ok(match result? {
-            ActivityExit::Completed(count) => ActivityAction::Continue(count),
-            ActivityExit::Suspended(cursor) => {
+            MigrationReply::Completed(count) => ActivityAction::Continue(count),
+            MigrationReply::Busy => ActivityAction::Retry { reason: "balance busy".into() },
+            MigrationReply::Stopped(cursor) => {
                 self.cursor = cursor;
-                ActivityAction::Suspend
+                ActivityAction::Suspend(ActivityWait::Resume)
             }
         })
     }
 }
 ```
 
-`Continue(value)` 返回最终结果；`Retry(delay)` 通过现有 `ctx.sleep()` 等待并重试；
-`Suspend` 通过现有准入边界等待恢复；`Cancel` 终结 Task。重试条件和次数上限由
-`handle()` 根据业务结果及实例字段决定，框架不默认重试错误。`execute()` 返回的
-Cancelled/Uncertain 不进入 handler；handler 主动返回 Cancelled 等价于 Cancel。
+| 决定 | 框架行为 |
+| --- | --- |
+| `Continue(value)` | 完成逻辑步骤，向 WF 返回结果 |
+| `Retry { reason }` | 检查预算、计算退避、等待后再次 execute |
+| `Suspend(ActivityWait::Resume)` | 等待已有 Task 暂停原因解除，并重新检查准入 |
+| `Suspend(ActivityWait::Condition(check))` | 等待业务条件；数据改变后通过 `RunControl::recheck()` 唤醒 |
+| `Cancel` | 终结 Task，取消不能当作中断后续作 |
 
-暂停和重试保留同一个实例，WF 停在同一个 await。`Suspend` 用于响应 Task 的暂停，
-不代表主动设置一个新的暂停原因；恢复总会重新检查 Workflow 的 RunCondition。
-延迟期间的暂停、取消也复用现有控制机制。在途服务必须真正停稳，框架不丢弃其 Future 来模拟暂停。
+**重试策略。** `RetryPolicy::fixed(max_retries, delay)` 使用固定间隔；
+`RetryPolicy::exponential(max_retries, initial, maximum)` 使用翻倍且有上限的退避。
+默认不重试，只有 handler 明确返回 Retry 才消耗预算。初次执行不计入 max_retries；
+暂停后的续作也不消耗预算。次数由框架保存，暂停恢复不会重置，退避截止时间也不会重置。
+业务判断可以基于成功回复、错误以及实例字段，业务代码不需要维护公共重试计数器。
 
-外部副作用通过 `scope.call()` 执行；本地长循环通过 `scope.control()` 协作响应控制。
-每次服务调用沿用已有资源锁和 Activity 记录，自动使用 trait 的步骤名；多次调用不构成
-一个原子的资源事务，重试、暂停期间不保留已结束调用的锁。`scope.report_progress()` 使用同一步骤名。
+**两种暂停方式。** 对本地循环，`scope.wait_until_runnable()` 或 `scope.sleep()` 在安全边界
+原地等待，恢复后继续同一次 execute。对 C 侧长操作，领域适配器观察 `scope.control()` 传递的
+控制请求，调用 C 的停止接口、等待实际停稳，然后返回类型化回复；handler 保存进程内游标并
+返回 Suspend，恢复后框架在同一个实例上再次 execute。两种方式都保持同一个逻辑 ActivityId，
+并重新检查 Workflow 的 RunCondition。自定义条件等待与用户暂停同时生效，恢复不能绕过任一条件。
 
-这层只保存进程内状态，不提供 Activity checkpoint、函数适配器或新的历史存储。
-现有 `ctx.activity()` 及缩容 Workflow 的显式持久化路径继续保留。
-可运行的迁移、暂停、重试测试见 [activity_trait.rs](tests/activity_trait.rs)。
+**执行安全。** 所有外部副作用通过 `scope.call()` 调用已有领域服务。资源按每次真实调用
+取得并持有到实际停稳，多次调用不构成隐式原子事务；重试和等待期间不占用已结束调用的资源。
+框架不丢弃在途 IO 来模拟停止。Cancelled/Uncertain 执行结果不进入 handler，scope 还会记住
+服务调用返回的这两类结果，防止 execute 吞掉后返回成功。handler 主动返回 Cancelled 等价于 Cancel。
+执行或 handler panic 记为 Uncertain，不能被外层吞掉成为成功。丢弃 Activity 等待者会请求协作取消，
+逻辑记录保持 Settling，直到实际子调用结束。
+
+**步骤级观测。** TaskSnapshot.activities 同时包含 `kind = Step` 的逻辑步骤和 `kind = Call`
+的真实服务调用，调用通过 `parent_id` 关联步骤。步骤自动记录名称、说明、attempts、retries、
+last_error、retry_reason、retry_at、进度和生命周期。attempts 是 execute 的进入次数，
+retries 是已批准的重试次数，两者不会把暂停续作混为重试。`scope.report_progress()` 自动使用步骤名；
+领域服务的进度也会归入所属步骤。同一逻辑步骤在暂停时显示 Suspended，不会因子调用返回而显示 Completed。
+
+历史上限优先淘汰已结束的子调用。活跃步骤及在途调用始终保留，极小上限下允许暂时多出活跃记录，
+结束后重新收敛到配置上限；omitted 明确记录淘汰数量。这些记录和 Activity 实例状态均只存在于当前进程。
+此实现不增加历史存储或 Activity checkpoint，已有 Workflow 的显式持久化恢复路径继续保留。
+原有 `ctx.activity()` 直接调用方式仍然可用。
+
+独立 demo：[examples/activity_trait.rs](examples/activity_trait.rs)。按 WF → Activity → 模拟领域适配器
+的顺序阅读；只演示缩容的迁移步骤，不实际移除磁盘，C 接口使用模拟实现。
+
+```bash
+cargo run -p workflow-foundation --example activity_trait
+cargo run -p workflow-foundation --example activity_trait -- --cancel
+```
+
+默认演示：均衡暂忙 → 策略重试 → 迁移进度 → 暂停 → C 停稳 → 同一 Activity 从游标恢复 → 完成。
+`--cancel` 演示在迁移中取消，先等待停稳再终结。末尾同时打印逻辑步骤与实际调用记录。
+回归测试见 [activity_trait.rs](tests/activity_trait.rs)。
 
 ## 控制与安全语义
 
@@ -154,7 +192,8 @@ Cancelled/Uncertain 不进入 handler；handler 主动返回 Cancelled 等价于
 
 ## 逐 Activity 观测
 
-每次通过 `WorkflowContext::activity()` 发起的步骤自动进入 `TaskSnapshot.activities`，
+每次通过 `WorkflowContext::activity()` 发起的实际调用自动进入 `TaskSnapshot.activities`；
+`run_activity()` 另有覆盖整个逻辑步骤的父记录，
 不需要在 Workflow 中手工上报开始/结束。每条记录包含稳定的 `ActivityId`（TaskId + 当前宿主内调用序号）、
 注册服务名、步骤名、资源声明、当前状态和创建/实际开始/实际结束时间。
 
@@ -177,12 +216,12 @@ let updated = observer.changed().await?; // Activity 更新也会唤醒，不依
 循环中的同名步骤通过调用序号区分；再次调用也有新序号。直接调用不自动重试，
 trait 路径仅在 handler 返回 `Retry` 时重试。
 
-`Config::activity_history` 默认每 task 保留最近 1024 条，必须大于零。
+`Config::activity_history` 默认每 task 保留 1024 条，必须大于零；活跃的父步骤和子调用不会被淘汰。
 `activities.total` 是累计调用数，`activities.omitted` 明确给出因上限淘汰的条数；当前在途步骤始终保留。
 记录随 task 一起按 `Config::task_history` 淘汰，已有 observer/RunControl 仍可读取自身记录。
 `task_ids()` 可只列出 ID，避免复制所有步骤历史。
 
-这里记录实际发起过的调用；普通 async Workflow 的未来分支、未发起或跳过的步骤无法自动推断。
+这里记录实际开始等待的逻辑步骤及发起过的调用；普通 async Workflow 的未来分支、未发起或跳过的步骤无法自动推断。
 watch 仍会合并通知，但合并不会抹掉历史上限内已结束的 Activity 记录。
 历史只存在当前进程内，关闭后保留在已有句柄中；重启后查询需要另外接入持久化存储。
 

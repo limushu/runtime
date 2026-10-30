@@ -61,6 +61,7 @@ where
 }
 
 struct Step<F> {
+    policy: RetryPolicy,
     client: ServiceClient<Probe>,
     work: VecDeque<Work>,
     handler: F,
@@ -71,6 +72,9 @@ impl<F: FnMut(Outcome<usize>) -> Outcome<ActivityAction<usize>> + Send> Activity
     type Output = usize;
     fn name(&self) -> &'static str {
         "check.replication"
+    }
+    fn retry_policy(&self) -> RetryPolicy {
+        self.policy
     }
     async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<usize> {
         scope
@@ -86,19 +90,17 @@ impl<F: FnMut(Outcome<usize>) -> Outcome<ActivityAction<usize>> + Send> Activity
 }
 
 #[tokio::test]
-async fn business_retry_keeps_local_budget_across_pause_and_names_calls() {
+async fn framework_retry_budget_survives_pause_and_links_child_calls() {
     let (mut runtime, client, mut entered) = setup();
-    let mut remaining = 2;
     let step = Step {
+        policy: RetryPolicy::fixed(1, Duration::from_millis(30)),
         client,
         work: (0..2).map(|_| Work::write("check", "disk")).collect(),
         handler: move |result: Outcome<usize>| {
             assert!(result? < 3); // Successful reply, but business condition is not met.
-            remaining -= 1;
-            if remaining == 0 {
-                return Err(Failure::Failed("replication retry limit".into()));
-            }
-            Ok(ActivityAction::Retry(Duration::from_millis(30)))
+            Ok(ActivityAction::Retry {
+                reason: "replication incomplete".into(),
+            })
         },
     };
     let mut run = runtime.submit(Flow::new(step)).await.unwrap();
@@ -111,15 +113,21 @@ async fn business_retry_keeps_local_budget_across_pause_and_names_calls() {
     run.control.resume().unwrap();
     assert_eq!(
         finish(&mut run).await,
-        Err(Failure::Failed("replication retry limit".into()))
+        Err(Failure::Failed(
+            "Activity retry limit exhausted (1 retries): replication incomplete".into()
+        ))
     );
     let history = run.control.activities();
-    assert_eq!(history.total, 2);
+    assert_eq!(history.total, 3);
+    assert_eq!(history.entries[0].name, "check.replication");
+    assert_eq!(history.entries[0].retries, 1);
+    assert_eq!(history.entries[0].attempts, 2);
     assert!(
         history
             .entries
             .iter()
-            .all(|entry| entry.name == "check.replication")
+            .skip(1)
+            .all(|entry| entry.parent_id == Some(history.entries[0].id))
     );
     runtime.shutdown().await.unwrap();
 }
@@ -177,7 +185,7 @@ impl Activity for Migrate {
             ActivityExit::Completed(value) => ActivityAction::Continue(value),
             ActivityExit::Suspended(cursor) => {
                 self.cursor = cursor;
-                ActivityAction::Suspend
+                ActivityAction::Suspend(ActivityWait::Resume)
             }
         })
     }
@@ -226,7 +234,7 @@ async fn pause_waits_for_native_stop_releases_resources_and_rechecks_admission()
     gate.0.store(true, Ordering::SeqCst);
     run.control.recheck();
     assert_eq!(finish(&mut run).await, Ok(100));
-    assert_eq!(run.control.activities().total, 2);
+    assert_eq!(run.control.activities().total, 3);
     runtime.shutdown().await.unwrap();
 }
 
@@ -285,6 +293,7 @@ async fn uncertainty_cannot_be_reclassified_or_retried() {
     let handled = Arc::new(AtomicBool::new(false));
     let observed = handled.clone();
     let step = Step {
+        policy: RetryPolicy::default(),
         client: client.clone(),
         work: [Work::write("uncertain", "disk").behavior(Behavior::Uncertain)].into(),
         handler: move |_| {
@@ -312,9 +321,10 @@ async fn uncertainty_cannot_be_reclassified_or_retried() {
 async fn suspend_without_request_is_rejected_instead_of_spinning() {
     let (mut runtime, client, _) = setup();
     let step = Step {
+        policy: RetryPolicy::default(),
         client,
         work: [Work::write("check", "disk")].into(),
-        handler: |_| Ok(ActivityAction::Suspend),
+        handler: |_| Ok(ActivityAction::Suspend(ActivityWait::Resume)),
     };
     let mut run = runtime.submit(Flow::new(step)).await.unwrap();
     assert!(matches!(finish(&mut run).await, Err(Failure::Rejected(_))));
@@ -333,6 +343,7 @@ async fn business_cancel_is_terminal_even_for_existing_durable_workflows() {
     let (tx, _) = mpsc::unbounded_channel();
     let client = driver.register("probe", Probe::new(tx)).unwrap();
     let step = Step {
+        policy: RetryPolicy::default(),
         client,
         work: [Work::write("check", "disk")].into(),
         handler: |_| Ok(ActivityAction::Cancel),
@@ -359,10 +370,13 @@ async fn business_cancel_is_terminal_even_for_existing_durable_workflows() {
 
 struct Abandon<A>(A, Arc<Semaphore>);
 #[async_trait]
-impl<A: Activity<Output = usize> + 'static> Workflow for Abandon<A> {
-    type Output = usize;
+impl<A: Activity + 'static> Workflow for Abandon<A>
+where
+    A::Output: 'static,
+{
+    type Output = A::Output;
     const NAME: &'static str = "abandon.activity";
-    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<usize> {
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<Self::Output> {
         tokio::select! {
             result = ctx.run_activity(self.0) => result,
             _ = self.1.acquire() => Err(Failure::Cancelled),
@@ -376,6 +390,7 @@ async fn abandoned_trait_waiter_keeps_native_operation_and_lease_until_settled()
     let stop = Arc::new(Semaphore::new(0));
     let settled = Arc::new(Semaphore::new(0));
     let step = Step {
+        policy: RetryPolicy::default(),
         client: client.clone(),
         work: [Work::write("native", "disk")
             .gated(&settled)
@@ -387,6 +402,10 @@ async fn abandoned_trait_waiter_keeps_native_operation_and_lease_until_settled()
     assert_eq!(next(&mut entered).await, "native");
     stop.add_permits(1);
     assert_eq!(next(&mut entered).await, "cancel-observed");
+    let root = run.control.activities().entries[0].clone();
+    assert_eq!(root.kind, ActivityKind::Step);
+    assert!(matches!(root.state, ActivityState::Settling(_)));
+    assert!(root.finished_at.is_none());
     let mut other = runtime
         .submit(Call::new(&client, Work::write("other", "disk")))
         .await
@@ -395,6 +414,7 @@ async fn abandoned_trait_waiter_keeps_native_operation_and_lease_until_settled()
     assert!(entered.try_recv().is_err());
     settled.add_permits(1);
     assert_eq!(finish(&mut run).await, Err(Failure::Cancelled));
+    assert!(run.control.activities().entries[0].finished_at.is_some());
     assert_eq!(next(&mut entered).await, "other");
     finish(&mut other).await.unwrap();
     runtime.shutdown().await.unwrap();
@@ -487,5 +507,433 @@ async fn consumed_call_returns_error_without_reexecuting_or_panicking() {
     );
     assert_eq!(next(&mut entered).await, "once");
     assert!(entered.try_recv().is_err());
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn framework_applies_capped_exponential_backoff_and_rejects_unconfigured_retry() {
+    for configured in [false, true] {
+        let (mut runtime, client, _) = setup();
+        let step = Step {
+            policy: if configured {
+                RetryPolicy::exponential(3, Duration::from_millis(30), Duration::from_millis(60))
+            } else {
+                RetryPolicy::default()
+            },
+            client,
+            work: (0..4).map(|_| Work::write("replicate", "disk")).collect(),
+            handler: |result: Outcome<usize>| {
+                let value = result?;
+                Ok(if value == 4 {
+                    ActivityAction::Continue(value)
+                } else {
+                    ActivityAction::Retry {
+                        reason: "replicas not ready".into(),
+                    }
+                })
+            },
+        };
+        let mut run = runtime.submit(Flow::new(step)).await.unwrap();
+        let result = finish(&mut run).await;
+        let history = run.control.activities();
+        let root = &history.entries[0];
+        assert_eq!(root.retry_reason.as_deref(), Some("replicas not ready"));
+        assert!(root.retry_at.is_none());
+        if configured {
+            assert_eq!(result, Ok(4));
+            assert_eq!(root.attempts, 4);
+            assert_eq!(root.retries, 3);
+            let calls: Vec<_> = history
+                .entries
+                .iter()
+                .filter(|e| e.parent_id == Some(root.id))
+                .collect();
+            for (pair, delay) in calls.windows(2).zip([30, 60, 60]) {
+                let gap = pair[1]
+                    .started_at
+                    .unwrap()
+                    .duration_since(pair[0].finished_at.unwrap())
+                    .unwrap();
+                assert!(gap >= Duration::from_millis(delay - 2));
+            }
+        } else {
+            assert!(matches!(result, Err(Failure::Failed(_))));
+            assert_eq!(root.attempts, 1);
+            assert_eq!(root.retries, 0);
+        }
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn business_wait_is_observed_releases_resources_and_survives_user_pause() {
+    let (mut runtime, client, mut entered) = setup();
+    let gate = Arc::new(Gate(AtomicBool::new(false)));
+    let condition = gate.clone();
+    let mut first = true;
+    let step = Step {
+        policy: RetryPolicy::default(),
+        client: client.clone(),
+        work: (0..2).map(|_| Work::write("check", "disk")).collect(),
+        handler: move |result: Outcome<usize>| {
+            let value = result?;
+            if first {
+                first = false;
+                Ok(ActivityAction::Suspend(ActivityWait::Condition(
+                    condition.clone(),
+                )))
+            } else {
+                Ok(ActivityAction::Continue(value))
+            }
+        },
+    };
+    let mut run = runtime.submit(Flow::new(step)).await.unwrap();
+    assert_eq!(next(&mut entered).await, "check");
+    state(
+        &run.control,
+        RunState::WaitingConditions("topology changed".into()),
+    )
+    .await;
+    let root = run.control.activities().entries[0].clone();
+    assert_eq!(
+        root.state,
+        ActivityState::WaitingConditions("topology changed".into())
+    );
+    assert!(root.finished_at.is_none());
+    let mut other = runtime
+        .submit(Call::new(&client, Work::write("topology", "disk")))
+        .await
+        .unwrap();
+    finish(&mut other).await.unwrap();
+    assert_eq!(next(&mut entered).await, "topology");
+    run.control.suspend().unwrap();
+    state(&run.control, RunState::Suspended).await;
+    gate.0.store(true, Ordering::SeqCst);
+    run.control.recheck();
+    assert_eq!(
+        run.control.activities().entries[0].state,
+        ActivityState::Suspended
+    );
+    assert!(entered.try_recv().is_err());
+    run.control.resume().unwrap();
+    finish(&mut run).await.unwrap();
+    let completed = run.control.activities().entries[0].clone();
+    assert_eq!(completed.id, root.id);
+    assert_eq!(completed.attempts, 2);
+    assert_eq!(completed.retries, 0);
+    assert_eq!(completed.state, ActivityState::Completed);
+    runtime.shutdown().await.unwrap();
+}
+
+struct LocalLoop(mpsc::UnboundedSender<ActivityId>);
+#[async_trait]
+impl Activity for LocalLoop {
+    type Reply = ();
+    type Output = ();
+    fn name(&self) -> &'static str {
+        "local.loop"
+    }
+    fn description(&self) -> Option<&str> {
+        Some("local cooperative work")
+    }
+    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<()> {
+        self.0.send(scope.id()).unwrap();
+        scope.report_progress(1, Some(2));
+        scope.sleep(Duration::from_millis(50)).await?;
+        scope.report_progress(2, Some(2));
+        Ok(())
+    }
+    fn handle(&mut self, result: Outcome<()>) -> Outcome<ActivityAction<()>> {
+        result.map(ActivityAction::Continue)
+    }
+}
+#[tokio::test]
+async fn cooperative_loop_parks_without_reentering_execute_and_cancel_wakes_it() {
+    for cancel in [false, true] {
+        let mut runtime = WorkflowRuntime::start("pool", Config::default()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut run = runtime.submit(Flow::new(LocalLoop(tx))).await.unwrap();
+        let id = rx.recv().await.unwrap();
+        run.control.suspend().unwrap();
+        state(&run.control, RunState::Suspended).await;
+        let root = run.control.activities().entries[0].clone();
+        assert_eq!(root.id, id);
+        assert_eq!(root.description.as_deref(), Some("local cooperative work"));
+        assert_eq!(root.progress.completed, 1);
+        assert_eq!(root.state, ActivityState::Suspended);
+        if cancel {
+            run.control.cancel();
+        } else {
+            run.control.resume().unwrap();
+        }
+        assert_eq!(
+            finish(&mut run).await,
+            if cancel {
+                Err(Failure::Cancelled)
+            } else {
+                Ok(())
+            }
+        );
+        let root = run.control.activities().entries[0].clone();
+        assert_eq!(root.attempts, 1);
+        assert_eq!(root.retries, 0);
+        assert!(rx.try_recv().is_err());
+        if !cancel {
+            assert_eq!(root.progress.completed, 2);
+        }
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn small_history_keeps_live_parent_and_child_then_retains_logical_summary() {
+    let mut runtime = WorkflowRuntime::start(
+        "pool",
+        Config {
+            activity_history: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (events, mut rx) = mpsc::unbounded_channel();
+    let stopped = Arc::new(Semaphore::new(0));
+    let client = runtime
+        .register(
+            "migration",
+            Migration {
+                events,
+                stopped: stopped.clone(),
+            },
+        )
+        .unwrap();
+    let mut run = runtime
+        .submit(Flow::new(Migrate { client, cursor: 0 }))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut rx).await, "migrating");
+    let live = run.control.activities();
+    assert_eq!(live.entries.len(), 2);
+    let id = live.entries[0].id;
+    assert_eq!(live.entries[1].parent_id, Some(id));
+    run.control.suspend().unwrap();
+    assert_eq!(next(&mut rx).await, "stop-requested");
+    state(&run.control, RunState::Suspending).await;
+    assert_eq!(
+        run.control.activities().entries[0].state,
+        ActivityState::Suspending
+    );
+    stopped.add_permits(1);
+    state(&run.control, RunState::Suspended).await;
+    let paused = run.control.activities();
+    assert_eq!(paused.entries.len(), 1);
+    assert_eq!(paused.entries[0].state, ActivityState::Suspended);
+    run.control.resume().unwrap();
+    assert_eq!(finish(&mut run).await, Ok(100));
+    let history = run.control.activities();
+    assert_eq!(history.total, 3);
+    assert_eq!(history.omitted, 2);
+    assert_eq!(history.entries.len(), 1);
+    assert_eq!(history.entries[0].id, id);
+    assert_eq!(history.entries[0].state, ActivityState::Completed);
+    runtime.shutdown().await.unwrap();
+}
+
+struct Ignore<A>(A);
+#[async_trait]
+impl<A: Activity + 'static> Workflow for Ignore<A> {
+    type Output = ();
+    const NAME: &'static str = "ignore.activity.failure";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
+        let _ = ctx.run_activity(self.0).await;
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn result_handler_panic_remains_uncertain_even_if_workflow_ignores_error() {
+    let (mut runtime, client, _) = setup();
+    let step = Step {
+        policy: RetryPolicy::default(),
+        client,
+        work: [Work::write("prepare", "disk")].into(),
+        handler: |_| panic!("handler bug"),
+    };
+    let mut run = runtime.submit(Ignore(step)).await.unwrap();
+    assert!(matches!(finish(&mut run).await, Err(Failure::Uncertain(_))));
+    let root = run.control.activities().entries[0].clone();
+    assert!(matches!(
+        root.state,
+        ActivityState::Failed(Failure::Uncertain(_))
+    ));
+    assert!(root.finished_at.is_some());
+    runtime.shutdown().await.unwrap();
+}
+
+struct Terminal;
+#[async_trait]
+impl ServiceHandler for Terminal {
+    type Request = Failure;
+    type Reply = ();
+    type Query = ();
+    type View = ();
+    fn resources(_: &Failure) -> Vec<ResourceAccess> {
+        vec![]
+    }
+    async fn execute(&self, failure: Failure, _: ActivityContext) -> Outcome<()> {
+        Err(failure)
+    }
+    fn query(&self, _: ()) -> Outcome<()> {
+        Ok(())
+    }
+}
+struct Swallow {
+    client: ServiceClient<Terminal>,
+    failure: Failure,
+    handled: Arc<AtomicBool>,
+    after_call: Option<mpsc::UnboundedSender<()>>,
+}
+#[async_trait]
+impl Activity for Swallow {
+    type Reply = ();
+    type Output = ();
+    fn name(&self) -> &'static str {
+        "swallow"
+    }
+    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<()> {
+        let _ = scope.call(&self.client, self.failure.clone()).await;
+        if let Some(ready) = &self.after_call {
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+    fn handle(&mut self, _: Outcome<()>) -> Outcome<ActivityAction<()>> {
+        self.handled.store(true, Ordering::SeqCst);
+        Ok(ActivityAction::Continue(()))
+    }
+}
+#[tokio::test]
+async fn swallowed_cancelled_or_uncertain_service_result_never_reaches_handler() {
+    for failure in [
+        Failure::Cancelled,
+        Failure::Uncertain("lost native reply".into()),
+    ] {
+        let mut runtime = WorkflowRuntime::start("pool", Config::default()).unwrap();
+        let client = runtime.register("terminal", Terminal).unwrap();
+        let handled = Arc::new(AtomicBool::new(false));
+        let mut run = runtime
+            .submit(Flow::new(Swallow {
+                client,
+                failure: failure.clone(),
+                handled: handled.clone(),
+                after_call: None,
+            }))
+            .await
+            .unwrap();
+        let result = finish(&mut run).await;
+        if failure == Failure::Cancelled {
+            assert_eq!(result, Err(Failure::Cancelled));
+        } else {
+            assert!(matches!(result, Err(Failure::Uncertain(_))));
+        }
+        assert!(!handled.load(Ordering::SeqCst));
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn abandoning_after_uncertain_reply_does_not_downgrade_parent_to_cancelled() {
+    let mut runtime = WorkflowRuntime::start("pool", Config::default()).unwrap();
+    let client = runtime.register("terminal", Terminal).unwrap();
+    let (ready, mut rx) = mpsc::unbounded_channel();
+    let stop = Arc::new(Semaphore::new(0));
+    let mut run = runtime
+        .submit(Abandon(
+            Swallow {
+                client,
+                failure: Failure::Uncertain("lost native reply".into()),
+                handled: Arc::new(AtomicBool::new(false)),
+                after_call: Some(ready),
+            },
+            stop.clone(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    stop.add_permits(1);
+    assert!(matches!(finish(&mut run).await, Err(Failure::Uncertain(_))));
+    assert!(matches!(
+        run.control.activities().entries[0].state,
+        ActivityState::Failed(Failure::Uncertain(_))
+    ));
+    runtime.shutdown().await.unwrap();
+}
+
+struct PanicInExecute {
+    client: ServiceClient<Probe>,
+    trigger: Arc<Semaphore>,
+    stopped: Arc<Semaphore>,
+}
+#[async_trait]
+impl Activity for PanicInExecute {
+    type Reply = usize;
+    type Output = usize;
+    fn name(&self) -> &'static str {
+        "panic.during.native.call"
+    }
+    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<usize> {
+        tokio::select! {
+            result = scope.call(&self.client, Work::write("native", "disk")
+                .gated(&self.stopped).behavior(Behavior::CancelThenSettle)) => result,
+            _ = self.trigger.acquire() => panic!("execute bug"),
+        }
+    }
+    fn handle(&mut self, result: Outcome<usize>) -> Outcome<ActivityAction<usize>> {
+        result.map(ActivityAction::Continue)
+    }
+}
+struct ObserveReturn(PanicInExecute, Arc<AtomicBool>);
+#[async_trait]
+impl Workflow for ObserveReturn {
+    type Output = ();
+    const NAME: &'static str = "observe.activity.return";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
+        let _ = ctx.run_activity(self.0).await;
+        self.1.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn execute_panic_does_not_return_to_workflow_until_actual_native_stop() {
+    let (mut runtime, client, mut entered) = setup();
+    let trigger = Arc::new(Semaphore::new(0));
+    let stopped = Arc::new(Semaphore::new(0));
+    let returned = Arc::new(AtomicBool::new(false));
+    let mut run = runtime
+        .submit(ObserveReturn(
+            PanicInExecute {
+                client: client.clone(),
+                trigger: trigger.clone(),
+                stopped: stopped.clone(),
+            },
+            returned.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut entered).await, "native");
+    trigger.add_permits(1);
+    assert_eq!(next(&mut entered).await, "cancel-observed");
+    assert!(!returned.load(Ordering::SeqCst));
+    let root = run.control.activities().entries[0].clone();
+    assert!(matches!(
+        root.state,
+        ActivityState::Settling(Failure::Uncertain(_))
+    ));
+    assert!(root.finished_at.is_none());
+    stopped.add_permits(1);
+    assert!(matches!(finish(&mut run).await, Err(Failure::Uncertain(_))));
+    assert!(returned.load(Ordering::SeqCst));
     runtime.shutdown().await.unwrap();
 }

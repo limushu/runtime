@@ -74,6 +74,52 @@ fn setup() -> (
     let client = runtime.register("worker", Worker(tx)).unwrap();
     (runtime, client, rx)
 }
+
+struct DropProtected {
+    client: ServiceClient<Worker>,
+    drop_waiter: Arc<Semaphore>,
+}
+#[async_trait]
+impl Workflow for DropProtected {
+    type Output = ();
+    const NAME: &'static str = "drop.protected.waiter";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
+        tokio::select! {
+            result = ctx.activity(&self.client, "commit").uninterruptible() => result,
+            _ = self.drop_waiter.acquire() => Err(Failure::Cancelled),
+        }
+    }
+}
+#[tokio::test]
+async fn protected_control_channel_survives_its_dropped_waiter() {
+    let (mut runtime, client, mut events) = setup();
+    let drop_waiter = Arc::new(Semaphore::new(0));
+    let mut run = runtime
+        .submit(DropProtected {
+            client: client.clone(), // Keep the service alive after its Workflow drops.
+            drop_waiter: drop_waiter.clone(),
+        })
+        .await
+        .unwrap();
+    let (_, mut token, finish) = bounded(events.recv()).await.unwrap();
+    drop_waiter.add_permits(1);
+    let mut control = run.control.clone();
+    bounded(async {
+        while control.state() != RunState::Settling {
+            control.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert!(!token.is_cancelled());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), token.changed())
+            .await
+            .is_err()
+    );
+    finish.send(()).unwrap();
+    assert_eq!(bounded(run.result()).await, Err(Failure::Cancelled));
+    runtime.shutdown().await.unwrap();
+}
 async fn entered(run: &Run<()>) {
     bounded(async {
         while !run.control.has_started() {

@@ -10,7 +10,7 @@ mod standalone;
 mod tasks;
 mod workflow;
 
-pub use activity::{Activity, ActivityAction, ActivityScope};
+pub use activity::{Activity, ActivityAction, ActivityScope, ActivityWait, Backoff, RetryPolicy};
 pub use driver::execution::Run;
 pub use driver::recovery::Restored;
 pub use driver::{ExecutionView, StartPermit, WorkflowDriver};
@@ -19,7 +19,8 @@ pub use service::{ActivityClient, ActivityContext, ActivityExit, ServiceClient, 
 pub use standalone::{RuntimeHandle, WorkflowRuntime};
 pub(crate) use tasks::TaskInfo;
 pub use tasks::{
-    ActivityHistory, ActivitySnapshot, ActivityState, TaskObserver, TaskProgress, TaskSnapshot,
+    ActivityHistory, ActivityKind, ActivitySnapshot, ActivityState, TaskObserver, TaskProgress,
+    TaskSnapshot,
 };
 pub use workflow::{
     ActivityCall, Dependencies, Readiness, RunCondition, Workflow, WorkflowContext,

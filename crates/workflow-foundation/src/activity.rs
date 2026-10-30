@@ -1,45 +1,102 @@
-//! A business step over the existing service calls and Task control boundaries.
-use crate::*;
+//! Business steps, result interpretation and cooperative execution capabilities.
+use crate::{tasks::ActivityObservation, *};
 use async_trait::async_trait;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-/// One step, retained in memory across retries and suspension. External effects
-/// go through scope.call(); execute must consume the actual reply before returning.
-/// Long local loops cooperate with scope.control(). No Future is forcibly dropped.
+mod policy;
+mod runner;
+pub use policy::{Backoff, RetryPolicy};
+
+/// One logical step. The same instance and ActivityId survive retries and
+/// suspension. External effects use scope.call(); local loops cooperate at
+/// scope.wait_until_runnable()/sleep() or inspect scope.control().
 #[async_trait]
 pub trait Activity: Send {
     type Reply: Send;
     type Output: Send;
-
     fn name(&self) -> &'static str;
+    fn description(&self) -> Option<&str> {
+        None
+    }
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
     async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply>;
-    /// Interpret a settled reply. Cancelled/Uncertain execution results bypass
-    /// this handler. Retry limits and continuation data belong to the step.
+    /// Interpret a settled business result. Cancelled/Uncertain execution
+    /// results bypass this handler and can never be retried or hidden as success.
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<Self::Output>>;
 }
 
 pub enum ActivityAction<T> {
     Continue(T),
-    Retry(Duration),
-    /// A domain operation stopped for a Task pause. Resume rechecks admission
-    /// and calls execute on this same instance; the Workflow stays at its await.
-    Suspend,
-    /// Terminal cancellation, including when the Workflow is durable.
+    Retry {
+        reason: String,
+    },
+    Suspend(ActivityWait),
+    /// Deliberate terminal cancellation, also for existing durable Workflows.
     Cancel,
 }
+pub enum ActivityWait {
+    /// A domain operation stopped for a Task pause. Resume rechecks admission.
+    Resume,
+    /// Read-only, cancellation-safe check. Update its source and call
+    /// RunControl::recheck() to wake the waiting Activity.
+    Condition(Arc<dyn RunCondition>),
+}
 
-/// Borrowed access to existing Workflow primitives. Each service call keeps its
-/// own resource lease and observation; this adds no composite lock or executor.
+/// Calls retain their own resource leases and are children of this step;
+/// there is no implicit multi-call transaction.
 pub struct ActivityScope<'a> {
     context: &'a mut WorkflowContext,
-    name: &'static str,
+    observation: &'a ActivityObservation,
+    terminal_error: Option<Failure>,
 }
 impl ActivityScope<'_> {
+    fn record_terminal<T>(&mut self, result: &Outcome<T>) {
+        if let Err(error @ (Failure::Cancelled | Failure::Uncertain(_))) = result {
+            self.terminal_error = Some(error.clone());
+        }
+    }
+    pub fn id(&self) -> ActivityId {
+        self.observation.id()
+    }
     pub fn control(&self) -> ControlToken {
         self.context.control()
     }
     pub fn report_progress(&self, completed: u64, total: Option<u64>) {
-        self.context.report_progress(self.name, completed, total);
+        if total.is_some_and(|total| completed > total) {
+            return;
+        }
+        let progress = TaskProgress {
+            stage: Some(self.observation.name().into()),
+            completed,
+            total,
+        };
+        self.context.progress.send_replace(progress.clone());
+        self.observation.update(|entry| entry.progress = progress);
+    }
+    /// Park inside execute without ending the attempt. Use only after actual
+    /// operations have settled, never while external IO still needs stopping.
+    pub async fn wait_until_runnable(&mut self) -> Outcome<()> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        let result = self.context.wait_observed(Some(self.observation)).await;
+        self.record_terminal(&result);
+        result
+    }
+    /// Local-loop delay: suspension parks this same execute Future; cancellation
+    /// ends the delay. In-flight IO is never raced/dropped.
+    pub async fn sleep(&mut self, delay: Duration) -> Outcome<()> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        let result = self
+            .context
+            .sleep_observed(delay, Some(self.observation))
+            .await;
+        self.record_terminal(&result);
+        result
     }
     pub async fn call<
         R: Send + 'static,
@@ -51,61 +108,12 @@ impl ActivityScope<'_> {
         service: &ActivityClient<R, P, Q, V>,
         request: R,
     ) -> Outcome<P> {
-        self.context
-            .activity(service, request)
-            .name(self.name)
-            .await
-    }
-}
-
-impl WorkflowContext {
-    /// Interpret results in the Activity; return only its final business output
-    /// to the Workflow. Local step state is not a persistent checkpoint.
-    pub async fn run_activity<A: Activity>(&mut self, mut step: A) -> Outcome<A::Output> {
-        let name = step.name();
-        if name.chars().all(char::is_whitespace) || name.len() > 256 {
-            return Err(Failure::Rejected("invalid Activity name".into()));
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
         }
-        loop {
-            self.wait_until_runnable().await?;
-            let generation = self.control().request().generation;
-            let result = step
-                .execute(&mut ActivityScope {
-                    context: self,
-                    name,
-                })
-                .await;
-            // Includes calls whose waiter was abandoned or whose Uncertain
-            // result was swallowed in execute. Never start a new attempt then.
-            self.tracker.ready()?;
-            if let Err(error @ (Failure::Cancelled | Failure::Uncertain(_))) = result {
-                return Err(error);
-            }
-            let action = match step.handle(result) {
-                Err(Failure::Cancelled) => ActivityAction::Cancel,
-                action => action?,
-            };
-            match action {
-                ActivityAction::Continue(value) => return Ok(value),
-                ActivityAction::Retry(delay) => self.sleep(delay).await?,
-                ActivityAction::Suspend => {
-                    self.check_execution()?;
-                    let request = self.control().request();
-                    // Resume can race the stopped reply. With no observed
-                    // control change, Suspend would otherwise spin forever.
-                    if !request.paused() && request.generation == generation {
-                        return Err(Failure::Rejected("Suspend requires a Task pause".into()));
-                    }
-                }
-                ActivityAction::Cancel => {
-                    self.controls.user_cancelled.store(true, Ordering::SeqCst);
-                    self.controls.revoke();
-                    self.persist_intent().await.map_err(|error| {
-                        Failure::Uncertain(format!("cancellation intent not persisted: {error}"))
-                    })?;
-                    return Err(Failure::Cancelled);
-                }
-            }
-        }
+        let id = self.id();
+        let result = self.context.activity(service, request).parent(id).await;
+        self.record_terminal(&result);
+        result
     }
 }

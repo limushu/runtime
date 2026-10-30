@@ -188,17 +188,30 @@ impl WorkflowContext {
     /// Wait for suspension reasons to clear and the workflow's RunCondition to
     /// become Ready. All earlier activities must have settled at this boundary.
     pub async fn wait_until_runnable(&mut self) -> Outcome<()> {
+        self.wait_observed(None).await
+    }
+    pub(crate) async fn wait_observed(
+        &mut self,
+        observation: Option<&ActivityObservation>,
+    ) -> Outcome<()> {
         self.check_execution()?;
         let cancel = self.cancel.clone();
-        self.wait_for_readiness(&cancel).await?;
+        self.wait_for_readiness(&cancel, observation).await?;
         self.state.send_replace(RunState::Running);
+        if let Some(observation) = observation {
+            observation.state(ActivityState::Running);
+        }
         Ok(())
     }
     pub fn control(&self) -> ControlToken {
         self.controls.token(self.cancel.clone())
     }
 
-    async fn wait_for_readiness(&mut self, cancel: &CancellationToken) -> Outcome<()> {
+    async fn wait_for_readiness(
+        &mut self,
+        cancel: &CancellationToken,
+        observation: Option<&ActivityObservation>,
+    ) -> Outcome<()> {
         let mut token = self.controls.token(cancel.clone());
         loop {
             self.persist_intent().await?;
@@ -209,6 +222,9 @@ impl WorkflowContext {
             if request.paused() {
                 if self.controls.acknowledge(request.generation, cancel) {
                     self.state.send_replace(RunState::Suspended);
+                    if let Some(observation) = observation {
+                        observation.state(ActivityState::Suspended);
+                    }
                 }
                 token.changed().await?;
                 continue;
@@ -229,6 +245,9 @@ impl WorkflowContext {
             match decision {
                 Readiness::Ready => return Ok(()),
                 Readiness::Blocked(reason) => {
+                    if let Some(observation) = observation {
+                        observation.state(ActivityState::WaitingConditions(reason.clone()));
+                    }
                     self.state.send_replace(RunState::WaitingConditions(reason));
                     tokio::select! {
                         r = token.changed() => { r?; },
@@ -256,16 +275,47 @@ impl WorkflowContext {
         }
     }
     pub async fn sleep(&mut self, delay: Duration) -> Outcome<()> {
-        let deadline = tokio::time::Instant::now() + delay;
+        self.sleep_observed(delay, None).await
+    }
+    pub(crate) async fn sleep_observed(
+        &mut self,
+        delay: Duration,
+        observation: Option<&ActivityObservation>,
+    ) -> Outcome<()> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(delay)
+            .ok_or_else(|| Failure::Rejected("timer deadline overflow".into()))?;
         loop {
-            self.wait_until_runnable().await?;
+            self.wait_observed(observation).await?;
             self.state.send_replace(RunState::WaitingTimer);
+            if let Some(observation) = observation {
+                observation.state(ActivityState::WaitingTimer);
+            }
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
                 changed = self.pause.changed() => { changed.map_err(|_| Failure::Unavailable)?; }
-                _ = tokio::time::sleep_until(deadline) => return self.wait_until_runnable().await,
+                _ = tokio::time::sleep_until(deadline) => return self.wait_observed(observation).await,
             }
+        }
+    }
+    pub(crate) fn next_activity_id(&mut self) -> Outcome<ActivityId> {
+        self.next_activity = self
+            .next_activity
+            .checked_add(1)
+            .ok_or_else(|| Failure::Rejected("Activity sequence exhausted".into()))?;
+        Ok(ActivityId {
+            task_id: self.id,
+            sequence: self.next_activity,
+        })
+    }
+    fn parent_state(&self, parent: Option<ActivityId>, state: ActivityState) {
+        if let Some(id) = parent {
+            self.activities.send_modify(|history| {
+                if let Some(entry) = history.entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.state = state;
+                }
+            });
         }
     }
     /// Configure a single invocation; ordinary `.activity(...).await` is unchanged.
@@ -285,6 +335,7 @@ impl WorkflowContext {
             service,
             request: Some(request),
             name: None,
+            parent: None,
             uninterruptible: false,
             configuration_error: false,
             future: None,
@@ -301,6 +352,7 @@ impl WorkflowContext {
         request: R,
         uninterruptible: bool,
         name: Option<&'static str>,
+        parent: Option<ActivityId>,
     ) -> Outcome<P> {
         if name.is_some_and(|name| name.chars().all(char::is_whitespace) || name.len() > 256) {
             return Err(Failure::Rejected("invalid Activity name".into()));
@@ -323,11 +375,7 @@ impl WorkflowContext {
             ));
         }
         let resources = (service.resources)(&request);
-        self.next_activity += 1;
-        let id = ActivityId {
-            task_id: self.id,
-            sequence: self.next_activity,
-        };
+        let id = self.next_activity_id()?;
         let mut observation = ActivityObservation::new(
             self.activities.clone(),
             self.activity_history,
@@ -338,8 +386,10 @@ impl WorkflowContext {
                 None => (service.activity_name)(&request),
             },
             resources.clone(),
+            parent,
         );
         let permit: Outcome<Permit> = async {
+            self.parent_state(parent, ActivityState::WaitingResources);
             if uninterruptible {
                 self.state.send_replace(RunState::WaitingResources);
                 return self.broker.acquire(Kind::Activity, resources.clone(), &self.shutdown).await;
@@ -369,6 +419,7 @@ impl WorkflowContext {
             }
         };
         observation.queued();
+        self.parent_state(parent, ActivityState::Running);
         let guard = self.tracker.register(permit, observation);
         self.state.send_replace(RunState::Activity(id));
         let cancel = if uninterruptible {
@@ -392,13 +443,21 @@ impl WorkflowContext {
                 cancel: cancel.clone(),
                 control,
                 progress: self.progress.clone(),
+                activity_progress: Some((
+                    self.activities.clone(),
+                    match parent {
+                        Some(id) => id,
+                        None => id,
+                    },
+                )),
+                _protected_controls: protected_controls.clone(),
             },
             guard,
         );
         let result = if uninterruptible {
             operation.await
         } else {
-            self.drive_activity(cancel, operation).await
+            self.drive_activity(cancel, operation, parent).await
         };
         self.state.send_replace(RunState::Running);
         result
@@ -411,6 +470,7 @@ impl WorkflowContext {
         &mut self,
         cancel: CancellationToken,
         operation: impl std::future::Future<Output = Outcome<P>>,
+        parent: Option<ActivityId>,
     ) -> Outcome<P> {
         tokio::pin!(operation);
         let mut token = self.controls.token(cancel.clone());
@@ -434,6 +494,7 @@ impl WorkflowContext {
             }
             if token.request().paused() {
                 self.state.send_replace(RunState::Suspending);
+                self.parent_state(parent, ActivityState::Suspending);
             }
             tokio::select! {
                 biased;
@@ -462,11 +523,16 @@ pub struct ActivityCall<'a, R, P, Q, V> {
     service: &'a ActivityClient<R, P, Q, V>,
     request: Option<R>,
     name: Option<&'static str>,
+    parent: Option<ActivityId>,
     uninterruptible: bool,
     configuration_error: bool,
     future: Option<BoxFuture<'a, Outcome<P>>>,
 }
 impl<R, P, Q, V> ActivityCall<'_, R, P, Q, V> {
+    pub(crate) fn parent(mut self, id: ActivityId) -> Self {
+        self.parent = Some(id);
+        self
+    }
     /// Override the observation label for this service invocation.
     pub fn name(mut self, name: &'static str) -> Self {
         self.configuration_error |= self.context.is_none();
@@ -507,6 +573,7 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
                 request,
                 this.uninterruptible,
                 this.name,
+                this.parent,
             )));
         }
         match &mut this.future {
