@@ -24,7 +24,7 @@ impl<T> Run<T> {
     pub fn id(&self) -> TaskId {
         self.control.id
     }
-    /// Confirms durable acceptance (or immediate in-memory registration). Driver owners
+    /// Confirms persisted acceptance (or immediate in-memory registration). Driver owners
     /// must keep polling tick() while waiting; application submit APIs await this for you.
     pub async fn accepted(&mut self) -> Outcome<()> {
         loop {
@@ -53,6 +53,24 @@ impl<T> Run<T> {
 struct Tracking {
     pending: usize,
     uncertain: bool,
+    closed: bool,
+}
+impl Tracking {
+    fn ready(&self) -> Outcome<()> {
+        if self.closed {
+            Err(Failure::Rejected("activity body has ended".into()))
+        } else if self.uncertain {
+            Err(Failure::Uncertain(
+                "earlier activity needs reconciliation".into(),
+            ))
+        } else if self.pending != 0 {
+            Err(Failure::Rejected(
+                "previous activity has not settled".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 #[derive(Clone, Default)]
 pub(crate) struct Tracker {
@@ -64,18 +82,15 @@ impl Tracker {
         self.state.lock().unwrap().uncertain = true;
     }
     pub(crate) fn ready(&self) -> Outcome<()> {
-        let state = self.state.lock().unwrap();
-        if state.uncertain {
-            Err(Failure::Uncertain(
-                "earlier activity needs reconciliation".into(),
-            ))
-        } else if state.pending != 0 {
-            Err(Failure::Rejected(
-                "previous activity has not settled".into(),
-            ))
-        } else {
-            Ok(())
-        }
+        self.state.lock().unwrap().ready()
+    }
+    /// Seal an Activity body's invocation capability before releasing its lease.
+    /// Registration and closure use the same mutex, including escaped contexts.
+    pub(crate) fn close(&self) -> Outcome<()> {
+        let mut state = self.state.lock().unwrap();
+        let ready = state.ready();
+        state.closed = true;
+        ready
     }
     pub(crate) fn register(
         &self,
@@ -85,10 +100,23 @@ impl Tracker {
         self.state.lock().unwrap().pending += 1;
         ActivityGuard {
             tracker: self.clone(),
-            permit,
+            permit: Some(permit),
             uncertain: false,
-            observation,
+            observation: Some(observation),
         }
+    }
+    /// A service invocation inside an Activity body shares its parent's resource
+    /// lease and observation, but must still be tracked until the real reply.
+    pub(crate) fn register_call(&self) -> Outcome<ActivityGuard> {
+        let mut state = self.state.lock().unwrap();
+        state.ready()?;
+        state.pending += 1;
+        Ok(ActivityGuard {
+            tracker: self.clone(),
+            permit: None,
+            uncertain: false,
+            observation: None,
+        })
     }
     pub(crate) async fn settle(&self, cancel: &CancellationToken) -> bool {
         if self.state.lock().unwrap().pending != 0 {
@@ -108,26 +136,36 @@ impl Tracker {
 }
 pub(crate) struct ActivityGuard {
     tracker: Tracker,
-    permit: Permit,
+    permit: Option<Permit>,
     uncertain: bool,
-    observation: ActivityObservation,
+    observation: Option<ActivityObservation>,
 }
 impl ActivityGuard {
     pub fn started(&mut self) {
         self.uncertain = true;
-        self.permit.started();
-        self.observation.started();
+        if let Some(permit) = &mut self.permit {
+            permit.started();
+        }
+        if let Some(observation) = &mut self.observation {
+            observation.started();
+        }
     }
     pub fn settled<T>(&mut self, result: &Outcome<T>) {
         self.uncertain = result.as_ref().is_err_and(|e| e.uncertain());
-        self.permit.settled(result);
-        self.observation.settled(result);
+        if let Some(permit) = &mut self.permit {
+            permit.settled(result);
+        }
+        if let Some(observation) = &mut self.observation {
+            observation.settled(result);
+        }
     }
 }
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         // Publish the final observation before waking a workflow settling its guards.
-        self.observation.abandon();
+        if let Some(observation) = &mut self.observation {
+            observation.abandon();
+        }
         let mut state = self.tracker.state.lock().unwrap();
         state.pending -= 1;
         state.uncertain |= self.uncertain;
@@ -228,7 +266,12 @@ pub(crate) fn execution<W: Workflow>(
         ..TaskInfo::default()
     })
     .0;
-    let (progress, progress_rx) = watch::channel(TaskProgress::default());
+    let (progress, progress_rx) = watch::channel(
+        restored
+            .as_ref()
+            .map(|task| task.observation.progress.clone())
+            .unwrap_or_default(),
+    );
     let (activities, activities_rx) = watch::channel(ActivityHistory::default());
     let objects = Arc::new(Mutex::new(
         restored
@@ -244,7 +287,7 @@ pub(crate) fn execution<W: Workflow>(
         state: state_rx,
         max_signal_bytes: config.max_signal_bytes,
         controls: controls.clone(),
-        durable: journal.is_some(),
+        persistent: journal.is_some(),
         acceptance: accepted_rx.clone(),
         progress: progress_rx,
         info: info.clone(),
@@ -305,6 +348,7 @@ pub(crate) fn execution<W: Workflow>(
             for object in &declared {
                 object.validate()?;
             }
+            context.persist_observation().await?;
             if let Some(start) = start {
                 // The application owns logical objects for a managed run.
                 tokio::pin!(start);
@@ -336,10 +380,22 @@ pub(crate) fn execution<W: Workflow>(
                 }
             }
             context.wait_until_runnable().await?;
+            if let Some(journal) = &context.journal {
+                journal.update(|task| {
+                    task.observation.started_at.get_or_insert_with(std::time::SystemTime::now);
+                    task.observation.state = Some(RunState::Running);
+                }).await?;
+            }
             let journal = context.journal.clone();
             let controls = context.controls.clone();
             let cancel = context.cancel.clone();
             let mut requests = controls.tx.subscribe();
+            let observed_state = context.state.clone();
+            let observed_progress = context.progress.clone();
+            let observed_info = context.info.clone();
+            let mut state_updates = observed_state.subscribe();
+            let mut progress_updates = observed_progress.subscribe();
+            let mut info_updates = observed_info.subscribe();
             let body = async {
                 context.controls.entered.store(true, std::sync::atomic::Ordering::SeqCst);
                 context.controls.wake.notify_one();
@@ -352,33 +408,37 @@ pub(crate) fn execution<W: Workflow>(
             let updates = async {
                 loop {
                     sync_controls(&journal, &controls, &cancel).await?;
+                    sync_observation(&journal, &observed_state, &observed_progress, &observed_info).await?;
                     tokio::select! {
                         _ = updates_stop.cancelled() => return Ok::<(), Failure>(()),
                         r = requests.changed() => r.map_err(|_| Failure::Unavailable)?,
+                        r = state_updates.changed(), if journal.is_some() => r.map_err(|_| Failure::Unavailable)?,
+                        r = progress_updates.changed(), if journal.is_some() => r.map_err(|_| Failure::Unavailable)?,
+                        r = info_updates.changed(), if journal.is_some() => r.map_err(|_| Failure::Unavailable)?,
                     }
                 }
             };
             tokio::pin!(updates);
-            let mut control_error = None;
+            let mut storage_error = None;
             loop {
                 tokio::select! {
                     biased;
                     result = &mut body => {
                         // Finish a dispatched write before the final CAS update.
                         updates_stop.cancel();
-                        if control_error.is_none() {
-                            control_error = updates.await.err().map(|error| Failure::Uncertain(
-                                format!("control intent not persisted: {error}")
+                        if storage_error.is_none() {
+                            storage_error = updates.await.err().map(|error| Failure::Uncertain(
+                                format!("task state not persisted: {error}")
                             ));
                         }
-                        break match control_error {
+                        break match storage_error {
                             Some(error) if !result.as_ref().is_err_and(|e| e.uncertain()) => Err(error),
                             _ => result,
                         };
                     },
-                    result = &mut updates, if control_error.is_none() => {
+                    result = &mut updates, if storage_error.is_none() => {
                         if let Err(error) = result {
-                            control_error = Some(Failure::Uncertain(format!("control intent not persisted: {error}")));
+                            storage_error = Some(Failure::Uncertain(format!("task state not persisted: {error}")));
                             cancel.cancel();
                         }
                     }
@@ -405,10 +465,14 @@ pub(crate) fn execution<W: Workflow>(
                 .controls
                 .user_cancelled
                 .load(std::sync::atomic::Ordering::SeqCst);
+            let recoverable = journal.record.lock().await.recoverable;
             let outcome = match &result {
                 Ok(_) => crate::persistence::StoredOutcome::Completed,
-                Err(Failure::Cancelled) if !user_cancelled => {
+                Err(Failure::Cancelled) if !user_cancelled && recoverable => {
                     crate::persistence::StoredOutcome::Pending
+                }
+                Err(Failure::Cancelled) if !user_cancelled => {
+                    crate::persistence::StoredOutcome::Interrupted
                 }
                 Err(Failure::Cancelled) => crate::persistence::StoredOutcome::Cancelled,
                 Err(Failure::Uncertain(e)) => {
@@ -418,12 +482,23 @@ pub(crate) fn execution<W: Workflow>(
             };
             let details = context.info.borrow().details.clone();
             let paused = context.controls.reasons().contains("user");
+            let progress = context.progress.borrow().clone();
+            let terminal_state = match &result {
+                Ok(_) => RunState::Completed,
+                Err(error) => RunState::Failed(error.clone()),
+            };
+            let finished = outcome != crate::persistence::StoredOutcome::Pending;
             if let Err(error) = journal
                 .update(|r| {
                     r.outcome = outcome;
                     r.details = details;
                     r.user_paused = paused;
                     r.cancel_requested = user_cancelled;
+                    r.observation.state = Some(terminal_state);
+                    r.observation.progress = progress;
+                    if finished {
+                        r.observation.finished_at = Some(std::time::SystemTime::now());
+                    }
                 })
                 .await
             {
@@ -447,6 +522,36 @@ pub(crate) fn execution<W: Workflow>(
         },
         future,
     )
+}
+
+/// Read the watches under the journal lock, so a delayed observer cannot overwrite
+/// a newer checkpoint/details snapshot. watch coalesces rapid progress reports.
+pub(crate) async fn sync_observation(
+    journal: &Option<crate::persistence::Journal>,
+    state: &watch::Sender<RunState>,
+    progress: &watch::Sender<TaskProgress>,
+    info: &watch::Sender<TaskInfo>,
+) -> Outcome<()> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    journal
+        .update_if(|task| {
+            let state = state.borrow().clone();
+            let progress = progress.borrow().clone();
+            let details = info.borrow().details.clone();
+            if task.observation.state.as_ref() == Some(&state)
+                && task.observation.progress == progress
+                && task.details == details
+            {
+                return false;
+            }
+            task.observation.state = Some(state);
+            task.observation.progress = progress;
+            task.details = details;
+            true
+        })
+        .await
 }
 
 pub(crate) async fn sync_controls(

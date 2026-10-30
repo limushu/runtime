@@ -19,7 +19,7 @@ pub struct RunControl {
     pub(crate) state: watch::Receiver<RunState>,
     pub(crate) max_signal_bytes: usize,
     pub(crate) controls: crate::control::Controls,
-    pub(crate) durable: bool,
+    pub(crate) persistent: bool,
     pub(crate) acceptance: watch::Receiver<Option<Outcome<()>>>,
     pub(crate) info: watch::Sender<TaskInfo>,
     pub(crate) progress: watch::Receiver<TaskProgress>,
@@ -27,7 +27,7 @@ pub struct RunControl {
     pub(crate) objects: Arc<Mutex<Vec<ObjectKey>>>,
 }
 impl RunControl {
-    /// None while durable registration is pending. Not a workflow completion result.
+    /// None while persisted registration is pending. Not a workflow completion result.
     pub fn acceptance_status(&self) -> Option<Outcome<()>> {
         self.acceptance.borrow().clone()
     }
@@ -131,7 +131,7 @@ impl RunControl {
             .user_cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.controls.revoke();
-        if self.durable {
+        if self.persistent {
             self.controls.tx.send_modify(|r| r.generation += 1);
         } else {
             self.cancel.cancel();

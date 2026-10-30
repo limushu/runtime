@@ -40,7 +40,11 @@ model 不依赖 Tokio 或 workflow-foundation，service 不依赖托管自己的
 ## 使用与观察
 
 需要主备切换时，通过 `with_task_ids`、`with_task_store` 和异步 `activate(PoolRecovery)` 启动；
-该入口的 `pool.shrink()` 自动持久化。降主使用 `manager.demote()`，新宿主以更新轮次重新激活。
+该入口默认保存普通任务摘要，`pool.shrink()` 额外保存续作数据。降主使用 `manager.demote()`，新宿主以更新轮次重新激活。
+切主后通过 `pool.history(TaskQuery::default()).await` 分页查看已处理事件，
+或 `pool.history_task(id).await` 查看原 Task。历史记录不进入调度队列；普通任务不会自动重跑。
+`Config::record_history = false` 可关闭普通任务摘要记录，缩容续作记录仍然保存；
+详细策略和 KV 适配接口见 [Task 历史](../workflow-foundation/README.md#跨切主的-task-历史)。
 完整运行示例和边界见 [主备切换](../../docs/leader-handoff.md)。下面的 create_pool 示例保留内存模式。
 
 ```rust,ignore

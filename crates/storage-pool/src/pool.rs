@@ -169,6 +169,19 @@ impl PoolHandle {
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.task_center.tasks()
     }
+    /// Persistent history across leader changes; querying never restarts a Task.
+    pub async fn history(
+        &self,
+        query: workflow_foundation::persistence::TaskQuery,
+    ) -> Outcome<workflow_foundation::persistence::TaskPage> {
+        self.task_center.history(query).await
+    }
+    pub async fn history_task(
+        &self,
+        id: TaskId,
+    ) -> Outcome<workflow_foundation::persistence::SavedTask> {
+        self.task_center.history_task(id).await
+    }
     pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
         self.task_center.task(id)
     }

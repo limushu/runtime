@@ -1,6 +1,7 @@
 //! Business-facing Workflow contract and context: Activity calls and safe boundaries.
 //! Task execution and settlement live in driver/execution.rs; controls in control.rs.
 use crate::{
+    activity::{ActivityFnFactory, Invocation, Options, run_step},
     driver::execution::{Tracker, sync_controls},
     locks::{Broker, Kind, Permit},
     model::Scope,
@@ -9,14 +10,12 @@ use crate::{
     *,
 };
 use async_trait::async_trait;
-use futures_util::{FutureExt, future::BoxFuture};
+use futures_util::FutureExt;
 use std::{
     any::{Any, TypeId},
     collections::BTreeMap,
     future::Future,
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
     time::Duration,
 };
 use tokio::sync::{mpsc, watch};
@@ -67,9 +66,10 @@ pub trait Workflow: Send + 'static {
     fn details(&self) -> Outcome<serde_json::Value> {
         Ok(serde_json::Value::Null)
     }
-    /// Persistence is declared here, never inferred from whether a store happens to exist.
+    /// Ordinary tasks inherit host history recording. Durable explicitly opts
+    /// into continuation; Memory opts out of all task-record persistence.
     fn persistence(&self) -> Outcome<Persistence> {
-        Ok(Persistence::Memory)
+        Ok(Persistence::History)
     }
     /// Rebuild ONLY the execution body for a persisted Task, binding this host's clients.
     /// Driver restores Task identity, control state and checkpoint separately; this
@@ -162,6 +162,11 @@ impl WorkflowContext {
             .journal
             .as_ref()
             .ok_or_else(|| Failure::Rejected("workflow is not persistent".into()))?;
+        if !journal.record.lock().await.recoverable {
+            return Err(Failure::Rejected(
+                "history-only task does not support checkpoints".into(),
+            ));
+        }
         let details = self.info.borrow().details.clone();
         journal
             .update(|r| {
@@ -174,6 +179,15 @@ impl WorkflowContext {
     }
     pub(crate) async fn persist_intent(&self) -> Outcome<()> {
         sync_controls(&self.journal, &self.controls, &self.cancel).await
+    }
+    pub(crate) async fn persist_observation(&self) -> Outcome<()> {
+        crate::driver::execution::sync_observation(
+            &self.journal,
+            &self.state,
+            &self.progress,
+            &self.info,
+        )
+        .await
     }
     pub fn check_execution(&self) -> Outcome<()> {
         if self.cancel.is_cancelled() || self.scope.is_closed() {
@@ -207,6 +221,7 @@ impl WorkflowContext {
                 if self.controls.acknowledge(request.generation, cancel) {
                     self.state.send_replace(RunState::Suspended);
                 }
+                self.persist_observation().await?;
                 token.changed().await?;
                 continue;
             }
@@ -227,6 +242,7 @@ impl WorkflowContext {
                 Readiness::Ready => return Ok(()),
                 Readiness::Blocked(reason) => {
                     self.state.send_replace(RunState::WaitingConditions(reason));
+                    self.persist_observation().await?;
                     tokio::select! {
                         r = token.changed() => { r?; },
                         _ = self.controls.recheck.notified() => {},
@@ -276,26 +292,90 @@ impl WorkflowContext {
         &'a mut self,
         service: &'a ActivityClient<R, P, Q, V>,
         request: R,
-    ) -> ActivityCall<'a, R, P, Q, V> {
-        ActivityCall {
-            context: Some(self),
-            service,
-            request: Some(request),
-            uninterruptible: false,
-            future: None,
-        }
+    ) -> ActivityCall<'a, P> {
+        ActivityCall::new(move |options| {
+            Box::pin(async move {
+                let invocation = Invocation {
+                    scope: service.scope.clone(),
+                    service: service.name.to_string(),
+                    name: (service.activity_name)(&request),
+                    resources: service.resources(&request),
+                    dispatch: Box::new(move |context, guard| {
+                        Box::pin(service.dispatch(request, context, guard))
+                    }),
+                };
+                self.execute_activity(invocation, options).await
+            })
+        })
     }
-    async fn execute_activity<
-        R: Send + 'static,
-        P: Send + 'static,
-        Q: Send + 'static,
-        V: Send + 'static,
-    >(
+    /// Run a named step. Metadata, resources and retry budget are defined by the
+    /// Activity; execution, observation and controls use the usual Activity path.
+    pub fn run_activity<A: Activity>(
         &mut self,
-        service: &ActivityClient<R, P, Q, V>,
-        request: R,
-        uninterruptible: bool,
+        step: A,
+    ) -> ActivityCall<'_, ActivityExit<A::Output, ()>> {
+        ActivityCall::new(move |mut options| {
+            Box::pin(async move {
+                let name = step.name();
+                options.name.get_or_insert(name);
+                if options.description.is_none() {
+                    options.description = step.description().map(str::to_owned);
+                }
+                let retry = step.retry();
+                options.retry = retry;
+                let history = self.activities.clone();
+                let invocation =
+                    Invocation::body(self.scope.clone(), name, step.resources(), move |scope| {
+                        run_step(scope, step, retry, history)
+                    });
+                self.execute_activity(invocation, options).await
+            })
+        })
+    }
+    /// Function adapter for Activity, with optional result handling and retries.
+    /// Use `|| function(args)` or `|scope| function(scope, args)` when calling
+    /// managed services. Each attempt must own its arguments (Send + 'static),
+    /// because an abandoned waiter must not destroy in-flight effects.
+    pub fn activity_fn<T, F, Args: 'static>(&mut self, function: F) -> ActivityFn<'_, T>
+    where
+        T: Send + 'static,
+        F: ActivityFnFactory<Args, T>,
+    {
+        ActivityFn::new(self, function)
+    }
+    /// Advanced body for business loops and typed suspension checkpoints.
+    /// Declare the union of all service accesses up front.
+    /// The body owns its captures so that dropping its waiter cannot drop live IO.
+    /// Return ActivityExit::Suspended(checkpoint), then save and acknowledge in
+    /// the Workflow just as for a direct service Activity.
+    pub fn activity_body<T, F, Fut>(
+        &mut self,
+        name: &'static str,
+        resources: Vec<ResourceAccess>,
+        body: F,
+    ) -> ActivityCall<'_, T>
+    where
+        T: Send + 'static,
+        F: FnOnce(ActivityScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Outcome<T>> + Send + 'static,
+    {
+        ActivityCall::new(move |options| {
+            Box::pin(async move {
+                if name.trim().is_empty() || name.len() > 256 {
+                    return Err(Failure::Rejected("invalid Activity name".into()));
+                }
+                let invocation = Invocation::body(self.scope.clone(), name, resources, body);
+                self.execute_activity(invocation, options).await
+            })
+        })
+    }
+    pub(crate) async fn execute_activity<P: Send + 'static>(
+        &mut self,
+        invocation: Invocation<'_, P>,
+        options: Options,
     ) -> Outcome<P> {
+        options.validate()?;
+        let uninterruptible = options.uninterruptible;
         if uninterruptible {
             // Task control may already be requested. Mandatory work still runs;
             // host shutdown/fencing and resource safety are never bypassed.
@@ -308,12 +388,12 @@ impl WorkflowContext {
         } else {
             self.wait_until_runnable().await?;
         }
-        if !Arc::ptr_eq(&self.scope, &service.scope) {
+        if !Arc::ptr_eq(&self.scope, &invocation.scope) {
             return Err(Failure::Rejected(
                 "service belongs to another Pool instance".into(),
             ));
         }
-        let resources = (service.resources)(&request);
+        let resources = invocation.resources;
         self.next_activity += 1;
         let id = ActivityId {
             task_id: self.id,
@@ -323,8 +403,9 @@ impl WorkflowContext {
             self.activities.clone(),
             self.activity_history,
             id,
-            service.name.to_string(),
-            (service.activity_name)(&request),
+            invocation.service,
+            options.name.unwrap_or(invocation.name),
+            options.description,
             resources.clone(),
         );
         let permit: Outcome<Permit> = async {
@@ -372,13 +453,13 @@ impl WorkflowContext {
             .as_ref()
             .unwrap_or(&self.controls)
             .token(cancel.clone());
-        let operation = service.dispatch(
-            request,
+        let operation = (invocation.dispatch)(
             ActivityContext {
                 id,
                 cancel: cancel.clone(),
                 control,
                 progress: self.progress.clone(),
+                protected_controls: protected_controls.clone(),
             },
             guard,
         );
@@ -436,51 +517,5 @@ impl WorkflowContext {
         } else {
             result
         }
-    }
-}
-
-/// Options for the existing Activity invocation, not a separate activity kind.
-/// It remains a Future, including when used in select!/timeout.
-#[must_use = "an Activity does nothing until awaited"]
-pub struct ActivityCall<'a, R, P, Q, V> {
-    context: Option<&'a mut WorkflowContext>,
-    service: &'a ActivityClient<R, P, Q, V>,
-    request: Option<R>,
-    uninterruptible: bool,
-    future: Option<BoxFuture<'a, Outcome<P>>>,
-}
-impl<R, P, Q, V> ActivityCall<'_, R, P, Q, V> {
-    /// Defer task cancellation and suspension through resource acquisition,
-    /// dispatch and the actual reply, even if already requested before dispatch.
-    /// Return the business result so the caller can save its checkpoint. The next
-    /// ordinary boundary observes the unchanged task control request.
-    /// Host shutdown, service failure and lost leadership are NOT masked.
-    pub fn uninterruptible(mut self) -> Self {
-        assert!(
-            self.future.is_none(),
-            "configure an Activity before polling it"
-        );
-        self.uninterruptible = true;
-        self
-    }
-}
-// The request moves into a separately pinned Future on the first poll. No field
-// borrows another field, and the boxed Future itself never moves after polling.
-impl<R, P, Q, V> Unpin for ActivityCall<'_, R, P, Q, V> {}
-impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static> Future
-    for ActivityCall<'_, R, P, Q, V>
-{
-    type Output = Outcome<P>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.future.is_none() {
-            let context = this.context.take().expect("Activity already started");
-            this.future = Some(Box::pin(context.execute_activity(
-                this.service,
-                this.request.take().unwrap(),
-                this.uninterruptible,
-            )));
-        }
-        this.future.as_mut().unwrap().as_mut().poll(cx)
     }
 }

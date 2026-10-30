@@ -170,7 +170,7 @@ impl State {
         })
     }
     fn pump(&mut self) {
-        // A failed durable registration must not pause/cancel already accepted work.
+        // A failed persisted registration must not pause/cancel already accepted work.
         let accepted: Vec<_> = self
             .entries
             .iter()
@@ -441,6 +441,18 @@ impl TaskCenter {
     }
     pub fn tasks(&self) -> Vec<TaskSnapshot> {
         self.execution.tasks()
+    }
+    pub async fn history(
+        &self,
+        query: workflow_foundation::persistence::TaskQuery,
+    ) -> Outcome<workflow_foundation::persistence::TaskPage> {
+        self.execution.history(query).await
+    }
+    pub async fn history_task(
+        &self,
+        id: TaskId,
+    ) -> Outcome<workflow_foundation::persistence::SavedTask> {
+        self.execution.history_task(id).await
     }
     pub fn task(&self, id: TaskId) -> Outcome<TaskSnapshot> {
         self.execution.task(id)

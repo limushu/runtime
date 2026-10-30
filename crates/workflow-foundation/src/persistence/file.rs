@@ -121,6 +121,27 @@ impl FileTaskStore {
     }
 }
 impl TaskStore for FileTaskStore {
+    fn get(&self, id: TaskId) -> Outcome<Option<SavedTask>> {
+        let inner = self.inner.lock().unwrap();
+        if inner.poisoned {
+            return Err(Failure::Uncertain("journal requires reopen".into()));
+        }
+        Ok(inner.state.records.get(&id).cloned())
+    }
+    fn query(&self, pool: u128, query: &TaskQuery) -> Outcome<TaskPage> {
+        let inner = self.inner.lock().unwrap();
+        if inner.poisoned {
+            return Err(Failure::Uncertain("journal requires reopen".into()));
+        }
+        inner.state.query(pool, query)
+    }
+    fn unfinished(&self, pool: u128) -> Outcome<Vec<SavedTask>> {
+        let inner = self.inner.lock().unwrap();
+        if inner.poisoned {
+            return Err(Failure::Uncertain("journal requires reopen".into()));
+        }
+        Ok(inner.state.unfinished(pool))
+    }
     fn claim(&self, pool: u128, epoch: u64) -> Outcome<()> {
         self.append(Event::Claim { pool, epoch })
     }

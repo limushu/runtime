@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Failure {
     Cancelled,
     Rejected(String),
@@ -29,7 +29,7 @@ impl Failure {
 }
 pub type Outcome<T> = Result<T, Failure>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActivityId {
     pub task_id: crate::TaskId,
     pub sequence: u64,
@@ -95,7 +95,7 @@ impl Signal {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunState {
     WaitingObjects,
     Running,
@@ -142,6 +142,9 @@ pub struct Config {
     pub task_history: usize,
     /// Most recent Activity invocations retained per task (including its current Activity).
     pub activity_history: usize,
+    /// Record ordinary task summaries when a TaskStore is configured. Durable
+    /// continuation records are retained independently of this switch.
+    pub record_history: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -151,6 +154,7 @@ impl Default for Config {
             max_signal_bytes: 64 * 1024,
             task_history: 256,
             activity_history: 1024,
+            record_history: true,
         }
     }
 }

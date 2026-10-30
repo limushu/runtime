@@ -41,6 +41,8 @@ pub struct ActivityContext {
     pub(crate) cancel: CancellationToken,
     pub(crate) control: ControlToken,
     pub(crate) progress: watch::Sender<TaskProgress>,
+    // A protected body may outlive the Workflow's response Future.
+    pub(crate) protected_controls: Option<crate::control::Controls>,
 }
 impl ActivityContext {
     /// Live task progress from a long domain operation; reporting has no business effects.
@@ -108,6 +110,10 @@ impl<R, P, Q, V> Clone for ActivityClient<R, P, Q, V> {
 impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
     ActivityClient<R, P, Q, V>
 {
+    /// Accesses required by one request, for declaring a composite Activity body.
+    pub fn resources(&self, request: &R) -> Vec<ResourceAccess> {
+        (self.resources)(request)
+    }
     pub fn snapshot(&self) -> ServiceSnapshot {
         self.state.borrow().clone()
     }

@@ -485,6 +485,8 @@ async fn file_journal_locks_reopens_fences_old_owner_and_recovers_incomplete_tai
     let store = FileTaskStore::open(&path).unwrap();
     store.claim(7, 1).unwrap();
     let record = SavedTask {
+        recoverable: true,
+        observation: Default::default(),
         id: "1/00000000000000000000000000000007/checkpoint/1"
             .parse()
             .unwrap(),
@@ -575,6 +577,8 @@ async fn unknown_durable_workflow_keeps_admission_closed_until_its_definition_is
     store
         .save(
             SavedTask {
+                recoverable: true,
+                observation: Default::default(),
                 id,
                 version: 1,
                 input: json!({"disk":"a"}),
@@ -635,6 +639,8 @@ impl Workflow for SharedObject {
 }
 fn saved_checkpoint(sequence: u64) -> SavedTask {
     SavedTask {
+        recoverable: true,
+        observation: Default::default(),
         id: format!("1/00000000000000000000000000000007/checkpoint/{sequence}")
             .parse()
             .unwrap(),

@@ -2,6 +2,7 @@
 mod driver;
 mod identity;
 pub use identity::{TaskId, TaskIds};
+mod activity;
 mod locks;
 mod model;
 mod service;
@@ -9,6 +10,10 @@ mod standalone;
 mod tasks;
 mod workflow;
 
+pub use activity::{
+    Activity, ActivityAction, ActivityCall, ActivityDecision, ActivityFn, ActivityScope,
+    ActivityWait, ManagedActivity, Retry,
+};
 pub use driver::execution::Run;
 pub use driver::recovery::Restored;
 pub use driver::{ExecutionView, StartPermit, WorkflowDriver};
@@ -19,9 +24,7 @@ pub(crate) use tasks::TaskInfo;
 pub use tasks::{
     ActivityHistory, ActivitySnapshot, ActivityState, TaskObserver, TaskProgress, TaskSnapshot,
 };
-pub use workflow::{
-    ActivityCall, Dependencies, Readiness, RunCondition, Workflow, WorkflowContext,
-};
+pub use workflow::{Dependencies, Readiness, RunCondition, Workflow, WorkflowContext};
 
 mod control;
 pub use control::{CancellationReason, ControlRequest, ControlToken, RunControl};

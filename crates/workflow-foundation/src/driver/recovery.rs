@@ -1,4 +1,4 @@
-//! Restore persisted Tasks. Read restore() first: load -> prepare -> claim -> register.
+//! Load stored Tasks, close interrupted history, and restore only recoverable executions.
 //! Workflow::restore only rebuilds an execution body during prepare; Task identity,
 //! owner, control state, checkpoint and the scheduling start gate belong to this path.
 use super::*;
@@ -6,19 +6,25 @@ use crate::persistence::{self, SavedTask, StoredOutcome, TaskStore};
 
 impl WorkflowDriver {
     /// Recover the same Tasks, without executing their business logic.
-    /// Every record is checked before any ownership write; every ownership write
+    /// Every recoverable record is checked before any ownership write; every ownership write
     /// must succeed before any Task is registered. The owner opens start gates later.
     pub async fn restore(&mut self) -> Outcome<Vec<Restored>> {
         if self.recovery_ready || !self.running.is_empty() {
             return Err(Failure::Rejected(
-                "restore is only valid on a fresh durable host".into(),
+                "restore is only valid on a fresh persistent host".into(),
             ));
         }
         self.check_registration()?;
         let store = self.store.clone().ok_or(Failure::Unavailable)?;
 
-        let records = self.load_pending_tasks(&store).await?;
-        let mut tasks = self.prepare_tasks(records)?;
+        let records = self.load_unfinished_tasks(&store).await?;
+        let (recoverable, history): (Vec<_>, Vec<_>) =
+            records.into_iter().partition(|task| task.recoverable);
+        if recoverable.len() > self.config.max_workflows {
+            return Err(Failure::Busy);
+        }
+        let mut tasks = self.prepare_tasks(recoverable)?;
+        self.interrupt_history(history, &store).await?;
         self.claim_tasks(&store, &mut tasks).await?;
         self.check_registration()?;
         let restored = self.register_restored_tasks(tasks, store);
@@ -40,6 +46,10 @@ impl WorkflowDriver {
         let pool = self.pool_uuid;
         let epoch = self.ids.epoch();
         persistence::blocking(move || backend.claim(pool, epoch)).await?;
+        *self.view.history.lock().unwrap() = Some(super::HistoryStore {
+            pool,
+            store: store.clone(),
+        });
         self.store = Some(store);
         Ok(())
     }
@@ -57,10 +67,18 @@ impl WorkflowDriver {
         Ok(())
     }
 
-    async fn load_pending_tasks(&mut self, store: &Arc<dyn TaskStore>) -> Outcome<Vec<SavedTask>> {
+    async fn load_unfinished_tasks(
+        &mut self,
+        store: &Arc<dyn TaskStore>,
+    ) -> Outcome<Vec<SavedTask>> {
         let backend = store.clone();
         let pool = self.pool_uuid;
-        let mut records = persistence::blocking(move || backend.list(pool)).await?;
+        let mut records = persistence::blocking(move || backend.unfinished(pool)).await?;
+        if records.iter().any(|task| task.id.pool != pool) {
+            return Err(Failure::Rejected(
+                "task store returned another pool's task".into(),
+            ));
+        }
         records.retain(|task| {
             matches!(
                 task.outcome,
@@ -68,10 +86,33 @@ impl WorkflowDriver {
             )
         });
         records.sort_by_key(|task| task.id);
-        if records.len() > self.config.max_workflows {
-            return Err(Failure::Busy);
-        }
         Ok(records)
+    }
+
+    /// Close the old execution's audit record without constructing a Workflow.
+    /// NeedsCheck remains an explicit historical uncertainty, never a restart.
+    async fn interrupt_history(
+        &mut self,
+        records: Vec<SavedTask>,
+        store: &Arc<dyn TaskStore>,
+    ) -> Outcome<()> {
+        for mut task in records
+            .into_iter()
+            .filter(|task| task.outcome == StoredOutcome::Pending)
+        {
+            self.check_registration()?;
+            let previous = task.revision;
+            task.revision = task
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Failure::Rejected("task revision exhausted".into()))?;
+            task.owner_epoch = self.ids.epoch();
+            task.outcome = StoredOutcome::Interrupted;
+            task.observation.updated_at = Some(std::time::SystemTime::now());
+            let backend = store.clone();
+            persistence::blocking(move || backend.save(task, Some(previous))).await?;
+        }
+        Ok(())
     }
 
     fn prepare_tasks(&self, records: Vec<SavedTask>) -> Outcome<Vec<PreparedRestore>> {
