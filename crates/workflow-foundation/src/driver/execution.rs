@@ -276,6 +276,7 @@ pub(crate) fn execution<W: Workflow>(
         pause: pause_rx,
         controls,
         continuation: None,
+        activity_condition: None,
         journal,
         restored_checkpoint: restored
             .as_ref()
@@ -477,7 +478,7 @@ pub(crate) async fn sync_controls(
         if request.generation != controls.tx.borrow().generation {
             continue;
         }
-        if cancelled {
+        if cancelled && !controls.cancellation_deferred() {
             cancel.cancel();
         }
         return Ok(());

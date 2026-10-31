@@ -3,7 +3,10 @@
 //! Both member disks are submitted together; no disks are actually removed.
 use async_trait::async_trait;
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -30,7 +33,7 @@ impl Workflow for ShrinkMigration {
     }
 }
 
-// The Activity owns interpretation, retry budget and in-process continuation.
+// The Activity declares business readiness and retry policy, and interprets replies.
 struct MigrateDisks {
     balance: ServiceClient<Balance>,
     cursor: u64,
@@ -47,6 +50,9 @@ impl Activity for MigrateDisks {
     }
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::fixed(2, Duration::from_millis(100))
+    }
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
+        Some(Arc::new(BalanceReadiness(self.balance.clone())))
     }
     async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
         scope.call(&self.balance, self.cursor).await
@@ -69,6 +75,16 @@ impl Activity for MigrateDisks {
     }
 }
 
+// This checks the domain's readiness, not whether another Task is running.
+// Cross-task exclusion belongs to TaskCenter's SchedulingPolicy.
+struct BalanceReadiness(ServiceClient<Balance>);
+#[async_trait]
+impl RunCondition for BalanceReadiness {
+    async fn check(&self) -> Outcome<Readiness> {
+        self.0.query(()).await
+    }
+}
+
 // Mock domain adapter: observe control, call the separate native stop API,
 // await its acknowledgement, and only then return Stopped or Cancelled.
 enum MigrationReply {
@@ -77,6 +93,7 @@ enum MigrationReply {
     Completed(u64),
 }
 struct Balance {
+    ready: Arc<AtomicBool>,
     busy_once: AtomicBool,
     progress: mpsc::UnboundedSender<u64>,
 }
@@ -85,7 +102,7 @@ impl ServiceHandler for Balance {
     type Request = u64;
     type Reply = MigrationReply;
     type Query = ();
-    type View = ();
+    type View = Readiness;
     fn resources(_: &u64) -> Vec<ResourceAccess> {
         DISKS
             .iter()
@@ -122,8 +139,12 @@ impl ServiceHandler for Balance {
         }
         Ok(MigrationReply::Completed(cursor))
     }
-    fn query(&self, _: ()) -> Outcome<()> {
-        Ok(())
+    fn query(&self, _: ()) -> Outcome<Readiness> {
+        Ok(if self.ready.load(Ordering::SeqCst) {
+            Readiness::Ready
+        } else {
+            Readiness::Blocked("balance not ready".into())
+        })
     }
 }
 
@@ -131,9 +152,11 @@ async fn demo() -> Outcome<()> {
     let cancel = std::env::args().any(|arg| arg == "--cancel");
     let mut runtime = WorkflowRuntime::start("demo-pool", Config::default())?;
     let (progress, mut updates) = mpsc::unbounded_channel();
+    let ready = Arc::new(AtomicBool::new(true));
     let balance = runtime.register(
         "balance",
         Balance {
+            ready: ready.clone(),
             busy_once: AtomicBool::new(true),
             progress,
         },
@@ -171,8 +194,24 @@ async fn demo() -> Outcome<()> {
                 TOTAL
             );
         }
-        println!("[控制端] 请求恢复");
+        ready.store(false, Ordering::SeqCst);
+        println!("[控制端] 请求恢复，但均衡暂未就绪");
         task.control.resume()?;
+        loop {
+            match task.control.state() {
+                RunState::WaitingConditions(reason) => {
+                    println!("[Activity] 框架自动检查条件并等待：{reason}");
+                    break;
+                }
+                RunState::Failed(error) => return Err(error),
+                _ => {
+                    task.control.changed().await?;
+                }
+            }
+        }
+        println!("[领域事件] 均衡已就绪，通知框架重新检查");
+        ready.store(true, Ordering::SeqCst);
+        task.control.recheck();
     }
     match task.result().await {
         Err(Failure::Cancelled) if cancel => println!("[Task] 已取消，WF 不会进入下一步"),

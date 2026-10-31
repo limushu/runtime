@@ -93,7 +93,7 @@ let migrated = ctx.run_activity(MigrateDisks { balance, cursor: 0 }).await?;
 // 迁移完成后，才进入后续步骤。
 ```
 
-Activity 提供 `name()`、可选 `description()`、`retry_policy()`、`execute()` 和 `handle()`。
+Activity 提供 `name()`、可选 `description()`、`retry_policy()`、`cancellable()`、`run_condition()`、`execute()` 和 `handle()`。
 `execute` 负责一次执行，`handle` 解释已停稳的业务回复；框架负责调度决定、观测和控制。
 
 ```rust,ignore
@@ -105,6 +105,9 @@ impl Activity for MigrateDisks {
     fn description(&self) -> Option<&str> { Some("迁移待移除磁盘上的数据") }
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::exponential(3, Duration::from_millis(100), Duration::from_secs(2))
+    }
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
+        Some(Arc::new(BalanceReadiness(self.balance.clone())))
     }
     async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
         scope.call(&self.balance, self.cursor).await
@@ -130,17 +133,48 @@ impl Activity for MigrateDisks {
 | `Suspend(ActivityWait::Condition(check))` | 等待业务条件；数据改变后通过 `RunControl::recheck()` 唤醒 |
 | `Cancel` | 终结 Task，取消不能当作中断后续作 |
 
+**调度与业务条件。** “一个池只能有一个缩容任务”“缩容不能与其他 topo 并发”由
+TaskCenter 的 `SchedulingPolicy` 决策，WF/Activity 不查询其他任务来重复判断。
+Activity 用 `run_condition()` 声明本步骤的只读业务条件，例如均衡能力是否就绪；框架在
+首次执行、重试、暂停恢复和内部普通调用边界自动检查，业务无需在 execute 开头显式等待。
+条件对象在逻辑步骤开始时绑定，`check()` 每次重新读取业务状态；条件改变后通过
+`RunControl::recheck()` 唤醒。阻塞等待不增加 attempts，也不消耗重试次数。
+TaskCenter 放行不等于业务条件满足；业务条件满足也不能越过 TaskCenter 的暂停要求。
+可选的 `Workflow::run_condition()` 仍可表达跨步骤的共同业务条件；默认无条件，两者同时配置时
+都要满足。步骤结束或执行 Future 被丢弃后，其条件不会影响后续步骤。
+
 **重试策略。** `RetryPolicy::fixed(max_retries, delay)` 使用固定间隔；
 `RetryPolicy::exponential(max_retries, initial, maximum)` 使用翻倍且有上限的退避。
 默认不重试，只有 handler 明确返回 Retry 才消耗预算。初次执行不计入 max_retries；
 暂停后的续作也不消耗预算。次数由框架保存，暂停恢复不会重置，退避截止时间也不会重置。
 业务判断可以基于成功回复、错误以及实例字段，业务代码不需要维护公共重试计数器。
 
+**不可取消的 Activity。** 覆盖 `fn cancellable(&self) -> bool { false }`，保护范围从首次进入
+execute 开始，到整个逻辑步骤结束，包括内部调用、资源等待、重试和暂停后的续作。进入前的
+准入等待仍可取消。外部取消请求被记录，已有持久化任务仍照常保存取消意图，但暂不向执行端
+投递取消；步骤返回真实结果后，下一普通执行边界响应请求。若它是最后一步且 WF 已完成，
+保留实际成功结果，不把已经完成的效果改写为取消。
+
+该属性只延迟取消，不屏蔽暂停：领域服务仍可停稳返回，恢复时仍检查准入。即使有待处理取消，
+正在保护中的步骤也可暂停/恢复。宿主关闭、失主、服务失败和控制意图持久化失败仍然有效；
+Activity 自身返回 Cancel 也仍是终态。它与旧 `.uninterruptible()` 不同，后者同时屏蔽 Task
+暂停/取消，并允许已请求取消后的必做清理。丢弃 trait 等待 Future 会放弃业务体，框架不会继续
+运行已被丢弃的 Rust Future；已经派发的受保护领域调用仍持有资源直至真实结束。
+
+可运行示例：[examples/noncancellable_activity.rs](examples/noncancellable_activity.rs)：
+
+```bash
+cargo run -p workflow-foundation --example noncancellable_activity
+```
+
+它演示：进入不可取消提交步骤 → 用户取消 → 提交仍完成 → WF 获得真实结果 → 后续普通步骤不执行。
+
 **两种暂停方式。** 对本地循环，`scope.wait_until_runnable()` 或 `scope.sleep()` 在安全边界
 原地等待，恢复后继续同一次 execute。对 C 侧长操作，领域适配器观察 `scope.control()` 传递的
 控制请求，调用 C 的停止接口、等待实际停稳，然后返回类型化回复；handler 保存进程内游标并
 返回 Suspend，恢复后框架在同一个实例上再次 execute。两种方式都保持同一个逻辑 ActivityId，
-并重新检查 Workflow 的 RunCondition。自定义条件等待与用户暂停同时生效，恢复不能绕过任一条件。
+并重新检查已声明的业务条件。自定义条件等待与用户暂停同时生效，恢复不能绕过任一条件。
+这些检查发生在协作边界，不会自动抢占任意 async 函数；运行中的 C 操作仍需领域适配器停稳。
 
 **执行安全。** 所有外部副作用通过 `scope.call()` 调用已有领域服务。资源按每次真实调用
 取得并持有到实际停稳，多次调用不构成隐式原子事务；重试和等待期间不占用已结束调用的资源。
@@ -151,7 +185,7 @@ impl Activity for MigrateDisks {
 
 **步骤级观测。** TaskSnapshot.activities 同时包含 `kind = Step` 的逻辑步骤和 `kind = Call`
 的真实服务调用，调用通过 `parent_id` 关联步骤。步骤自动记录名称、说明、attempts、retries、
-last_error、retry_reason、retry_at、进度和生命周期。attempts 是 execute 的进入次数，
+last_error、retry_reason、retry_at、cancellable、进度和生命周期。attempts 是 execute 的进入次数，
 retries 是已批准的重试次数，两者不会把暂停续作混为重试。`scope.report_progress()` 自动使用步骤名；
 领域服务的进度也会归入所属步骤。同一逻辑步骤在暂停时显示 Suspended，不会因子调用返回而显示 Completed。
 
@@ -168,7 +202,8 @@ cargo run -p workflow-foundation --example activity_trait
 cargo run -p workflow-foundation --example activity_trait -- --cancel
 ```
 
-默认演示：均衡暂忙 → 策略重试 → 迁移进度 → 暂停 → C 停稳 → 同一 Activity 从游标恢复 → 完成。
+默认演示：均衡暂忙 → 策略重试 → 迁移进度 → 暂停 → C 停稳 → 恢复后业务条件阻塞
+→ 就绪事件唤醒 → 同一 Activity 从游标恢复 → 完成。
 `--cancel` 演示在迁移中取消，先等待停稳再终结。末尾同时打印逻辑步骤与实际调用记录。
 回归测试见 [activity_trait.rs](tests/activity_trait.rs)。
 

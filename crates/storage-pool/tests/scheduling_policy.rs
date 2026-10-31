@@ -1,5 +1,11 @@
 use async_trait::async_trait;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use storage_pool::{task_center::*, *};
 use tokio::sync::{mpsc, oneshot};
 use workflow_foundation::{scheduling::*, *};
@@ -152,6 +158,173 @@ impl PoolWorkflow for Work {
         }
     }
 }
+struct BalanceReady(AtomicBool);
+#[async_trait]
+impl RunCondition for BalanceReady {
+    async fn check(&self) -> Outcome<Readiness> {
+        Ok(if self.0.load(Ordering::SeqCst) {
+            Readiness::Ready
+        } else {
+            Readiness::Blocked("balance not ready".into())
+        })
+    }
+}
+struct ScheduledStep {
+    name: &'static str,
+    client: ServiceClient<Worker>,
+    ready: Arc<BalanceReady>,
+}
+#[async_trait]
+impl Activity for ScheduledStep {
+    type Reply = ActivityExit<(), ()>;
+    type Output = ();
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
+        Some(self.ready.clone())
+    }
+    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
+        scope.call(&self.client, self.name.into()).await
+    }
+    fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<()>> {
+        Ok(match result? {
+            ActivityExit::Completed(()) => ActivityAction::Continue(()),
+            ActivityExit::Suspended(()) => ActivityAction::Suspend(ActivityWait::Resume),
+        })
+    }
+}
+struct ScheduledWork {
+    operation: OperationKind,
+    step: ScheduledStep,
+}
+#[async_trait]
+impl Workflow for ScheduledWork {
+    type Output = ();
+    const NAME: &'static str = "test.scheduled-activity";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<()> {
+        ctx.run_activity(self.step).await
+    }
+}
+impl PoolWorkflow for ScheduledWork {
+    fn operation(&self) -> PoolOperation {
+        PoolOperation {
+            kind: self.operation.clone(),
+            objects: vec![],
+        }
+    }
+}
+
+#[tokio::test]
+async fn taskcenter_owns_topology_exclusion_while_activity_owns_business_readiness() {
+    let config = Config::default();
+    let mut driver = WorkflowDriver::new("pool", config.clone()).unwrap();
+    let (started, mut events) = mpsc::unbounded_channel();
+    let (pauses, mut acknowledgements) = mpsc::unbounded_channel();
+    let client = driver
+        .register(
+            "worker",
+            Worker {
+                started,
+                pause: Arc::new(Pause(pauses)),
+            },
+        )
+        .unwrap();
+    let center = TaskCenter::with_policy(driver, &config, Arc::new(PoolSchedulingPolicy));
+    let ready = Arc::new(BalanceReady(AtomicBool::new(true)));
+    let disk = DiskId::new("disk-a").unwrap();
+    let shrink_work = || ScheduledWork {
+        operation: OperationKind::Shrink(vec![disk.clone()]),
+        step: ScheduledStep {
+            name: "scan",
+            client: client.clone(),
+            ready: ready.clone(),
+        },
+    };
+    let topo_work = || ScheduledWork {
+        operation: OperationKind::OnlineDisk(disk.clone()),
+        step: ScheduledStep {
+            name: "maintenance",
+            client: client.clone(),
+            ready: Arc::new(BalanceReady(AtomicBool::new(true))),
+        },
+    };
+    let mut shrink = center.submit(shrink_work()).await.unwrap();
+    let (name, _first) = bounded(events.recv()).await.unwrap();
+    assert_eq!(name, "scan");
+    let logical_id = shrink.control.activities().entries[0].id;
+
+    let mut topo = center.submit(topo_work()).await.unwrap();
+    let stopped = bounded(acknowledgements.recv()).await.unwrap();
+    assert!(!shrink.control.suspend_acknowledged());
+    assert!(
+        events.try_recv().is_err(),
+        "topology must wait for actual stop"
+    );
+    stopped.send(()).unwrap();
+    let (name, finish_topo) = bounded(events.recv()).await.unwrap();
+    assert_eq!(name, "maintenance");
+    assert!(matches!(
+        center.submit(shrink_work()).await,
+        Err(Failure::Rejected(_))
+    ));
+    ready.0.store(false, Ordering::SeqCst);
+    shrink.control.suspend().unwrap();
+    finish_topo.send(()).unwrap();
+    bounded(topo.result()).await.unwrap();
+    let mut observer = center.observe_task(shrink.id()).unwrap();
+    bounded(async {
+        while !observer.snapshot().blockers.is_empty() {
+            observer.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert!(shrink.control.suspend_reasons().contains("user"));
+    shrink.control.resume().unwrap();
+    bounded(async {
+        while shrink.control.state() != RunState::WaitingConditions("balance not ready".into()) {
+            shrink.control.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert!(
+        events.try_recv().is_err(),
+        "scheduler permission does not satisfy business readiness"
+    );
+    assert!(matches!(
+        center.submit(shrink_work()).await,
+        Err(Failure::Rejected(_))
+    ));
+
+    // A step blocked on its own condition must still acknowledge scheduler pause.
+    let mut topo = center.submit(topo_work()).await.unwrap();
+    let (name, finish_topo) = bounded(events.recv()).await.unwrap();
+    assert_eq!(name, "maintenance");
+    ready.0.store(true, Ordering::SeqCst);
+    center.recheck(shrink.id()).unwrap();
+    assert!(
+        events.try_recv().is_err(),
+        "business readiness cannot bypass topology exclusion"
+    );
+    assert!(shrink.control.suspend_acknowledged());
+    finish_topo.send(()).unwrap();
+    bounded(topo.result()).await.unwrap();
+    let (name, finish_shrink) = bounded(events.recv()).await.unwrap();
+    assert_eq!(name, "scan");
+    finish_shrink.send(()).unwrap();
+    bounded(shrink.result()).await.unwrap();
+    let history = shrink.control.activities();
+    let root = history
+        .entries
+        .iter()
+        .find(|entry| entry.id == logical_id)
+        .unwrap();
+    assert_eq!(root.attempts, 2);
+    assert_eq!(root.retries, 0);
+    assert_eq!(root.state, ActivityState::Completed);
+    center.shutdown().await.unwrap();
+}
+
 struct Policy;
 impl SchedulingPolicy<PoolOperation> for Policy {
     fn on_task(&self, existing: &PoolOperation, incoming: &PoolOperation) -> Conflict {

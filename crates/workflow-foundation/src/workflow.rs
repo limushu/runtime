@@ -85,6 +85,8 @@ pub trait Workflow: Send + 'static {
             "workflow does not define restoration".into(),
         ))
     }
+    /// Optional business prerequisite shared by all steps. Cross-task conflicts
+    /// belong to SchedulingPolicy; step-specific checks belong to Activity.
     fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         None
     }
@@ -113,6 +115,7 @@ pub struct WorkflowContext {
     pub(crate) pause: watch::Receiver<ControlRequest>,
     pub(crate) controls: crate::control::Controls,
     pub(crate) continuation: Option<Arc<dyn RunCondition>>,
+    pub(crate) activity_condition: Option<Arc<dyn RunCondition>>,
     pub(crate) journal: Option<crate::persistence::Journal>,
     pub(crate) restored_checkpoint: serde_json::Value,
 }
@@ -230,14 +233,20 @@ impl WorkflowContext {
                 continue;
             }
             self.controls.revoke();
-            let Some(check) = self.continuation.clone() else {
-                return Ok(());
-            };
+            let checks = [self.continuation.clone(), self.activity_condition.clone()];
             let generation = request.generation;
             let decision = tokio::select! {
                 biased;
                 r = token.changed() => { r?; continue; },
-                r = check.check() => r?,
+                r = async {
+                    for check in checks.into_iter().flatten() {
+                        let decision = check.check().await?;
+                        if matches!(decision, Readiness::Blocked(_)) {
+                            return Ok::<_, Failure>(decision);
+                        }
+                    }
+                    Ok(Readiness::Ready)
+                } => r?,
             };
             if generation != token.request().generation {
                 continue;
@@ -388,6 +397,8 @@ impl WorkflowContext {
             resources.clone(),
             parent,
         );
+        let cancellable = !uninterruptible && !self.controls.cancellation_deferred();
+        observation.update(|entry| entry.cancellable = cancellable);
         let permit: Outcome<Permit> = async {
             self.parent_state(parent, ActivityState::WaitingResources);
             if uninterruptible {
@@ -422,7 +433,9 @@ impl WorkflowContext {
         self.parent_state(parent, ActivityState::Running);
         let guard = self.tracker.register(permit, observation);
         self.state.send_replace(RunState::Activity(id));
-        let cancel = if uninterruptible {
+        let cancel = if !cancellable {
+            // A protected native operation must also survive a dropped caller.
+            // Ordinary Task pauses still flow through the shared control channel.
             self.shutdown.child_token()
         } else {
             self.cancel.child_token()

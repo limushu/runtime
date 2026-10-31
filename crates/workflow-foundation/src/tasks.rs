@@ -38,6 +38,8 @@ pub struct ActivitySnapshot {
     pub service: String,
     pub name: &'static str,
     pub description: Option<String>,
+    /// Whether Task cancellation can interrupt execution; host stop still applies.
+    pub cancellable: bool,
     /// execute entries, including continuation after a stopping-return pause.
     pub attempts: u32,
     /// Approved Retry decisions; suspension does not consume this budget.
@@ -92,6 +94,7 @@ impl ActivityObservation {
                 service,
                 name,
                 description: None,
+                cancellable: true,
                 attempts: 0,
                 retries: 0,
                 last_error: None,

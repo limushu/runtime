@@ -1,19 +1,24 @@
 use super::*;
 use futures_util::FutureExt;
 use std::{panic::AssertUnwindSafe, sync::atomic::Ordering, time::SystemTime};
-use tokio_util::sync::CancellationToken;
 
 /// A dropped caller requests cooperative cancellation. Observation stays in
 /// Settling until its actual child calls finish; no native Future is aborted.
-struct Execution {
+struct Execution<'a> {
+    context: &'a mut WorkflowContext,
     observation: ActivityObservation,
-    cancel: CancellationToken,
+    previous_condition: Option<Arc<dyn RunCondition>>,
+    previous_cancellation_deferred: bool,
     finished: bool,
 }
-impl Drop for Execution {
+impl Drop for Execution<'_> {
     fn drop(&mut self) {
+        self.context.activity_condition = self.previous_condition.take();
+        self.context
+            .controls
+            .set_cancellation_deferred(self.previous_cancellation_deferred);
         if !self.finished {
-            self.cancel.cancel();
+            self.context.cancel.cancel();
         }
     }
 }
@@ -25,6 +30,7 @@ impl WorkflowContext {
         }
         let policy = step.retry_policy();
         policy.validate()?;
+        let cancellable = step.cancellable();
         let description = step.description().map(str::to_owned);
         if description.as_ref().is_some_and(|text| text.len() > 4096) {
             return Err(Failure::Rejected(
@@ -32,36 +38,52 @@ impl WorkflowContext {
             ));
         }
         let id = self.next_activity_id()?;
+        let observation = ActivityObservation::logical(
+            self.activities.clone(),
+            self.activity_history,
+            id,
+            name,
+            description,
+        );
+        observation.update(|entry| entry.cancellable = cancellable);
+        let previous_condition =
+            std::mem::replace(&mut self.activity_condition, step.run_condition());
+        let previous_cancellation_deferred = self.controls.cancellation_deferred();
         let mut execution = Execution {
-            observation: ActivityObservation::logical(
-                self.activities.clone(),
-                self.activity_history,
-                id,
-                name,
-                description,
-            ),
-            cancel: self.cancel.clone(),
+            context: self,
+            observation,
+            previous_condition,
+            previous_cancellation_deferred,
             finished: false,
         };
-        let result = AssertUnwindSafe(self.run_step(&mut step, policy, &execution.observation))
-            .catch_unwind()
-            .await;
+        let result = AssertUnwindSafe(execution.context.run_step(
+            &mut step,
+            policy,
+            cancellable,
+            &execution.observation,
+        ))
+        .catch_unwind()
+        .await;
         let mut result = match result {
             Ok(result) => result,
             Err(_) => {
-                self.tracker.mark_uncertain();
+                execution.context.tracker.mark_uncertain();
                 Err(Failure::Uncertain(
                     "Activity execution or result handler panicked".into(),
                 ))
             }
         };
         if result.as_ref().is_err_and(Failure::uncertain) {
-            self.tracker.mark_uncertain();
+            execution.context.tracker.mark_uncertain();
         }
         execution.observation.settled(&result);
         // A panic may have abandoned a service response before run_step could
         // check its tracker. Never return control to the WF with live effects.
-        if self.tracker.settle(&self.cancel).await
+        if execution
+            .context
+            .tracker
+            .settle(&execution.context.cancel)
+            .await
             && !result.as_ref().is_err_and(Failure::uncertain)
         {
             result = Err(Failure::Uncertain(
@@ -76,12 +98,23 @@ impl WorkflowContext {
         &mut self,
         step: &mut A,
         policy: RetryPolicy,
+        cancellable: bool,
         observation: &ActivityObservation,
     ) -> Outcome<A::Output> {
         let mut retries = 0;
         loop {
             tokio::task::yield_now().await;
             self.wait_observed(Some(observation)).await?;
+            if !cancellable && !self.controls.cancellation_deferred() {
+                // Close the entry race with RunControl::cancel: it publishes
+                // intent before testing this flag. A prior request wins; once
+                // entered, subsequent requests wait for the whole step to finish.
+                self.controls.set_cancellation_deferred(true);
+                if self.cancel.is_cancelled() || self.controls.user_cancelled.load(Ordering::SeqCst)
+                {
+                    return Err(Failure::Cancelled);
+                }
+            }
             observation.started();
             let generation = self.control().request().generation;
             let mut scope = ActivityScope {

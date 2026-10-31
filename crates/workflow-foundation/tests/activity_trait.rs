@@ -20,7 +20,7 @@ impl RunCondition for Gate {
         Ok(if self.0.load(Ordering::SeqCst) {
             Readiness::Ready
         } else {
-            Readiness::Blocked("topology changed".into())
+            Readiness::Blocked("business prerequisite unavailable".into())
         })
     }
 }
@@ -29,6 +29,7 @@ struct Flow<A> {
     gate: Option<Arc<Gate>>,
     durable: bool,
 }
+
 impl<A> Flow<A> {
     fn new(step: A) -> Self {
         Self {
@@ -227,7 +228,7 @@ async fn pause_waits_for_native_stop_releases_resources_and_rechecks_admission()
     run.control.resume().unwrap();
     state(
         &run.control,
-        RunState::WaitingConditions("topology changed".into()),
+        RunState::WaitingConditions("business prerequisite unavailable".into()),
     )
     .await;
     assert!(rx.try_recv().is_err());
@@ -591,13 +592,13 @@ async fn business_wait_is_observed_releases_resources_and_survives_user_pause() 
     assert_eq!(next(&mut entered).await, "check");
     state(
         &run.control,
-        RunState::WaitingConditions("topology changed".into()),
+        RunState::WaitingConditions("business prerequisite unavailable".into()),
     )
     .await;
     let root = run.control.activities().entries[0].clone();
     assert_eq!(
         root.state,
-        ActivityState::WaitingConditions("topology changed".into())
+        ActivityState::WaitingConditions("business prerequisite unavailable".into())
     );
     assert!(root.finished_at.is_none());
     let mut other = runtime
@@ -935,5 +936,188 @@ async fn execute_panic_does_not_return_to_workflow_until_actual_native_stop() {
     stopped.add_permits(1);
     assert!(matches!(finish(&mut run).await, Err(Failure::Uncertain(_))));
     assert!(returned.load(Ordering::SeqCst));
+    runtime.shutdown().await.unwrap();
+}
+
+struct Gated<A> {
+    step: A,
+    condition: Arc<dyn RunCondition>,
+}
+#[async_trait]
+impl<A: Activity> Activity for Gated<A> {
+    type Reply = A::Reply;
+    type Output = A::Output;
+    fn name(&self) -> &'static str {
+        self.step.name()
+    }
+    fn retry_policy(&self) -> RetryPolicy {
+        self.step.retry_policy()
+    }
+    fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
+        Some(self.condition.clone())
+    }
+    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
+        self.step.execute(scope).await
+    }
+    fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<Self::Output>> {
+        self.step.handle(result)
+    }
+}
+
+struct Followup<A> {
+    step: A,
+    client: ServiceClient<Probe>,
+}
+#[async_trait]
+impl<A: Activity<Output = usize> + 'static> Workflow for Followup<A> {
+    type Output = usize;
+    const NAME: &'static str = "activity.followup";
+    async fn run(self, ctx: &mut WorkflowContext) -> Outcome<usize> {
+        let value = ctx.run_activity(self.step).await?;
+        ctx.activity(&self.client, Work::write("followup", "disk"))
+            .await?;
+        Ok(value)
+    }
+}
+
+#[tokio::test]
+async fn declared_condition_gates_entry_and_retry_without_leaking_to_next_step() {
+    let (mut runtime, client, mut entered) = setup();
+    let gate = Arc::new(Gate(AtomicBool::new(false)));
+    let condition = gate.clone();
+    let mut first = true;
+    let step = Step {
+        policy: RetryPolicy::fixed(1, Duration::ZERO),
+        client: client.clone(),
+        work: (0..2).map(|_| Work::write("check", "disk")).collect(),
+        handler: move |result: Outcome<usize>| {
+            let value = result?;
+            condition.0.store(false, Ordering::SeqCst);
+            if first {
+                first = false;
+                Ok(ActivityAction::Retry {
+                    reason: "need another observation".into(),
+                })
+            } else {
+                Ok(ActivityAction::Continue(value))
+            }
+        },
+    };
+    let mut run = runtime
+        .submit(Followup {
+            step: Gated {
+                step,
+                condition: gate.clone(),
+            },
+            client,
+        })
+        .await
+        .unwrap();
+    state(
+        &run.control,
+        RunState::WaitingConditions("business prerequisite unavailable".into()),
+    )
+    .await;
+    let root = run.control.activities().entries[0].clone();
+    assert_eq!(root.attempts, 0);
+    assert_eq!(
+        root.state,
+        ActivityState::WaitingConditions("business prerequisite unavailable".into())
+    );
+    assert!(entered.try_recv().is_err());
+    gate.0.store(true, Ordering::SeqCst);
+    run.control.recheck();
+    assert_eq!(next(&mut entered).await, "check");
+    state(
+        &run.control,
+        RunState::WaitingConditions("business prerequisite unavailable".into()),
+    )
+    .await;
+    assert_eq!(run.control.activities().entries[0].attempts, 1);
+    assert_eq!(run.control.activities().entries[0].retries, 1);
+    gate.0.store(true, Ordering::SeqCst);
+    run.control.recheck();
+    finish(&mut run).await.unwrap();
+    assert_eq!(next(&mut entered).await, "check");
+    assert_eq!(next(&mut entered).await, "followup");
+    assert!(!gate.0.load(Ordering::SeqCst));
+    let completed = run.control.activities().entries[0].clone();
+    assert_eq!(completed.id, root.id);
+    assert_eq!(completed.attempts, 2);
+    assert_eq!(completed.retries, 1);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn declared_condition_is_rechecked_when_a_local_execute_resumes() {
+    let mut runtime = WorkflowRuntime::start("pool", Config::default()).unwrap();
+    let gate = Arc::new(Gate(AtomicBool::new(true)));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut run = runtime
+        .submit(Flow::new(Gated {
+            step: LocalLoop(tx),
+            condition: gate.clone(),
+        }))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    run.control.suspend().unwrap();
+    state(&run.control, RunState::Suspended).await;
+    gate.0.store(false, Ordering::SeqCst);
+    run.control.resume().unwrap();
+    state(
+        &run.control,
+        RunState::WaitingConditions("business prerequisite unavailable".into()),
+    )
+    .await;
+    let root = run.control.activities().entries[0].clone();
+    assert_eq!(root.attempts, 1);
+    assert_eq!(root.progress.completed, 1);
+    gate.0.store(true, Ordering::SeqCst);
+    run.control.recheck();
+    finish(&mut run).await.unwrap();
+    assert_eq!(run.control.activities().entries[0].attempts, 1);
+    assert!(rx.try_recv().is_err());
+    runtime.shutdown().await.unwrap();
+}
+
+struct PendingCondition(mpsc::UnboundedSender<()>);
+#[async_trait]
+impl RunCondition for PendingCondition {
+    async fn check(&self) -> Outcome<Readiness> {
+        self.0.send(()).unwrap();
+        std::future::pending().await
+    }
+}
+#[tokio::test]
+async fn a_pending_condition_check_does_not_delay_pause_or_cancellation() {
+    let mut runtime = WorkflowRuntime::start("pool", Config::default()).unwrap();
+    let (checks, mut checked) = mpsc::unbounded_channel();
+    let (calls, mut called) = mpsc::unbounded_channel();
+    let mut run = runtime
+        .submit(Flow::new(Gated {
+            step: LocalLoop(calls),
+            condition: Arc::new(PendingCondition(checks)),
+        }))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), checked.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    run.control.suspend().unwrap();
+    state(&run.control, RunState::Suspended).await;
+    run.control.resume().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), checked.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    run.control.cancel();
+    assert_eq!(finish(&mut run).await, Err(Failure::Cancelled));
+    assert_eq!(run.control.activities().entries[0].attempts, 0);
+    assert!(called.try_recv().is_err());
     runtime.shutdown().await.unwrap();
 }

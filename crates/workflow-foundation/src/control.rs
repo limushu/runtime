@@ -131,8 +131,8 @@ impl RunControl {
             .user_cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.controls.revoke();
-        if self.durable {
-            self.controls.tx.send_modify(|r| r.generation += 1);
+        if self.durable || self.controls.cancellation_deferred() {
+            self.controls.notify_cancellation();
         } else {
             self.cancel.cancel();
         }
@@ -240,6 +240,7 @@ pub(crate) struct Controls {
     pub changed: Arc<Notify>,
     pub recheck: Arc<Notify>,
     pub user_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancellation_deferred: Arc<std::sync::atomic::AtomicBool>,
     pub entered: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Controls {
@@ -251,6 +252,7 @@ impl Controls {
             changed: Arc::default(),
             recheck: Arc::default(),
             user_cancelled: Arc::default(),
+            cancellation_deferred: Arc::default(),
             entered: Arc::default(),
         }
     }
@@ -260,6 +262,30 @@ impl Controls {
             cancel,
             user_cancelled: self.user_cancelled.clone(),
         }
+    }
+    pub fn cancellation_deferred(&self) -> bool {
+        self.cancellation_deferred
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn set_cancellation_deferred(&self, deferred: bool) {
+        let previous = self
+            .cancellation_deferred
+            .swap(deferred, std::sync::atomic::Ordering::SeqCst);
+        if previous
+            && !deferred
+            && self
+                .user_cancelled
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // The driver persists pending intent before delivering cancellation.
+            // Do not cancel the token here: a durable write may still be pending.
+            self.notify_cancellation();
+        }
+    }
+    fn notify_cancellation(&self) {
+        self.tx.send_modify(|r| r.generation += 1);
+        self.changed.notify_waiters();
+        self.wake.notify_one();
     }
     pub fn reasons(&self) -> BTreeSet<String> {
         self.tx.borrow().suspend_reasons.clone()
