@@ -138,7 +138,7 @@ impl Drop for ActivityGuard {
 
 struct Completion<T> {
     reply: Option<oneshot::Sender<Outcome<T>>>,
-    state: watch::Sender<RunState>,
+    state: crate::audit::TaskState,
     accepted: watch::Sender<Option<Outcome<()>>>,
 }
 impl<T> Completion<T> {
@@ -172,6 +172,7 @@ impl<T> Drop for Completion<T> {
 
 pub(crate) struct ExecutionEnv {
     pub id: TaskId,
+    pub audit: crate::audit::TaskAudit,
     pub wake: Arc<Notify>,
     pub scope: Arc<Scope>,
     pub pool: String,
@@ -192,6 +193,7 @@ pub(crate) fn execution<W: Workflow>(
 ) {
     let ExecutionEnv {
         id,
+        audit,
         wake,
         scope,
         pool,
@@ -207,6 +209,16 @@ pub(crate) fn execution<W: Workflow>(
     let (accepted, accepted_rx) = watch::channel(None);
     let (signals, signal_rx) = mpsc::channel(config.capacity);
     let (state, state_rx) = watch::channel(RunState::WaitingObjects);
+    let state = crate::audit::TaskState::new(state, audit.clone());
+    audit.emit(
+        if restored.is_some() {
+            "Restored"
+        } else {
+            "Registered"
+        },
+        None,
+        serde_json::json!({"workflow": W::NAME, "state": "WaitingObjects"}),
+    );
     let controls = crate::control::Controls::new(wake);
     if restored.as_ref().is_some_and(|r| r.user_paused) {
         controls.update(|r| {
@@ -238,6 +250,7 @@ pub(crate) fn execution<W: Workflow>(
     ));
     let control = RunControl {
         id,
+        audit: audit.clone(),
         name: W::NAME,
         cancel: cancel.clone(),
         signals: signals.clone(),
@@ -258,6 +271,7 @@ pub(crate) fn execution<W: Workflow>(
     };
     let mut context = WorkflowContext {
         id,
+        audit: audit.clone(),
         scope,
         pool,
         broker,
@@ -288,6 +302,7 @@ pub(crate) fn execution<W: Workflow>(
         let mut ownership = None;
         let mut journal_started = restored.is_some();
         let result = AssertUnwindSafe(async {
+            audit.flush().await?;
             if restored.is_none() && let Some(journal) = &context.journal {
                 journal.create().await?;
                 journal_started = true;
@@ -302,6 +317,7 @@ pub(crate) fn execution<W: Workflow>(
                     .unwrap_or_else(|| workflow.details())?,
             )?;
             let declared = workflow.objects();
+            audit.emit("Objects", None, serde_json::to_value(&declared).expect("serializable objects"));
             *context.objects.lock().unwrap() = declared.clone();
             for object in &declared {
                 object.validate()?;
@@ -342,6 +358,7 @@ pub(crate) fn execution<W: Workflow>(
             let cancel = context.cancel.clone();
             let mut requests = controls.tx.subscribe();
             let body = async {
+                audit.emit("Started", None, serde_json::Value::Null);
                 context.controls.entered.store(true, std::sync::atomic::Ordering::SeqCst);
                 context.controls.wake.notify_one();
                 workflow.run(&mut context).await
@@ -435,6 +452,36 @@ pub(crate) fn execution<W: Workflow>(
         }
         if let Some(mut permit) = ownership {
             permit.settled(&result);
+        }
+        let terminal = match &result {
+            Ok(_) => RunState::Completed,
+            Err(e) => RunState::Failed(e.clone()),
+        };
+        if context.journal.is_some()
+            && matches!(result, Err(Failure::Cancelled))
+            && !context
+                .controls
+                .user_cancelled
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            audit.emit("RecoveryPending", None, serde_json::Value::Null);
+        }
+        audit.emit(
+            "Finished",
+            None,
+            serde_json::to_value(terminal).expect("serializable state"),
+        );
+        if let Err(error) = audit.flush().await {
+            result = Err(Failure::Uncertain(format!("audit incomplete: {error}")));
+            // Do not leave a durable success record when final confirmation failed.
+            if let Some(journal) = &context.journal {
+                let _ = journal
+                    .update(|r| {
+                        r.outcome =
+                            crate::persistence::StoredOutcome::NeedsCheck("audit incomplete".into())
+                    })
+                    .await;
+            }
         }
         completion.finish(result);
         id

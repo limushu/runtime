@@ -1,5 +1,6 @@
 //! Business-free execution mechanics; applications can drive workflows in their own event loop.
 mod activity;
+pub mod audit;
 mod driver;
 mod identity;
 pub use identity::{TaskId, TaskIds};

@@ -27,6 +27,17 @@ async fn wait_for(
 }
 
 pub async fn run_handoff(path: &Path) -> Outcome<()> {
+    let audit_path = path.with_extension("audit.jsonl");
+    let audit = workflow_foundation::audit::AuditLog::new(
+        Arc::new(workflow_foundation::audit::FileAuditStore::open(
+            &audit_path,
+        )?),
+        4096,
+    )?;
+    println!(
+        "Audit TUI: node tools/task-center-tui/index.mjs {}",
+        audit_path.display()
+    );
     let metadata = Arc::new(MemoryMetadata::default());
     let balance = Arc::new(SimulatedBalance::new(metadata.clone()));
     let store = Arc::new(FileTaskStore::open(path)?);
@@ -36,6 +47,7 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
         Arc::new(SimulatedDataPlane),
     )
     .with_task_ids(TaskIds::for_leader(11)?)
+    .with_audit(audit.clone())
     .with_task_store(store.clone())
     .with_balance(balance.clone());
     let pool = primary
@@ -49,6 +61,17 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
         path.display()
     );
     let tier = TierId::new("tier")?;
+    let observer_pool = primary
+        .activate(PoolRecovery::empty(CreatePool::new(
+            PoolId::new("second-pool")?,
+            PoolName::new("second-pool")?,
+        )))
+        .await?;
+    observer_pool
+        .create_tier(TierId::new("second-tier")?)
+        .await?
+        .result()
+        .await?;
     pool.create_tier(tier.clone()).await?.result().await?;
     for name in ["a", "b", "c", "d"] {
         let node = NodeId::new(format!("node-{name}"))?;
@@ -89,6 +112,13 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
     let copied = pool.task(id)?.details["migration"]["progress"]["completed"].clone();
     assert!(copied.as_u64().unwrap() >= 2);
     println!("[2] Task {id} paused after real migration settlement; saved progress={copied}");
+    // Optional time to inspect the live paused task in a second terminal.
+    if let Ok(ms) = std::env::var("WORKFLOW_DEMO_HOLD_MS") {
+        let ms = ms
+            .parse::<u64>()
+            .map_err(|_| Failure::Rejected("invalid demo hold milliseconds".into()))?;
+        tokio::time::sleep(Duration::from_millis(ms.min(120_000))).await;
+    }
     primary.demote().await?;
     assert_eq!(run.result().await, Err(Failure::Cancelled));
     assert!(
@@ -133,6 +163,7 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
         Arc::new(SimulatedDataPlane),
     )
     .with_task_ids(TaskIds::for_leader(12)?)
+    .with_audit(audit.clone())
     .with_task_store(store.clone())
     .with_balance(balance.clone());
     let pool = standby.activate(snapshot).await?;
@@ -179,6 +210,32 @@ pub async fn run_handoff(path: &Path) -> Outcome<()> {
         online.id().epoch
     );
     standby.demote().await?;
+    audit.flush().await?;
+    let records = workflow_foundation::audit::read_file(&audit_path, 0, usize::MAX)?;
+    let attempts: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|r| r.event.task == Some(id) && r.event.kind == "Activity")
+        .map(|r| r.event.execution.clone())
+        .collect();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "both leadership executions must retain their steps"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.event.task == Some(id) && r.event.kind == "Restored")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.event.task != Some(id) && r.event.kind == "Finished")
+    );
+    println!(
+        "[8] durable audit retained {} events, old completed tasks and both shrink execution timelines",
+        records.len()
+    );
     Ok(())
 }
 

@@ -3,6 +3,7 @@
 当前代码只有两个 workspace 成员，入口以本页和根 README 为准。
 
 - [当前架构与目录边界](architecture.md)
+- [可运行 TUI 与持久化审计：启动、下钻、切主和限制](changes/2026-11-01-persistent-observation.md)
 - [主备切换：正式 Pool 入口、文件日志示例与验证](leader-handoff.md)
 - [PoolManager 当前实现与限制](pool-manager.md)
 - [PoolManager 接口、多索引与创建/删除设计](pool-manager-design.md)（含后续持久化目标）

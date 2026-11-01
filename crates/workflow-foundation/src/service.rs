@@ -37,6 +37,7 @@ pub trait ServiceHandler: Send + Sync + 'static {
     fn query(&self, query: Self::Query) -> Outcome<Self::View>;
 }
 pub struct ActivityContext {
+    pub(crate) audit: crate::audit::TaskAudit,
     pub id: ActivityId,
     pub(crate) cancel: CancellationToken,
     pub(crate) control: ControlToken,
@@ -64,6 +65,11 @@ impl ActivityContext {
             history.send_modify(|history| {
                 if let Some(entry) = history.entries.iter_mut().find(|entry| entry.id == *id) {
                     entry.progress = progress;
+                    self.audit.emit(
+                        "Activity",
+                        Some(id.sequence),
+                        serde_json::to_value(&*entry).expect("serializable activity"),
+                    );
                 }
             });
         }

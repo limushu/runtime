@@ -39,6 +39,7 @@ impl WorkflowContext {
         }
         let id = self.next_activity_id()?;
         let observation = ActivityObservation::logical(
+            self.audit.clone(),
             self.activities.clone(),
             self.activity_history,
             id,

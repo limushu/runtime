@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct RunControl {
     pub id: TaskId,
+    pub(crate) audit: crate::audit::TaskAudit,
     pub name: &'static str,
     pub(crate) cancel: CancellationToken,
     pub(crate) signals: mpsc::Sender<Signal>,
@@ -44,6 +45,11 @@ impl RunControl {
         {
             return Err(Failure::Rejected("run is cancelled or terminal".into()));
         }
+        self.audit.emit(
+            "ControlRequested",
+            None,
+            serde_json::json!({"action": if value { "suspend" } else { "resume" }}),
+        );
         self.controls.update(|reasons| {
             if value {
                 reasons.insert("user".into());
@@ -58,12 +64,19 @@ impl RunControl {
             if info.blockers == blockers {
                 false
             } else {
+                self.audit
+                    .emit("Blockers", None, serde_json::json!({"blockers": blockers}));
                 info.blockers = blockers;
                 true
             }
         });
     }
     pub fn explain(&self, conflicts: Vec<ConflictMatch>, blockers: Vec<TaskId>) {
+        self.audit.emit(
+            "AdmissionDecision",
+            None,
+            serde_json::json!({"conflicts": conflicts, "blockers": blockers}),
+        );
         self.info.send_modify(|info| {
             info.conflicts = conflicts;
             info.blockers = blockers;
@@ -90,6 +103,21 @@ impl RunControl {
         self.controls.reasons()
     }
     pub fn set_policy_suspensions(&self, reasons: &std::collections::BTreeSet<String>) {
+        if self
+            .controls
+            .reasons()
+            .iter()
+            .filter(|s| s.starts_with("policy:"))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != reasons.iter().map(|s| format!("policy:{s}")).collect()
+        {
+            self.audit.emit(
+                "PolicySuspensions",
+                None,
+                serde_json::json!({"reasons": reasons}),
+            );
+        }
         self.controls.update(|current| {
             current.retain(|s| !s.starts_with("policy:"));
             current.extend(reasons.iter().map(|s| format!("policy:{s}")));
@@ -127,6 +155,11 @@ impl RunControl {
         }
     }
     pub fn cancel(&self) {
+        self.audit.emit(
+            "ControlRequested",
+            None,
+            serde_json::json!({"action": "cancel"}),
+        );
         self.controls
             .user_cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);

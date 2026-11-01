@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Failure {
     Cancelled,
     Rejected(String),
@@ -29,7 +29,7 @@ impl Failure {
 }
 pub type Outcome<T> = Result<T, Failure>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ActivityId {
     pub task_id: crate::TaskId,
     pub sequence: u64,
@@ -57,12 +57,12 @@ impl ObjectKey {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Access {
     Read,
     Write,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResourceAccess {
     pub object: ObjectKey,
     pub access: Access,
@@ -95,7 +95,7 @@ impl Signal {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RunState {
     WaitingObjects,
     Running,
