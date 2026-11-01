@@ -37,7 +37,8 @@ export class Model {
     this.cursor = record.cursor;
     this.records.push(record);
     if(e.kind === 'EvidenceIncomplete') this.incomplete = true;
-    this.catalog.set(e.pool_uuid, {id:e.pool_uuid,name:e.pool_name,epoch:e.owner_epoch,last:e.at_ms});
+    const catalog = this.catalog.get(e.pool_uuid);
+    this.catalog.set(e.pool_uuid, {id:e.pool_uuid,name:e.pool_name,epoch:Math.max(catalog?.epoch ?? 0,e.owner_epoch),last:e.at_ms});
     if (e.task === null) return;
     let task = this.tasks.get(e.task);
     if (!task) {
@@ -48,30 +49,34 @@ export class Model {
     }
     let execution = task.executions.get(e.execution);
     if (!execution) {
-      execution = { id: e.execution, epoch: e.owner_epoch, activities: new Map(), events: [], first: e.at_ms };
+      execution = { id: e.execution, epoch: e.owner_epoch, activities: new Map(), events: [], first: e.at_ms,
+        firstCursor: record.cursor, state: 'Unknown', rawState: 'Unknown', terminal: false };
       task.executions.set(e.execution, execution);
     }
     task.last = e.at_ms; task.events.push(record); execution.events.push(record);
     execution.last = e.at_ms;
-    task.execution = e.execution;
-    if (e.kind === 'Objects' && Array.isArray(e.data)) task.objects = e.data;
-    if (e.kind === 'AdmissionDecision') { task.conflicts = e.data?.conflicts ?? []; task.blockers = e.data?.blockers ?? []; }
-    if (e.kind === 'Blockers') task.blockers = e.data?.blockers ?? [];
-    if (e.kind === 'PolicySuspensions') task.suspensions = e.data;
-    if (e.kind === 'ControlRequested') task.control = { ...e.data, at: e.at_ms };
+    const current = task.executions.get(task.execution);
+    if (!current || execution.epoch > current.epoch || (execution.epoch === current.epoch && execution.firstCursor > current.firstCursor)) task.execution = e.execution;
+    const isCurrent = task.execution === e.execution;
+    if (isCurrent && e.kind === 'Objects' && Array.isArray(e.data)) task.objects = e.data;
+    if (isCurrent && e.kind === 'AdmissionDecision') { task.conflicts = e.data?.conflicts ?? []; task.blockers = e.data?.blockers ?? []; }
+    if (isCurrent && e.kind === 'Blockers') task.blockers = e.data?.blockers ?? [];
+    if (isCurrent && e.kind === 'PolicySuspensions') task.suspensions = e.data;
+    if (isCurrent && e.kind === 'ControlRequested') task.control = { ...e.data, at: e.at_ms };
     if (e.kind === 'Started') execution.started = e.at_ms;
     if (e.kind === 'Finished') execution.finished = e.at_ms;
     if (e.kind === 'RecoveryPending') execution.recoverable = true;
     if (e.kind === 'Registered' || e.kind === 'Restored') {
-      task.state = 'WaitingObjects'; task.rawState = task.state; task.terminal = false;
-      task.blockers = []; task.conflicts = []; task.suspensions = []; task.control = null;
+      execution.state = 'WaitingObjects'; execution.rawState = execution.state; execution.terminal = false;
+      if (isCurrent) { task.blockers = []; task.conflicts = []; task.suspensions = []; task.control = null; }
     }
     if (e.kind === 'TaskState' || e.kind === 'Finished') {
-      task.state = stateName(e.data);
-      task.rawState = e.data;
-      task.terminal = e.data === 'Completed' || !!e.data?.Failed;
-      if (execution.recoverable && e.data?.Failed === 'Cancelled') { task.state = 'Interrupted / recoverable'; task.terminal = false; }
+      execution.state = stateName(e.data);
+      execution.rawState = e.data;
+      execution.terminal = e.data === 'Completed' || !!e.data?.Failed;
+      if (execution.recoverable && e.data?.Failed === 'Cancelled') { execution.state = 'Interrupted / recoverable'; execution.terminal = false; }
     }
+    if (isCurrent) { task.state = execution.state; task.rawState = execution.rawState; task.terminal = execution.terminal; }
     if (e.kind === 'Activity' && e.activity !== null) {
       let activity = execution.activities.get(e.activity);
       if (!activity) { activity = { id: e.activity, events: [], data: {} }; execution.activities.set(e.activity, activity); }

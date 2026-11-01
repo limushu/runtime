@@ -1,5 +1,8 @@
 # TaskCenter TOP：运维终端重做
 
+本页记录四页签方案，现已被[按池分层的界面](2026-11-01-pool-workflow-view.md)替代。
+当前键位、步骤计数与完成语义以新说明为准。
+
 ## 目标与验收
 
 第一版逐级文本列表不足以承担运维观察。此版本参考 [SPDK 官方 spdk_top](https://spdk.io/doc/spdk_top.html)
