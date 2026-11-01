@@ -3,7 +3,7 @@ export const safe = value => [...String(value)].map(c=>{
   const n=c.codePointAt(0);return n<32||(n>=127&&n<=159)||(n>=0x202a&&n<=0x202e)||(n>=0x2066&&n<=0x2069)?'?':c;
 }).join('');
 export const stateName = value => typeof value === 'string' ? value : JSON.stringify(value ?? 'Unknown');
-const cellWidth = c => {
+export const cellWidth = c => {
   if (/\p{Mark}/u.test(c)) return 0;
   const n=c.codePointAt(0);
   return n>=0x1100 && (n<=0x115f || n>=0x2e80&&n<=0xa4cf || n>=0xac00&&n<=0xd7a3 || n>=0xf900&&n<=0xfaff || n>=0xfe10&&n<=0xfe6f || n>=0xff01&&n<=0xff60 || n>=0x1f300) ? 2 : 1;
@@ -16,6 +16,7 @@ export function wrapCells(value,width) {
 export class Model {
   tasks = new Map();
   catalog = new Map();
+  records = [];
   cursor = 0;
   incomplete = false;
   apply(record) {
@@ -28,26 +29,46 @@ export class Model {
       throw Error('Invalid audit record, schema or cursor gap; refusing a misleading history');
     }
     if(e.task !== null && e.task.split('/')[1] !== e.pool_uuid) throw Error('Task and pool scope mismatch');
+    if (!Number.isSafeInteger(e.owner_epoch) || e.owner_epoch < 0) throw Error('Invalid owner epoch');
+    if (e.kind === 'Activity' && (!e.data || typeof e.data !== 'object' || Array.isArray(e.data) ||
+        (e.data.resources !== undefined && (!Array.isArray(e.data.resources) || e.data.resources.some(r => !r || typeof r !== 'object'))))) {
+      throw Error('Invalid activity evidence');
+    }
     this.cursor = record.cursor;
+    this.records.push(record);
     if(e.kind === 'EvidenceIncomplete') this.incomplete = true;
-    this.catalog.set(e.pool_uuid, {id:e.pool_uuid,name:e.pool_name});
+    this.catalog.set(e.pool_uuid, {id:e.pool_uuid,name:e.pool_name,epoch:e.owner_epoch,last:e.at_ms});
     if (e.task === null) return;
     let task = this.tasks.get(e.task);
     if (!task) {
       task = { id: e.task, pool: e.task.split('/')[1], poolName: e.pool_name, name: e.task.split('/')[2],
-        state: 'Unknown', terminal: false, executions: new Map(), events: [], last: e.at_ms };
+        state: 'Unknown', rawState: 'Unknown', terminal: false, executions: new Map(), events: [],
+        first: e.at_ms, last: e.at_ms, objects: [], blockers: [], conflicts: [], suspensions: [] };
       this.tasks.set(e.task, task);
     }
     let execution = task.executions.get(e.execution);
     if (!execution) {
-      execution = { id: e.execution, epoch: e.owner_epoch, activities: new Map(), events: [] };
+      execution = { id: e.execution, epoch: e.owner_epoch, activities: new Map(), events: [], first: e.at_ms };
       task.executions.set(e.execution, execution);
     }
     task.last = e.at_ms; task.events.push(record); execution.events.push(record);
+    execution.last = e.at_ms;
+    task.execution = e.execution;
+    if (e.kind === 'Objects' && Array.isArray(e.data)) task.objects = e.data;
+    if (e.kind === 'AdmissionDecision') { task.conflicts = e.data?.conflicts ?? []; task.blockers = e.data?.blockers ?? []; }
+    if (e.kind === 'Blockers') task.blockers = e.data?.blockers ?? [];
+    if (e.kind === 'PolicySuspensions') task.suspensions = e.data;
+    if (e.kind === 'ControlRequested') task.control = { ...e.data, at: e.at_ms };
+    if (e.kind === 'Started') execution.started = e.at_ms;
+    if (e.kind === 'Finished') execution.finished = e.at_ms;
     if (e.kind === 'RecoveryPending') execution.recoverable = true;
-    if (e.kind === 'Registered' || e.kind === 'Restored') { task.state = 'WaitingObjects'; task.terminal = false; }
+    if (e.kind === 'Registered' || e.kind === 'Restored') {
+      task.state = 'WaitingObjects'; task.rawState = task.state; task.terminal = false;
+      task.blockers = []; task.conflicts = []; task.suspensions = []; task.control = null;
+    }
     if (e.kind === 'TaskState' || e.kind === 'Finished') {
       task.state = stateName(e.data);
+      task.rawState = e.data;
       task.terminal = e.data === 'Completed' || !!e.data?.Failed;
       if (execution.recoverable && e.data?.Failed === 'Cancelled') { task.state = 'Interrupted / recoverable'; task.terminal = false; }
     }
