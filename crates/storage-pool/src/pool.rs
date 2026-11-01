@@ -26,9 +26,6 @@ impl Pool {
             .parse::<uuid::Uuid>()
             .map_err(|e| reject(e.to_string()))?;
         driver = driver.with_task_ids(uuid.as_u128(), manager.task_ids.clone())?;
-        if let Some(audit) = &manager.audit {
-            driver = driver.with_audit(audit.clone())?;
-        }
         let shared = Arc::new(crate::manager::PoolShared::new(
             descriptor,
             Arc::downgrade(&manager.registry),

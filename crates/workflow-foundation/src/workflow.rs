@@ -95,7 +95,6 @@ pub trait Workflow: Send + 'static {
 
 /// Non-cloneable execution capability. All effects go through activity().
 pub struct WorkflowContext {
-    pub(crate) audit: crate::audit::TaskAudit,
     pub(crate) id: TaskId,
     pub(crate) scope: Arc<Scope>,
     pub(crate) pool: String,
@@ -105,7 +104,7 @@ pub struct WorkflowContext {
     pub(crate) signals: mpsc::Receiver<Signal>,
     // Accepted execution lifetime is independent of the last public Run handle.
     pub(crate) _signal_sender: mpsc::Sender<Signal>,
-    pub(crate) state: crate::audit::TaskState,
+    pub(crate) state: watch::Sender<RunState>,
     pub(crate) tracker: Tracker,
     pub(crate) info: watch::Sender<TaskInfo>,
     pub(crate) progress: watch::Sender<TaskProgress>,
@@ -177,15 +176,12 @@ impl WorkflowContext {
             })
             .await?;
         self.restored_checkpoint = value;
-        self.audit
-            .emit("CheckpointSaved", None, serde_json::Value::Null);
         Ok(())
     }
     pub(crate) async fn persist_intent(&self) -> Outcome<()> {
         sync_controls(&self.journal, &self.controls, &self.cancel).await
     }
     pub fn check_execution(&self) -> Outcome<()> {
-        self.audit.health()?;
         if self.cancel.is_cancelled() || self.scope.is_closed() {
             Err(Failure::Cancelled)
         } else {
@@ -203,7 +199,7 @@ impl WorkflowContext {
     ) -> Outcome<()> {
         self.check_execution()?;
         let cancel = self.cancel.clone();
-        self.wait_for_readiness(&cancel, observation, None).await?;
+        self.wait_for_readiness(&cancel, observation).await?;
         self.state.send_replace(RunState::Running);
         if let Some(observation) = observation {
             observation.state(ActivityState::Running);
@@ -218,7 +214,6 @@ impl WorkflowContext {
         &mut self,
         cancel: &CancellationToken,
         observation: Option<&ActivityObservation>,
-        parent: Option<ActivityId>,
     ) -> Outcome<()> {
         let mut token = self.controls.token(cancel.clone());
         loop {
@@ -230,7 +225,6 @@ impl WorkflowContext {
             if request.paused() {
                 if self.controls.acknowledge(request.generation, cancel) {
                     self.state.send_replace(RunState::Suspended);
-                    self.parent_state(parent, ActivityState::Suspended);
                     if let Some(observation) = observation {
                         observation.state(ActivityState::Suspended);
                     }
@@ -260,7 +254,6 @@ impl WorkflowContext {
             match decision {
                 Readiness::Ready => return Ok(()),
                 Readiness::Blocked(reason) => {
-                    self.parent_state(parent, ActivityState::WaitingConditions(reason.clone()));
                     if let Some(observation) = observation {
                         observation.state(ActivityState::WaitingConditions(reason.clone()));
                     }
@@ -330,22 +323,9 @@ impl WorkflowContext {
             self.activities.send_modify(|history| {
                 if let Some(entry) = history.entries.iter_mut().find(|entry| entry.id == id) {
                     entry.state = state;
-                    self.audit.emit(
-                        "Activity",
-                        Some(id.sequence),
-                        serde_json::to_value(&*entry).expect("serializable activity"),
-                    );
                 }
             });
         }
-    }
-    async fn wait_call(&mut self, parent: Option<ActivityId>) -> Outcome<()> {
-        self.check_execution()?;
-        let cancel = self.cancel.clone();
-        self.wait_for_readiness(&cancel, None, parent).await?;
-        self.state.send_replace(RunState::Running);
-        self.parent_state(parent, ActivityState::Running);
-        Ok(())
     }
     /// Configure a single invocation; ordinary `.activity(...).await` is unchanged.
     pub fn activity<
@@ -396,7 +376,7 @@ impl WorkflowContext {
             self.persist_intent().await?;
             self.controls.revoke();
         } else {
-            self.wait_call(parent).await?;
+            self.wait_until_runnable().await?;
         }
         if !Arc::ptr_eq(&self.scope, &service.scope) {
             return Err(Failure::Rejected(
@@ -406,16 +386,16 @@ impl WorkflowContext {
         let resources = (service.resources)(&request);
         let id = self.next_activity_id()?;
         let mut observation = ActivityObservation::new(
-            self.audit.clone(),
             self.activities.clone(),
             self.activity_history,
-            (id, parent, crate::ActivityKind::Call),
+            id,
             service.name.to_string(),
             match name {
                 Some(name) => name,
                 None => (service.activity_name)(&request),
             },
             resources.clone(),
+            parent,
         );
         let cancellable = !uninterruptible && !self.controls.cancellation_deferred();
         observation.update(|entry| entry.cancellable = cancellable);
@@ -426,8 +406,7 @@ impl WorkflowContext {
                 return self.broker.acquire(Kind::Activity, resources.clone(), &self.shutdown).await;
             }
             loop {
-                self.wait_call(parent).await?;
-                self.parent_state(parent, ActivityState::WaitingResources);
+                self.wait_until_runnable().await?;
                 self.state.send_replace(RunState::WaitingResources);
                 let broker = self.broker.clone();
                 tokio::select! {
@@ -452,8 +431,6 @@ impl WorkflowContext {
         };
         observation.queued();
         self.parent_state(parent, ActivityState::Running);
-        // Evidence that this call was prepared must survive before external effects begin.
-        self.audit.flush().await?;
         let guard = self.tracker.register(permit, observation);
         self.state.send_replace(RunState::Activity(id));
         let cancel = if !cancellable {
@@ -475,7 +452,6 @@ impl WorkflowContext {
         let operation = service.dispatch(
             request,
             ActivityContext {
-                audit: self.audit.clone(),
                 id,
                 cancel: cancel.clone(),
                 control,
@@ -497,12 +473,6 @@ impl WorkflowContext {
             self.drive_activity(cancel, operation, parent).await
         };
         self.state.send_replace(RunState::Running);
-        if let Err(error) = self.audit.flush().await {
-            self.tracker.mark_uncertain();
-            return Err(Failure::Uncertain(format!(
-                "activity audit not durable: {error}"
-            )));
-        }
         result
     }
     /// ActivityContext already carries the task's control token into the service.

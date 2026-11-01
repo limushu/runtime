@@ -47,7 +47,6 @@ pub struct PoolManager {
     pub(crate) metadata: Arc<dyn MetadataStore>,
     pub(crate) data_plane: Arc<dyn DataPlane>,
     pub(crate) task_store: Option<Arc<dyn workflow_foundation::persistence::TaskStore>>,
-    pub(crate) audit: Option<workflow_foundation::audit::AuditLog>,
     pub(crate) next_fanout: Arc<AtomicUsize>,
 }
 impl PoolManager {
@@ -64,7 +63,6 @@ impl PoolManager {
             task_ids: TaskIds::default(),
             balance: None,
             task_store: None,
-            audit: None,
             config,
             metadata,
             data_plane,
@@ -74,31 +72,6 @@ impl PoolManager {
     pub fn with_task_ids(mut self, ids: TaskIds) -> Self {
         self.task_ids = ids;
         self
-    }
-    /// Shared durable execution evidence across pools, independent of recovery checkpoints.
-    pub fn with_audit(mut self, audit: workflow_foundation::audit::AuditLog) -> Self {
-        self.audit = Some(audit);
-        self
-    }
-    pub fn audit_records(
-        &self,
-        after: u64,
-        limit: usize,
-    ) -> Outcome<Vec<workflow_foundation::audit::AuditRecord>> {
-        self.audit
-            .as_ref()
-            .ok_or(Failure::Unavailable)?
-            .records(after, limit)
-    }
-    pub async fn flush_audit(&self) -> Outcome<()> {
-        if let Some(audit) = &self.audit {
-            audit.flush().await
-        } else {
-            Ok(())
-        }
-    }
-    pub fn audit_health(&self) -> Outcome<()> {
-        self.audit.as_ref().ok_or(Failure::Unavailable)?.health()
     }
     /// Bind the native balance capability; all storage operations use existing domains.
     pub fn with_balance(

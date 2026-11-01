@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::SystemTime;
 use tokio::sync::watch;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityState {
     WaitingConditions(String),
     WaitingTimer,
@@ -24,13 +24,13 @@ impl ActivityState {
         matches!(self, Self::Completed | Self::Failed(_))
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
     Step,
     Call,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivitySnapshot {
     pub id: ActivityId,
     pub kind: ActivityKind,
@@ -68,7 +68,6 @@ pub struct ActivityHistory {
 
 /// Ownership follows the real operation into the service, even if its caller stops waiting.
 pub(crate) struct ActivityObservation {
-    audit: crate::audit::TaskAudit,
     history: watch::Sender<ActivityHistory>,
     id: ActivityId,
     name: &'static str,
@@ -78,20 +77,19 @@ pub(crate) struct ActivityObservation {
 }
 impl ActivityObservation {
     pub fn new(
-        audit: crate::audit::TaskAudit,
         history: watch::Sender<ActivityHistory>,
         limit: usize,
-        identity: (ActivityId, Option<ActivityId>, ActivityKind),
+        id: ActivityId,
         service: String,
         name: &'static str,
         resources: Vec<ResourceAccess>,
+        parent_id: Option<ActivityId>,
     ) -> Self {
-        let (id, parent_id, kind) = identity;
         history.send_modify(|history| {
             history.total += 1;
             history.entries.push_back(ActivitySnapshot {
                 id,
-                kind,
+                kind: ActivityKind::Call,
                 parent_id,
                 service,
                 name,
@@ -109,16 +107,9 @@ impl ActivityObservation {
                 started_at: None,
                 finished_at: None,
             });
-            let entry = history.entries.back().unwrap();
-            audit.emit(
-                "Activity",
-                Some(id.sequence),
-                serde_json::to_value(entry).expect("serializable activity"),
-            );
             retain_history(history, limit);
         });
         Self {
-            audit,
             history,
             id,
             name,
@@ -128,22 +119,13 @@ impl ActivityObservation {
         }
     }
     pub fn logical(
-        audit: crate::audit::TaskAudit,
         history: watch::Sender<ActivityHistory>,
         limit: usize,
         id: ActivityId,
         name: &'static str,
         description: Option<String>,
     ) -> Self {
-        let mut observation = Self::new(
-            audit,
-            history,
-            limit,
-            (id, None, ActivityKind::Step),
-            "workflow".into(),
-            name,
-            vec![],
-        );
+        let mut observation = Self::new(history, limit, id, "workflow".into(), name, vec![], None);
         observation.logical = true;
         observation.update(|entry| {
             entry.kind = ActivityKind::Step;
@@ -164,11 +146,6 @@ impl ActivityObservation {
         self.history.send_modify(|history| {
             if let Some(entry) = history.entries.iter_mut().find(|entry| entry.id == self.id) {
                 update(entry);
-                self.audit.emit(
-                    "Activity",
-                    Some(self.id.sequence),
-                    serde_json::to_value(&*entry).expect("serializable activity"),
-                );
             }
         });
     }
@@ -184,7 +161,6 @@ impl ActivityObservation {
     }
     pub fn settled<T>(&mut self, result: &Outcome<T>) {
         self.history.send_modify(|history| {
-            let before = history.clone();
             let pending = history
                 .entries
                 .iter()
@@ -217,15 +193,6 @@ impl ActivityObservation {
                 }
             }
             finish_settling(history);
-            for entry in &history.entries {
-                if !before.entries.iter().any(|old| old == entry) {
-                    self.audit.emit(
-                        "Activity",
-                        Some(entry.id.sequence),
-                        serde_json::to_value(entry).expect("serializable activity"),
-                    );
-                }
-            }
             retain_history(history, self.limit);
         });
         self.finished = true;
@@ -304,7 +271,7 @@ impl Drop for ActivityObservation {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskProgress {
     pub stage: Option<String>,
     pub completed: u64,

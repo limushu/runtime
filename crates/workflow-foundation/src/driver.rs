@@ -100,7 +100,6 @@ pub struct WorkflowDriver {
     failure: Option<Failure>,
     lifecycle: Lifecycle,
     wake: Arc<tokio::sync::Notify>,
-    audit: Option<crate::audit::AuditLog>,
 }
 impl WorkflowDriver {
     pub fn new(pool: impl Into<String>, config: Config) -> Outcome<Self> {
@@ -144,15 +143,14 @@ impl WorkflowDriver {
             failure: None,
             lifecycle: Lifecycle::Running,
             wake: Arc::default(),
-            audit: None,
         })
     }
     /// Bind the immutable pool UUID and the allocator supplied by the election authority.
     /// Configure before registering work; ownership/fencing remains the host's responsibility.
     pub fn with_task_ids(mut self, pool_uuid: u128, ids: TaskIds) -> Outcome<Self> {
-        if pool_uuid == 0 || !self.running.is_empty() || self.audit.is_some() {
+        if pool_uuid == 0 || !self.running.is_empty() {
             return Err(Failure::Rejected(
-                "configure valid task identity before audit or work".into(),
+                "invalid task identity configuration".into(),
             ));
         }
         self.pool_uuid = pool_uuid;
@@ -162,14 +160,6 @@ impl WorkflowDriver {
     }
     pub fn view(&self) -> ExecutionView {
         self.view.clone()
-    }
-    pub fn with_audit(mut self, audit: crate::audit::AuditLog) -> Outcome<Self> {
-        if !self.running.is_empty() {
-            return Err(Failure::Rejected("configure audit before work".into()));
-        }
-        audit.register_pool(self.pool_uuid, self.pool.clone(), self.ids.epoch());
-        self.audit = Some(audit);
-        Ok(self)
     }
     pub fn is_idle(&self) -> bool {
         self.running.is_empty()
@@ -296,11 +286,6 @@ impl WorkflowDriver {
     ) -> ExecutionEnv {
         ExecutionEnv {
             id,
-            audit: self
-                .audit
-                .as_ref()
-                .map(|log| log.task(id, self.pool.clone(), self.ids.epoch()))
-                .unwrap_or_default(),
             wake: self.wake.clone(),
             scope: self.view.scope.clone(),
             pool: self.pool.clone(),

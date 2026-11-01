@@ -4,7 +4,7 @@ use crate::TaskId;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Business-neutral scheduling explanation, shared by every observation entry point.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictDecision {
     Independent,
     Wait,
@@ -13,12 +13,12 @@ pub enum ConflictDecision {
     SuspendThenWait,
     Reject(&'static str),
 }
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
     pub decision: ConflictDecision,
     pub reason: &'static str,
 }
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictMatch {
     pub existing: TaskId,
     pub conflict: Conflict,
