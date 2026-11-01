@@ -77,12 +77,9 @@ impl<F: FnMut(Outcome<usize>) -> Outcome<ActivityAction<usize>> + Send> Activity
     fn retry_policy(&self) -> RetryPolicy {
         self.policy
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<usize> {
-        scope
-            .call(
-                &self.client,
-                self.work.pop_front().expect("unexpected retry"),
-            )
+    async fn execute(&mut self) -> Outcome<usize> {
+        self.client
+            .send(self.work.pop_front().expect("unexpected retry"))
             .await
     }
     fn handle(&mut self, result: Outcome<usize>) -> Outcome<ActivityAction<usize>> {
@@ -178,8 +175,8 @@ impl Activity for Migrate {
     fn name(&self) -> &'static str {
         "shrink.migrate-disks"
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
-        scope.call(&self.client, self.cursor).await
+    async fn execute(&mut self) -> Outcome<Self::Reply> {
+        self.client.send(self.cursor).await
     }
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<u64>> {
         Ok(match result? {
@@ -637,11 +634,11 @@ impl Activity for LocalLoop {
     fn description(&self) -> Option<&str> {
         Some("local cooperative work")
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<()> {
-        self.0.send(scope.id()).unwrap();
-        scope.report_progress(1, Some(2));
-        scope.sleep(Duration::from_millis(50)).await?;
-        scope.report_progress(2, Some(2));
+    async fn execute(&mut self) -> Outcome<()> {
+        self.0.send(activity::id()?).unwrap();
+        activity::report_progress(1, Some(2))?;
+        activity::sleep(Duration::from_millis(50)).await?;
+        activity::report_progress(2, Some(2))?;
         Ok(())
     }
     fn handle(&mut self, result: Outcome<()>) -> Outcome<ActivityAction<()>> {
@@ -799,8 +796,8 @@ impl Activity for Swallow {
     fn name(&self) -> &'static str {
         "swallow"
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<()> {
-        let _ = scope.call(&self.client, self.failure.clone()).await;
+    async fn execute(&mut self) -> Outcome<()> {
+        let _ = self.client.send(self.failure.clone()).await;
         if let Some(ready) = &self.after_call {
             ready.send(()).unwrap();
             std::future::pending::<()>().await;
@@ -884,9 +881,9 @@ impl Activity for PanicInExecute {
     fn name(&self) -> &'static str {
         "panic.during.native.call"
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<usize> {
+    async fn execute(&mut self) -> Outcome<usize> {
         tokio::select! {
-            result = scope.call(&self.client, Work::write("native", "disk")
+            result = self.client.send(Work::write("native", "disk")
                 .gated(&self.stopped).behavior(Behavior::CancelThenSettle)) => result,
             _ = self.trigger.acquire() => panic!("execute bug"),
         }
@@ -956,8 +953,8 @@ impl<A: Activity> Activity for Gated<A> {
     fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         Some(self.condition.clone())
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
-        self.step.execute(scope).await
+    async fn execute(&mut self) -> Outcome<Self::Reply> {
+        self.step.execute().await
     }
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<Self::Output>> {
         self.step.handle(result)

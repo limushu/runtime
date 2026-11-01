@@ -124,6 +124,12 @@ impl<R: Send + 'static, P: Send + 'static, Q: Send + 'static, V: Send + 'static>
     pub fn snapshot(&self) -> ServiceSnapshot {
         self.state.borrow().clone()
     }
+    /// Execute inside Activity::execute(), using its Task controls, resources and
+    /// observation. The binding follows the polled Future, not this shared client.
+    /// Outside that execution (including tokio::spawn), returns Rejected.
+    pub async fn send(&self, request: R) -> Outcome<P> {
+        crate::activity::invocation::call(self.clone(), request).await
+    }
     pub async fn query(&self, query: Q) -> Outcome<V> {
         let (reply, response) = oneshot::channel();
         self.tx

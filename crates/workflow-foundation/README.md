@@ -109,8 +109,8 @@ impl Activity for MigrateDisks {
     fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         Some(Arc::new(BalanceReadiness(self.balance.clone())))
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
-        scope.call(&self.balance, self.cursor).await
+    async fn execute(&mut self) -> Outcome<Self::Reply> {
+        self.balance.send(self.cursor).await
     }
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<u64>> {
         Ok(match result? {
@@ -124,6 +124,17 @@ impl Activity for MigrateDisks {
     }
 }
 ```
+
+**调用与执行归属。** `execute(&mut self)` 不接收 scope；普通领域调用直接使用
+`client.send(request).await`，封装它的业务函数也不必传递框架参数。runner 在推进 execute
+Future 时绑定当前执行；客户端自动沿用原有 WorkflowContext 的资源、控制和观测路径。
+同一个客户端可以被多个 Task 共用，每次调用都归入实际执行它的 Task/Activity。
+
+绑定仅在 execute 内有效，结束、panic 或 Future 被丢弃后不会泄漏到后续步骤。
+在 WF 本体、条件检查、结果 handler 或独立 `tokio::spawn` 任务中使用 send 会返回 Rejected；
+不把框架执行能力自动传给脱离生命周期的任务。WF 直接调用仍使用 `ctx.activity()`，只读
+`client.query()` 保持原有用法。同一次 execute 的领域调用和协作等待串行驱动；即使使用
+`join!` 也不会并行派发领域调用。不同 Task 的并发仍由调度规则和资源声明控制。
 
 | 决定 | 框架行为 |
 | --- | --- |
@@ -169,16 +180,18 @@ cargo run -p workflow-foundation --example noncancellable_activity
 
 它演示：进入不可取消提交步骤 → 用户取消 → 提交仍完成 → WF 获得真实结果 → 后续普通步骤不执行。
 
-**两种暂停方式。** 对本地循环，`scope.wait_until_runnable()` 或 `scope.sleep()` 在安全边界
-原地等待，恢复后继续同一次 execute。对 C 侧长操作，领域适配器观察 `scope.control()` 传递的
+**两种暂停方式。** 对本地循环，可按需调用 `activity::wait_until_runnable().await?` 或
+`activity::sleep(delay).await?` 在安全边界原地等待，恢复后继续同一次 execute。
+需要直接检查信号时，可调用 `activity::control()?`。对 C 侧长操作，领域适配器观察其
+`ActivityContext::control()` 中的
 控制请求，调用 C 的停止接口、等待实际停稳，然后返回类型化回复；handler 保存进程内游标并
 返回 Suspend，恢复后框架在同一个实例上再次 execute。两种方式都保持同一个逻辑 ActivityId，
 并重新检查已声明的业务条件。自定义条件等待与用户暂停同时生效，恢复不能绕过任一条件。
 这些检查发生在协作边界，不会自动抢占任意 async 函数；运行中的 C 操作仍需领域适配器停稳。
 
-**执行安全。** 所有外部副作用通过 `scope.call()` 调用已有领域服务。资源按每次真实调用
+**执行安全。** Activity 中的外部副作用通过 `client.send()` 调用已有领域服务。资源按每次真实调用
 取得并持有到实际停稳，多次调用不构成隐式原子事务；重试和等待期间不占用已结束调用的资源。
-框架不丢弃在途 IO 来模拟停止。Cancelled/Uncertain 执行结果不进入 handler，scope 还会记住
+框架不丢弃在途 IO 来模拟停止。Cancelled/Uncertain 执行结果不进入 handler，runner 还会记住
 服务调用返回的这两类结果，防止 execute 吞掉后返回成功。handler 主动返回 Cancelled 等价于 Cancel。
 执行或 handler panic 记为 Uncertain，不能被外层吞掉成为成功。丢弃 Activity 等待者会请求协作取消，
 逻辑记录保持 Settling，直到实际子调用结束。
@@ -186,7 +199,8 @@ cargo run -p workflow-foundation --example noncancellable_activity
 **步骤级观测。** TaskSnapshot.activities 同时包含 `kind = Step` 的逻辑步骤和 `kind = Call`
 的真实服务调用，调用通过 `parent_id` 关联步骤。步骤自动记录名称、说明、attempts、retries、
 last_error、retry_reason、retry_at、cancellable、进度和生命周期。attempts 是 execute 的进入次数，
-retries 是已批准的重试次数，两者不会把暂停续作混为重试。`scope.report_progress()` 自动使用步骤名；
+retries 是已批准的重试次数，两者不会把暂停续作混为重试。`activity::report_progress(done, total)?`
+自动使用步骤名，`activity::id()?` 返回当前逻辑步骤 ID；这些辅助函数在 execute 之外返回 Rejected。
 领域服务的进度也会归入所属步骤。同一逻辑步骤在暂停时显示 Suspended，不会因子调用返回而显示 Completed。
 
 历史上限优先淘汰已结束的子调用。活跃步骤及在途调用始终保留，极小上限下允许暂时多出活跃记录，

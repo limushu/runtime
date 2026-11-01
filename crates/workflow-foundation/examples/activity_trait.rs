@@ -54,8 +54,8 @@ impl Activity for MigrateDisks {
     fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         Some(Arc::new(BalanceReadiness(self.balance.clone())))
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
-        scope.call(&self.balance, self.cursor).await
+    async fn execute(&mut self) -> Outcome<Self::Reply> {
+        self.balance.send(self.cursor).await
     }
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<u64>> {
         Ok(match result? {

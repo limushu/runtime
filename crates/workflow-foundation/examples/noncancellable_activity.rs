@@ -18,13 +18,13 @@ impl Activity for Commit {
     fn cancellable(&self) -> bool {
         false
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<()> {
+    async fn execute(&mut self) -> Outcome<()> {
         println!("[Commit] 已进入不可取消步骤");
         if let Some(entered) = self.entered.take() {
             entered.send(()).map_err(|_| Failure::Unavailable)?;
         }
         // Simulated local work. Pause/host shutdown still affect this wait.
-        scope.sleep(Duration::from_millis(250)).await?;
+        activity::sleep(Duration::from_millis(250)).await?;
         println!("[Commit] 已完成，返回真实结果");
         Ok(())
     }
@@ -40,7 +40,7 @@ impl Activity for Next {
     fn name(&self) -> &'static str {
         "next-step"
     }
-    async fn execute(&mut self, _: &mut ActivityScope<'_>) -> Outcome<()> {
+    async fn execute(&mut self) -> Outcome<()> {
         Err(Failure::Failed(
             "pending cancellation should prevent this step".into(),
         ))

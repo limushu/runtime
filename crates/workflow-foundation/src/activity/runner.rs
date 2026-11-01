@@ -1,4 +1,5 @@
 use super::*;
+use crate::tasks::ActivityObservation;
 use futures_util::FutureExt;
 use std::{panic::AssertUnwindSafe, sync::atomic::Ordering, time::SystemTime};
 
@@ -117,16 +118,7 @@ impl WorkflowContext {
             }
             observation.started();
             let generation = self.control().request().generation;
-            let mut scope = ActivityScope {
-                context: self,
-                observation,
-                terminal_error: None,
-            };
-            let result = step.execute(&mut scope).await;
-            let result = match scope.terminal_error {
-                Some(error) => Err(error),
-                None => result,
-            };
+            let result = invocation::execute(self, observation, step).await;
             if let Err(error) = self.tracker.ready() {
                 let uncertain = self.tracker.settle(&self.cancel).await;
                 return Err(if uncertain {

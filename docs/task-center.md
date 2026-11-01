@@ -96,6 +96,10 @@ Workflow::run_condition 是可选的共同业务条件，不承担任务间排�
 trait 路径中 run_activity 自动完成结果处理后的等待与恢复；原直接调用路径仍由 Workflow
 显式消费返回值、保存检查点，再等待准入。下面的暂停链描述生产缩容当前使用的直接调用路径。
 
+Activity trait 的 execute 不接收 scope，内部通过领域客户端的 send 方法通信。框架按当前
+execute Future 自动关联 Task、逻辑步骤、资源和控制信号，TaskCenter 的调度规则不因此改变。
+领域服务仍从 ActivityContext 观察暂停/取消，并负责等待真实停稳。
+
 ## 一条可追踪的暂停链
 
 ```text

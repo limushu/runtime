@@ -184,8 +184,8 @@ impl Activity for ScheduledStep {
     fn run_condition(&self) -> Option<Arc<dyn RunCondition>> {
         Some(self.ready.clone())
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Self::Reply> {
-        scope.call(&self.client, self.name.into()).await
+    async fn execute(&mut self) -> Outcome<Self::Reply> {
+        self.client.send(self.name.into()).await
     }
     fn handle(&mut self, result: Outcome<Self::Reply>) -> Outcome<ActivityAction<()>> {
         Ok(match result? {

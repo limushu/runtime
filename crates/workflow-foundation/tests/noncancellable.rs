@@ -108,8 +108,8 @@ impl Activity for Protected {
             .clone()
             .map(|ready| ready as Arc<dyn RunCondition>)
     }
-    async fn execute(&mut self, scope: &mut ActivityScope<'_>) -> Outcome<Reply> {
-        scope.call(&self.client, self.cursor).await
+    async fn execute(&mut self) -> Outcome<Reply> {
+        self.client.send(self.cursor).await
     }
     fn handle(&mut self, result: Outcome<Reply>) -> Outcome<ActivityAction<u64>> {
         if self.deliberate_cancel {
